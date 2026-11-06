@@ -49,7 +49,7 @@ def _invalid_constant(value):
 
 
 def _read(dir_fd: int) -> dict:
-    fd = os.open(RECORD_NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    fd = os.open(RECORD_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     with os.fdopen(fd, "rb") as file:
         info = os.fstat(file.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()

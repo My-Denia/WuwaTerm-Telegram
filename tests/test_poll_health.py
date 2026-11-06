@@ -94,6 +94,33 @@ def test_invalid_record_is_not_overwritten(monkeypatch, tmp_path):
         os.close(sentinel)
 
 
+
+@pytest.mark.parametrize("operation", ["health", "record_success"])
+def test_fifo_record_rejected_without_blocking(tmp_path, operation):
+    os.mkfifo(tmp_path / "poll.json", 0o600)
+    program = """import importlib.util,os,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("poll_health",sys.argv[1])
+health=importlib.util.module_from_spec(spec); spec.loader.exec_module(health)
+health.HEALTH_DIR=Path(sys.argv[2])
+read,write=os.pipe(); os.close(write)
+try:
+    try:
+        health.health() if sys.argv[3] == "health" else health.record_success(read)
+    except ValueError:
+        print("rejected")
+finally:
+    os.close(read)
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", program, poll_health.__file__, str(tmp_path), operation],
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "rejected"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["poll.json"]
+
+
 def test_unwritable_directory_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setattr(poll_health, "HEALTH_DIR", tmp_path)
     sentinel = _sentinel()
