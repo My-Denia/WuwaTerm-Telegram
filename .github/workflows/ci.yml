@@ -1,0 +1,65 @@
+name: Telegram CI
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      # The committed lock is the trust root. A missing/inaccessible producer,
+      # wrong run, expired artifact or mismatched wheel stops here before pip.
+      # The token belongs to this consumer repository. Its cross-repository
+      # artifact access is tested here, before any pip invocation.
+      - name: Probe consumer token and verify pinned Core
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/fetch_core.py --lock core-lock.json --output-dir artifacts
+      - name: Build distribution
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+          (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS)
+      - name: Verify and install both wheels with the normal resolver
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-env"
+          core=(artifacts/*.whl)
+          telegram=(dist/*.whl)
+          test "${#core[@]}" -eq 1 && test "${#telegram[@]}" -eq 1
+          sha=$(sha256sum "${telegram[0]}" | cut -d' ' -f1)
+          "$RUNNER_TEMP/wheel-env/bin/python" scripts/install_verified.py --lock core-lock.json --core "${core[0]}" --telegram "${telegram[0]}" --telegram-sha256 "$sha"
+          "$RUNNER_TEMP/wheel-env/bin/python" -m pip check
+          "$RUNNER_TEMP/wheel-env/bin/wuwaterm-telegram" --help
+          "$RUNNER_TEMP/wheel-env/bin/python" -m wuwaterm_telegram --help
+          "$RUNNER_TEMP/wheel-env/bin/python" -c "import importlib.util; assert importlib.util.find_spec('fastapi') is None; assert importlib.util.find_spec('pypinyin') is None"
+      - name: Install source distribution with verified Core
+        run: |
+          python -m venv "$RUNNER_TEMP/sdist-env"
+          (cd dist && sha256sum -c SHA256SUMS)
+          "$RUNNER_TEMP/sdist-env/bin/python" -m pip install artifacts/*.whl dist/*.tar.gz
+          "$RUNNER_TEMP/sdist-env/bin/python" -m pip check
+          "$RUNNER_TEMP/sdist-env/bin/wuwaterm-telegram" --help
+      - name: Run Telegram tests
+        run: |
+          "$RUNNER_TEMP/wheel-env/bin/python" -m pip install 'pytest>=8,<10' 'pypinyin>=0.54,<1' 'ruff>=0.16,<0.18'
+          "$RUNNER_TEMP/wheel-env/bin/python" tests/run_isolated.py --installed -q
+          "$RUNNER_TEMP/wheel-env/bin/python" -m ruff check src tests scripts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: telegram-package
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error

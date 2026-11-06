@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wuwaterm-telegram"
+version = "0.1.0.dev1"
+description = "Standalone Telegram adapter for WuwaTerm"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Peter"}]
+dependencies = [
+  "wuwaterm==0.7.0.dev1",
+  "python-telegram-bot>=22.7,<23",
+]
+
+[project.scripts]
+wuwaterm-telegram = "wuwaterm_telegram.cli:main"
+
+[tool.setuptools.data-files]
+"share/doc/wuwaterm-telegram" = ["PROVENANCE.md", "docs/artifact-verification.md"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["wuwaterm_telegram*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-config --strict-markers"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

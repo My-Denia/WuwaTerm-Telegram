@@ -1,0 +1,15 @@
+services:
+  wuwaterm-telegram:
+    build:
+      context: ../artifacts/docker-context
+      dockerfile: ../../deploy/Dockerfile
+    image: wuwaterm-telegram:local
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      WUWATERM_DB_PATH: /app/data/terms.db
+      WUWATERM_STATE_DIR: /app/state
+    volumes:
+      - ../data:/app/data:ro
+      - ../state:/app/state
