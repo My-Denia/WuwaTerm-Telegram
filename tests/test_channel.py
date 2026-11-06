@@ -3388,9 +3388,10 @@ def test_channel_reply_index_expired_read_does_not_rewrite_storage(tmp_path):
     assert path.read_text(encoding="utf-8") == persisted
 
 
-def test_channel_reply_index_ignores_corrupt_persistence_file(tmp_path, caplog):
+@pytest.mark.parametrize("contents", [b"{not json", b"\xff", b"\xf0\x9f\x8c"])
+def test_channel_reply_index_ignores_corrupt_persistence_file(tmp_path, caplog, contents):
     path = tmp_path / "channel_replies.json"
-    path.write_text("{not json", encoding="utf-8")
+    path.write_bytes(contents)
 
     with caplog.at_level(logging.WARNING):
         index = ChannelReplyIndex(ttl_seconds=60.0, storage_path=path)
@@ -3404,6 +3405,7 @@ def test_channel_reply_index_ignores_corrupt_persistence_file(tmp_path, caplog):
     assert "-2001" not in caplog.text
     assert "JSONDecodeError" not in caplog.text
     assert "Expecting" not in caplog.text
+    assert path.read_bytes() == contents
 
 
 @pytest.mark.parametrize(
