@@ -65,6 +65,7 @@ from .runtime_keys import (
     TRANSLATOR_KEY,
 )
 from .settings import ChatSettings, ChatSettingsDurabilityError, ChatSettingsError
+from .state_paths import state_paths
 from .telegram_html import (
     HTML_CONTENT_FAILURE_REASONS,
     strip_telegram_html,
@@ -944,28 +945,15 @@ def _state_file_path(
     explicit_path: str | Path | None,
     label: str,
 ) -> Path:
-    db_parent = Path(db_path).resolve(strict=False).parent
-    legacy = db_parent / filename
-    state_dir = os.getenv("WUWATERM_STATE_DIR", "").strip()
-    target = Path(state_dir).expanduser() / filename if state_dir else None
-    if explicit_path:
-        explicit = Path(explicit_path).expanduser()
-        if target is not None and (
-            _same_state_path(explicit, legacy)
-            or _same_state_path(explicit, target)
-        ):
-            _migrate_legacy_state_file(legacy, target, label=label)
-            return target
-        return explicit
-    if not state_dir:
-        return legacy
-    assert target is not None
-    _migrate_legacy_state_file(legacy, target, label=label)
-    return target
-
-
-def _same_state_path(left: Path, right: Path) -> bool:
-    return left.resolve(strict=False) == right.resolve(strict=False)
+    paths = state_paths(
+        db_path,
+        filename=filename,
+        explicit_path=explicit_path,
+        state_dir=os.getenv("WUWATERM_STATE_DIR", "").strip() or None,
+    )
+    if paths.migration_target is not None:
+        _migrate_legacy_state_file(paths.legacy, paths.migration_target, label=label)
+    return paths.effective
 
 
 def _migrate_legacy_state_file(legacy: Path, target: Path, *, label: str) -> None:
