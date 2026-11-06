@@ -47,6 +47,47 @@ def _chat_id_from_json(value: object) -> int | None:
     return None
 
 
+def parse_chat_settings_payload(
+    data: object, *, strict: bool = True
+) -> tuple[dict[int, bool], set[int]]:
+    """Parse settings without reading files or changing application state."""
+    if not isinstance(data, dict):
+        if strict:
+            raise ChatSettingsError("chat settings file has an invalid schema")
+        LOGGER.warning("chat settings schema invalid, starting empty")
+        return {}, set()
+
+    public_raw = data.get("public", {})
+    allowed_raw = data.get("allowed", [])
+    if not isinstance(public_raw, dict) or not isinstance(allowed_raw, list):
+        if strict:
+            raise ChatSettingsError("chat settings file has an invalid schema")
+        LOGGER.warning("chat settings schema invalid, starting empty")
+        return {}, set()
+
+    public: dict[int, bool] = {}
+    allowed: set[int] = set()
+    for key, value in public_raw.items():
+        if not isinstance(value, bool):
+            if strict:
+                raise ChatSettingsError("chat settings file has an invalid schema")
+            continue
+        chat_id = _chat_id_from_json(key)
+        if chat_id is None:
+            if strict:
+                raise ChatSettingsError("chat settings file has an invalid schema")
+            continue
+        public[chat_id] = value
+    for item in allowed_raw:
+        chat_id = _chat_id_from_json(item)
+        if chat_id is None:
+            if strict:
+                raise ChatSettingsError("chat settings file has an invalid schema")
+            continue
+        allowed.add(chat_id)
+    return public, allowed
+
+
 @contextmanager
 def _file_lock(path: Path) -> Iterator[None]:
     """Hold a stable sibling lock file across a settings transaction."""
@@ -119,10 +160,6 @@ class ChatSettings:
         self._allowed: set[int] = set()
         self._load()
 
-    @staticmethod
-    def _schema_error() -> ChatSettingsError:
-        return ChatSettingsError("chat settings file has an invalid schema")
-
     def _read_state(self, *, strict: bool) -> tuple[dict[int, bool], set[int]]:
         if not self.path.exists():
             return {}, set()
@@ -135,41 +172,7 @@ class ChatSettings:
             LOGGER.warning("chat settings unreadable, starting empty")
             return {}, set()
 
-        if not isinstance(data, dict):
-            if strict:
-                raise self._schema_error()
-            LOGGER.warning("chat settings schema invalid, starting empty")
-            return {}, set()
-
-        public_raw = data.get("public", {})
-        allowed_raw = data.get("allowed", [])
-        if not isinstance(public_raw, dict) or not isinstance(allowed_raw, list):
-            if strict:
-                raise self._schema_error()
-            LOGGER.warning("chat settings schema invalid, starting empty")
-            return {}, set()
-
-        public: dict[int, bool] = {}
-        allowed: set[int] = set()
-        for key, value in public_raw.items():
-            if not isinstance(value, bool):
-                if strict:
-                    raise self._schema_error()
-                continue
-            chat_id = _chat_id_from_json(key)
-            if chat_id is None:
-                if strict:
-                    raise self._schema_error() from None
-                continue
-            public[chat_id] = value
-        for item in allowed_raw:
-            chat_id = _chat_id_from_json(item)
-            if chat_id is None:
-                if strict:
-                    raise self._schema_error() from None
-                continue
-            allowed.add(chat_id)
-        return public, allowed
+        return parse_chat_settings_payload(data, strict=strict)
 
     def _load(self) -> None:
         public, allowed = self._read_state(strict=False)

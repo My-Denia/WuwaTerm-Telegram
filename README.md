@@ -41,6 +41,15 @@ The bot reads the terms database and writes its settings and channel reply index
 
 Before moving or upgrading, stop the bot and back up the database and both state files, including any explicitly configured paths. Restore those files to their original locations when rolling back. Keep the old release and its matching Core artifact available. Do not overwrite a current state file with an old backup without first preserving the current file.
 
+To validate a state file without starting the bot, pass its actual path and kind:
+
+```sh
+python -m wuwaterm_telegram.state_validation /path/to/settings.json chat-settings
+python -m wuwaterm_telegram.state_validation /path/to/replies.json channel-replies
+```
+
+The command reads the specified file without modifying it. It exits with 0 for valid state, 1 for a missing, unreadable or invalid file, and 2 for incorrect command usage. The kind is required even when using a default filename.
+
 ## Container
 
 The image contains only the bot runtime and installs the same two verified wheels. Prepare a minimal build context with the reviewed lock and verified artifacts:
