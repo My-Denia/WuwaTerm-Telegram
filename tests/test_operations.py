@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import traceback
 
 import pytest
 
@@ -87,6 +89,61 @@ def test_existing_target_is_preserved(monkeypatch, tmp_path):
     assert snapshot([old, target]) == before
     assert bot._chat_settings_path_from_env(data / "terms.db") == target
     assert snapshot([old, target]) == before
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX file permissions")
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_mounted_plan_checks_only_legacy_files_that_need_copying(monkeypatch, target_exists):
+    from wuwaterm_telegram.operations import OperationsError, state_plan
+
+    with tempfile.TemporaryDirectory(prefix="wuwaterm-state-access-") as directory:
+        root = Path(directory)
+        root.chmod(0o755)
+        data, state = root / "data", root / "state"
+        data.mkdir(mode=0o755)
+        state.mkdir(mode=0o777)
+        state.chmod(0o777)
+        legacy = data / "chat_settings.json"
+        legacy.write_text('{"public":{},"allowed":[]}', encoding="utf-8")
+        legacy.chmod(0o600)
+        target = state / legacy.name
+        if target_exists:
+            target.write_text('{"public":{},"allowed":[]}', encoding="utf-8")
+        before = snapshot([legacy] + ([target] if target_exists else []))
+        if os.geteuid() != 0:
+            legacy.chmod(0)
+        monkeypatch.setenv("WUWATERM_STATE_DIR", "/app/state")
+        mappings = [mount("/app/data", data, True), mount("/app/state", state)]
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            try:
+                if os.geteuid() == 0:
+                    os.setgroups([])
+                    os.setgid(65534)
+                    os.setuid(65534)
+                assert not os.access(legacy, os.R_OK)
+                with pytest.raises(PermissionError):
+                    legacy.read_bytes()
+                if target_exists:
+                    plan = state_plan(Path("/app/data/terms.db"), mappings)
+                    assert plan["kinds"]["chat-settings"]["migration"] == "validate-existing"
+                else:
+                    with pytest.raises(OperationsError, match="legacy state file is not readable"):
+                        state_plan(Path("/app/data/terms.db"), mappings)
+            except BaseException:
+                os.write(write_fd, traceback.format_exc().encode("utf-8"))
+                os._exit(1)
+            os._exit(0)
+        os.close(write_fd)
+        _, status = os.waitpid(child, 0)
+        error = os.read(read_fd, 65536).decode("utf-8")
+        os.close(read_fd)
+        legacy.chmod(0o600)
+        assert os.waitstatus_to_exitcode(status) == 0, error
+        assert snapshot([legacy] + ([target] if target_exists else [])) == before
+        assert list(state.iterdir()) == ([target] if target_exists else [])
 
 
 def test_mounted_plan_fails_closed_and_reports_original_source(monkeypatch, tmp_path):

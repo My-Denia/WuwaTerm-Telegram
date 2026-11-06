@@ -174,6 +174,8 @@ def state_plan(db_path: Path, mount_args: list[str]) -> dict[str, object]:
             if host_target.exists():
                 action = "validate-existing"
             elif host_legacy.resolve(strict=False) != host_target.resolve(strict=False):
+                if not host_legacy.is_file() or not os.access(host_legacy, os.R_OK):
+                    raise OperationsError("legacy state file is not readable")
                 action = "copy-if-absent"
         plans[kind] = {
             "effective_path": str(target),
