@@ -1,0 +1,39 @@
+name: Telegram release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Require stable matching Core and Telegram versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/release_preflight.py --lock core-lock.json --tag "$RELEASE_TAG"
+      - uses: actions/download-artifact@v7
+        with:
+          name: telegram-package
+          path: dist
+      - name: Verify artifacts and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes dist/*.whl dist/*.tar.gz dist/SHA256SUMS
