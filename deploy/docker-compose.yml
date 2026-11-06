@@ -3,6 +3,8 @@ services:
     build:
       context: ../artifacts/docker-context
       dockerfile: ../../deploy/Dockerfile
+      args:
+        WUWATERM_SOURCE_REVISION: ${WUWATERM_SOURCE_REVISION:-}
     image: wuwaterm-telegram:local
     restart: unless-stopped
     env_file:
@@ -10,6 +12,9 @@ services:
     environment:
       WUWATERM_DB_PATH: /app/data/terms.db
       WUWATERM_STATE_DIR: /app/state
+      WUWATERM_API_WEB_ENABLED: ""
+      WUWATERM_API_WEB_DEVICE_TOKEN: ""
+      WUWATERM_API_WEB_EDGE_SECRET: ""
     volumes:
       - ../data:/app/data:ro
       - ../state:/app/state

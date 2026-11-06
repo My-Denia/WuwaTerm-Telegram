@@ -50,6 +50,16 @@ python -m wuwaterm_telegram.state_validation /path/to/replies.json channel-repli
 
 The command reads the specified file without modifying it. It exits with 0 for valid state, 1 for a missing, unreadable or invalid file, and 2 for incorrect command usage. The kind is required even when using a default filename.
 
+The offline operations command can report the effective state paths before migration:
+
+```sh
+python -m wuwaterm_telegram.operations state-plan --db data/terms.db
+```
+
+It uses the bot's environment and path precedence, reports each file by kind and says whether an existing legacy file would be copied or an existing target validated. It does not copy, validate, lock or change the files; results describe a moment in time and must be rechecked when the bot is stopped. For a container, a caller can supply `--mount` more than once, each as a JSON object with absolute `container` and `host` paths and a boolean `read_only`. The command then maps legacy and target paths, rejects an unmapped or read-only target and checks host-side access without writing. The caller must supply the actual mounts and perform the check with the runtime's effective user; this is not a guarantee against later filesystem or permission changes.
+
+`python -m wuwaterm_telegram.operations identity` reports installed Telegram and Core versions. In the supplied container image it also checks the retained wheels against the supplied lock/checksum and reports their digests. These checks do not establish that the lock or checksum is trustworthy: verify them against the intended release. A build-supplied source revision is reported as a claim, not proof that a wheel came from that source. The command does not test whether a running bot is ready.
+
 ## Container
 
 The image contains only the bot runtime and installs the same two verified wheels. Prepare a minimal build context with the reviewed lock and verified artifacts:
@@ -62,6 +72,8 @@ cp deploy/env.example .env
 # Fill in the required values without committing .env.
 docker compose -f deploy/docker-compose.yml up --build -d
 ```
+
+An optional `WUWATERM_SOURCE_REVISION` build argument may be supplied as a full lowercase commit SHA after verifying the wheel provenance. The image records it as an unverified claim. Compose keeps API Web credentials out of the bot container even when a shared `.env` contains them.
 
 Place the database at `data/terms.db`; Compose mounts `data/` read-only and `state/` read-write. The prepared Docker context contains only the lock, wheel artifacts and verification code, not the workspace or `.env`. Stop the old bot before starting a replacement against the same state.
 
