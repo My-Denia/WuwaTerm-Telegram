@@ -60,6 +60,15 @@ It uses the bot's environment and path precedence, reports each file by kind and
 
 `python -m wuwaterm_telegram.operations identity` reports installed Telegram and Core versions. In the supplied container image it also checks the retained wheels against the supplied lock/checksum and reports their digests. These checks do not establish that the lock or checksum is trustworthy: verify them against the intended release. A build-supplied source revision is reported as a claim, not proof that a wheel came from that source. The command does not test whether a running bot is ready.
 
+For a container, set `WUWATERM_POLL_HEALTH=1` to enable polling health. Compose supplies a private tmpfs at `/run/wuwaterm-telegram` for the transient record. From the same container and user, run:
+
+```sh
+docker compose -f deploy/docker-compose.yml exec -T wuwaterm-telegram \
+  python -B -m wuwaterm_telegram.operations health
+```
+
+The command succeeds only after the SDK has completed a poll, including an empty response, within the last 90 seconds. `--max-age` accepts 1–3600 seconds. It checks the running process and boot identity without contacting Telegram. A stopped poller or stale, missing or invalid record fails. This indicates recent polling only; it does not verify handlers or translation. Poll health is disabled unless explicitly enabled, and needs Linux `/proc` and the writable tmpfs.
+
 ## Container
 
 The image contains only the bot runtime and installs the same two verified wheels. Prepare a minimal build context with the reviewed lock and verified artifacts:
