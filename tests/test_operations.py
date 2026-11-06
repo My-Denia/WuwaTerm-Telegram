@@ -272,3 +272,316 @@ def test_mapped_settings_lock_cannot_point_outside_mount(monkeypatch, tmp_path):
     result = run_ops("state-plan", "--db", "/app/data/terms.db", "--mount", mount("/app/state", state))
     assert result.returncode == 1
     assert snapshot([other_lock]) == before
+
+
+# These cases use the current non-root UID and real file permissions. Runtime
+# actions run in a second fixture so preflight snapshots remain untouched.
+_ACCESS_CASES = [
+    ("read-only-target", True, "settings"),
+    ("read-only-target", True, "channel"),
+    ("unreadable-settings-with-legacy", False, "settings"),
+    ("unreadable-settings-without-legacy", False, "settings"),
+    ("unreadable-custom-settings", False, "settings"),
+    ("unreadable-channel", False, "channel"),
+    ("parent-no-read", False, "settings"),
+    ("parent-no-read", False, "channel"),
+    ("parent-no-write", False, "settings"),
+    ("parent-no-execute", False, "settings"),
+    ("settings-lock-write-only", False, "settings"),
+    ("settings-lock-read-only", False, "settings"),
+    ("legacy-unreadable-target-preserved", True, "settings"),
+    ("channel-legacy-unreadable-target-preserved", True, "channel"),
+    ("read-only-source-copy", True, "settings"),
+    ("missing-nested-wx-ancestor", True, "settings"),
+    ("channel-lock-directory", True, "channel"),
+    ("channel-lock-symlink", True, "channel"),
+    ("channel-link-parent-unwritable", False, "channel"),
+    ("channel-link-referent-parent-unwritable", True, "channel"),
+    ("settings-link-entry-parent-unwritable", True, "settings"),
+    ("settings-link-referent-parent-unwritable", False, "settings"),
+    ("settings-parent-symlink-dotdot", False, "settings"),
+    ("channel-parent-symlink-dotdot", False, "channel"),
+]
+
+
+def _prepare_access_case(root, case):
+    data, state = root / "data", root / "state"
+    data.mkdir(parents=True)
+    state.mkdir()
+    config = {"state_dir": "/app/state", "settings": None, "channel": None}
+    settings = state / "chat_settings.json"
+    replies = state / "channel_replies.json"
+    original = data / "chat_settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    if case != "read-only-source-copy" and case != "missing-nested-wx-ancestor":
+        if case == "unreadable-custom-settings":
+            settings = state / "custom-settings.json"
+            config["settings"] = "/app/state/custom-settings.json"
+        settings.write_text('{"public":{},"allowed":[]}', encoding="utf-8")
+    if case != "missing-nested-wx-ancestor":
+        replies.write_text('{"version":1,"entries":[]}', encoding="utf-8")
+    if case in ("unreadable-settings-with-legacy", "legacy-unreadable-target-preserved", "read-only-source-copy"):
+        original.write_text('{"public":{},"allowed":[]}', encoding="utf-8")
+    if case == "channel-legacy-unreadable-target-preserved":
+        (data / "channel_replies.json").write_text('{"version":1,"entries":[]}', encoding="utf-8")
+    if case in ("settings-lock-write-only", "settings-lock-read-only"):
+        (state / "chat_settings.json.lock").write_text("", encoding="utf-8")
+    if case == "channel-lock-directory":
+        (state / "channel_replies.json.lock").mkdir()
+    if case == "channel-lock-symlink":
+        (state / "channel_replies.json.lock").symlink_to("not-used")
+    if case.startswith("channel-link-"):
+        entry_dir, referent_dir = state / "entry", state / "referent"
+        entry_dir.mkdir()
+        referent_dir.mkdir()
+        referent = referent_dir / "stored.json"
+        referent.write_text('{"version":1,"entries":[]}', encoding="utf-8")
+        (entry_dir / "custom-replies.json").symlink_to(referent)
+        config["channel"] = "/app/state/entry/custom-replies.json"
+    if case.startswith("settings-link-"):
+        entry_dir, referent_dir = state / "entry", state / "referent"
+        entry_dir.mkdir()
+        referent_dir.mkdir()
+        referent = referent_dir / "stored-settings.json"
+        referent.write_text('{"public":{},"allowed":[]}', encoding="utf-8")
+        (entry_dir / "custom-settings.json").symlink_to(referent)
+        config["settings"] = "/app/state/entry/custom-settings.json"
+    if case.endswith("parent-symlink-dotdot"):
+        nested = state / "real" / "nested"
+        nested.mkdir(parents=True)
+        (state / "link").symlink_to("real/nested", target_is_directory=True)
+        config["identity"] = True
+        config["state_dir"] = str(state)
+        if case.startswith("settings"):
+            (state / "real" / settings.name).write_text('{"public":{},"allowed":[]}', encoding="utf-8")
+            config["settings"] = str(state / "link" / ".." / settings.name)
+        else:
+            (state / "real" / replies.name).write_text('{"version":1,"entries":[]}', encoding="utf-8")
+            config["channel"] = str(state / "link" / ".." / replies.name)
+    if case == "missing-nested-wx-ancestor":
+        config["state_dir"] = "/app/state/missing/nested"
+
+    # Hold descriptors before removing access; their byte/stat and directory
+    # snapshots allow verifying the preflight without changing permissions.
+    directories = [root, data, state] + [x for x in state.iterdir() if x.is_dir() and not x.is_symlink()]
+    entries = [x for d in directories for x in d.iterdir()]
+    dirs = [(str(d), os.open(d, os.O_RDONLY | os.O_DIRECTORY)) for d in directories]
+    paths = [(str(p), os.open(p, os.O_PATH | os.O_NOFOLLOW)) for p in entries]
+    files = [(str(p), os.open(p, os.O_RDONLY)) for p in entries if p.is_file()]
+
+    if case == "read-only-target":
+        settings.chmod(0o400)
+        replies.chmod(0o400)
+    if case.startswith("unreadable-settings") or case == "unreadable-custom-settings":
+        settings.chmod(0)
+    if case == "unreadable-channel":
+        replies.chmod(0)
+    if case == "parent-no-read":
+        state.chmod(0o300)
+    if case == "parent-no-write":
+        state.chmod(0o500)
+    if case == "parent-no-execute":
+        state.chmod(0o600)
+    if case == "settings-lock-write-only":
+        (state / "chat_settings.json.lock").chmod(0o200)
+    if case == "settings-lock-read-only":
+        (state / "chat_settings.json.lock").chmod(0o400)
+    if case == "legacy-unreadable-target-preserved":
+        original.chmod(0)
+        settings.chmod(0o400)
+    if case == "channel-legacy-unreadable-target-preserved":
+        (data / "channel_replies.json").chmod(0)
+        replies.chmod(0o400)
+    if case == "read-only-source-copy":
+        original.chmod(0o400)
+        data.chmod(0o500)
+    if case == "missing-nested-wx-ancestor":
+        state.chmod(0o300)
+    if case == "channel-link-parent-unwritable":
+        (state / "entry").chmod(0o500)
+    if case == "channel-link-referent-parent-unwritable":
+        (state / "referent").chmod(0o500)
+    if case == "settings-link-entry-parent-unwritable":
+        (state / "entry").chmod(0o500)
+    if case == "settings-link-referent-parent-unwritable":
+        (state / "referent").chmod(0o500)
+    if case.endswith("parent-symlink-dotdot"):
+        (state / "real" / (settings.name if case.startswith("settings") else replies.name)).chmod(0)
+    return data, state, config, dirs, paths, files
+
+
+def _snapshot_handles(dirs, paths, files):
+    def metadata(fd):
+        s = os.fstat(fd)
+        return (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid, s.st_size, s.st_mtime_ns)
+    result = {"directories": {}, "entries": {}, "contents": {}}
+    for name, fd in dirs:
+        os.lseek(fd, 0, os.SEEK_SET)
+        result["directories"][name] = (metadata(fd), sorted(os.listdir(fd)))
+    for name, fd in paths:
+        result["entries"][name] = metadata(fd)
+    for name, fd in files:
+        result["contents"][name] = os.pread(fd, os.fstat(fd).st_size, 0)
+    return result
+
+
+def _close_access_handles(dirs, paths, files):
+    for _name, fd in dirs + paths + files:
+        os.close(fd)
+
+
+def _runtime_access_result(data, state, config, kind, monkeypatch):
+    from wuwaterm_telegram.channel_reply_index import ChannelReplyIndex
+    from wuwaterm_telegram.settings import ChatSettings
+
+    def actual(path):
+        return str(state) + path.removeprefix("/app/state") if path and path.startswith("/app/state") else path
+
+    monkeypatch.setenv("WUWATERM_STATE_DIR", actual(config["state_dir"]))
+    if config["settings"]:
+        monkeypatch.setenv("WUWATERM_SETTINGS_PATH", actual(config["settings"]))
+    else:
+        monkeypatch.delenv("WUWATERM_SETTINGS_PATH", raising=False)
+    try:
+        if kind == "settings":
+            location = bot._chat_settings_path_from_env(data / "terms.db")
+            ChatSettings(location).allow(17)
+        else:
+            cfg = bot.BotConfig(channel_reply_index_path=actual(config["channel"]))
+            location = bot._channel_reply_index_path(cfg, data / "terms.db")
+            index = ChannelReplyIndex(storage_path=location)
+            if index.last_load_succeeded() is False:
+                return False
+            index._write_payload({"version": 1, "entries": []})
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+@pytest.mark.skipif(os.name != "posix" or not hasattr(os, "O_PATH") or os.geteuid() == 0,
+                    reason="requires a non-root Linux UID and real POSIX permissions")
+@pytest.mark.parametrize("case, expected, kind", _ACCESS_CASES)
+def test_mapped_access_matches_real_state_operations(monkeypatch, tmp_path, case, expected, kind):
+    plan_root, runtime_root = tmp_path / "plan", tmp_path / "runtime"
+    plan_root.mkdir()
+    runtime_root.mkdir()
+    data, state, config, *handles = _prepare_access_case(plan_root, case)
+    run_data, run_state, run_config, *run_handles = _prepare_access_case(runtime_root, case)
+    try:
+        monkeypatch.setenv("WUWATERM_STATE_DIR", config["state_dir"])
+        if config["settings"]:
+            monkeypatch.setenv("WUWATERM_SETTINGS_PATH", config["settings"])
+        if config["channel"]:
+            monkeypatch.setenv("WUWATERM_CHANNEL_REPLY_INDEX_PATH", config["channel"])
+        identity = config.get("identity", False)
+        mappings = [mount(data if identity else "/app/data", data, True),
+                    mount(state if identity else "/app/state", state)]
+        before = _snapshot_handles(*handles)
+        result = run_ops("state-plan", "--db", data / "terms.db" if identity else "/app/data/terms.db",
+                         "--mount", mappings[0], "--mount", mappings[1])
+        after = _snapshot_handles(*handles)
+        assert after == before
+        assert (result.returncode == 0) is expected, result.stderr
+        assert _runtime_access_result(run_data, run_state, run_config, kind, monkeypatch) is expected
+    finally:
+        _close_access_handles(*handles)
+        _close_access_handles(*run_handles)
+        for path in (state, run_state, data, run_data):
+            path.chmod(0o700)
+        for root in (state, run_state):
+            for child in root.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    child.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="requires non-root permissions")
+def test_unmapped_mode_reports_path_without_reading_legacy(monkeypatch, tmp_path):
+    data, state = tmp_path / "data", tmp_path / "state"
+    data.mkdir()
+    state.mkdir()
+    legacy = data / "chat_settings.json"
+    legacy.write_text('{"public":{},"allowed":[]}', encoding="utf-8")
+    with legacy.open("rb") as keep:
+        legacy.chmod(0)
+        before = (os.fstat(keep.fileno()), os.pread(keep.fileno(), 1000, 0), sorted(state.iterdir()))
+        monkeypatch.setenv("WUWATERM_STATE_DIR", str(state))
+        result = run_ops("state-plan", "--db", data / "terms.db")
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["kinds"]["chat-settings"]["migration"] == "copy-if-absent"
+        assert (os.fstat(keep.fileno()), os.pread(keep.fileno(), 1000, 0), sorted(state.iterdir())) == before
+
+
+@pytest.mark.parametrize("kind", ["chat-settings", "channel-replies"])
+def test_mapped_dangling_target_with_legacy_rejected_without_changes(monkeypatch, tmp_path, kind):
+    filename = "chat_settings.json" if kind == "chat-settings" else "channel_replies.json"
+    payload = ('{"public":{},"allowed":[]}' if kind == "chat-settings"
+               else '{"version":1,"entries":[]}')
+    fixtures = []
+    for name in ("preflight", "runtime"):
+        base = tmp_path / name
+        data, state = base / "data", base / "state"
+        data.mkdir(parents=True)
+        state.mkdir()
+        legacy = data / filename
+        legacy.write_text(payload, encoding="utf-8")
+        target = state / filename
+        target.symlink_to("missing.json")
+        fixtures.append((data, state, legacy, target))
+    data, state, legacy, target = fixtures[0]
+
+    def snapshot():
+        def metadata(path):
+            value = path.lstat()
+            return value.st_ino, value.st_mode, value.st_uid, value.st_size, value.st_mtime_ns
+        return metadata(legacy), legacy.read_bytes(), metadata(target), metadata(state), sorted(p.name for p in state.iterdir())
+
+    monkeypatch.setenv("WUWATERM_STATE_DIR", "/app/state")
+    before = snapshot()
+    result = run_ops("state-plan", "--db", "/app/data/terms.db",
+                     "--mount", mount("/app/data", data, True), "--mount", mount("/app/state", state))
+    assert result.returncode == 1
+    assert snapshot() == before
+    monkeypatch.setenv("WUWATERM_STATE_DIR", str(state))
+    no_mount = run_ops("state-plan", "--db", data / "terms.db")
+    assert no_mount.returncode == 0, no_mount.stderr
+    assert json.loads(no_mount.stdout)["kinds"][kind]["migration"] == "copy-if-absent"
+    assert snapshot() == before
+
+    data, state, legacy, target = fixtures[1]
+    monkeypatch.setenv("WUWATERM_STATE_DIR", str(state))
+    if kind == "chat-settings":
+        returned = bot._chat_settings_path_from_env(data / "terms.db")
+        assert returned == target and returned.is_symlink() and not returned.exists()
+    else:
+        with pytest.raises(bot.StateMigrationError):
+            bot._channel_reply_index_path(bot.BotConfig(), data / "terms.db")
+    assert target.is_symlink() and not target.exists()
+    assert legacy.read_text(encoding="utf-8") == payload
+
+
+@pytest.mark.parametrize("kind", ["chat-settings", "channel-replies"])
+def test_mapped_dangling_target_without_legacy_keeps_runtime_semantics(monkeypatch, tmp_path, kind):
+    from wuwaterm_telegram.channel_reply_index import ChannelReplyIndex
+    from wuwaterm_telegram.settings import ChatSettings
+
+    data, state = tmp_path / "data", tmp_path / "state"
+    data.mkdir()
+    state.mkdir()
+    filename = "chat_settings.json" if kind == "chat-settings" else "channel_replies.json"
+    target = state / filename
+    target.symlink_to("missing.json")
+    before = (target.lstat().st_ino, target.lstat().st_mtime_ns, sorted(p.name for p in state.iterdir()))
+    monkeypatch.setenv("WUWATERM_STATE_DIR", "/app/state")
+    result = run_ops("state-plan", "--db", "/app/data/terms.db",
+                     "--mount", mount("/app/data", data, True), "--mount", mount("/app/state", state))
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["kinds"][kind]["migration"] == "none"
+    assert (target.lstat().st_ino, target.lstat().st_mtime_ns, sorted(p.name for p in state.iterdir())) == before
+    monkeypatch.setenv("WUWATERM_STATE_DIR", str(state))
+    if kind == "chat-settings":
+        ChatSettings(bot._chat_settings_path_from_env(data / "terms.db")).allow(17)
+        assert target.is_symlink() and target.exists()
+    else:
+        location = bot._channel_reply_index_path(bot.BotConfig(), data / "terms.db")
+        ChannelReplyIndex(storage_path=location)._write_payload({"version": 1, "entries": []})
+        assert target.is_file() and not target.is_symlink()

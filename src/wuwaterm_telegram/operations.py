@@ -125,31 +125,79 @@ def _mounts(values: list[str]) -> list[tuple[Path, Path, bool]]:
     return sorted(mounts, key=lambda item: len(item[0].parts), reverse=True)
 
 
-def _map_path(path: Path, mounts: list[tuple[Path, Path, bool]], *, write: bool) -> Path:
-    absolute = path.resolve(strict=False)
+def _map_path(path: Path, mounts: list[tuple[Path, Path, bool]], *, write: bool) -> tuple[Path, Path]:
+    # Preserve the leaf entry: channel reply saves replace that entry, even
+    # when reading it follows a symlink to a different directory.
+    absolute = path if path.is_absolute() else Path.cwd() / path
     for container, host, read_only in mounts:
         try:
             relative = absolute.relative_to(container)
         except ValueError:
             continue
-        mapped = (host / relative).resolve(strict=False)
-        if not mapped.is_relative_to(host):
+        raw = host / relative
+        parent = raw.parent.resolve(strict=False)
+        entry = parent / raw.name
+        resolved = entry.resolve(strict=False)
+        if not parent.is_relative_to(host) or not resolved.is_relative_to(host):
             raise OperationsError("mapped path escapes mount")
         if write and read_only:
             raise OperationsError("target is mounted read-only")
-        if write:
-            parent = mapped.parent
-            while not parent.exists():
-                parent = parent.parent
-            if not parent.is_dir() or not parent.stat().st_mode & 0o222 or not os.access(parent, os.W_OK | os.X_OK):
-                raise OperationsError("state target is not writable")
-            if mapped.exists() and not stat.S_ISREG(mapped.stat().st_mode):
-                raise OperationsError("state target is not a regular file")
-            lock = mapped.with_name(mapped.name + ".lock")
-            if lock.is_symlink() or (lock.exists() and (not lock.is_file() or not os.access(lock, os.W_OK))):
-                raise OperationsError("state lock is not writable")
-        return mapped
+        return entry, resolved
     raise OperationsError("state path has no supplied mount")
+
+
+def _can_access(path: Path, mode: int) -> bool:
+    options = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
+    return os.access(path, mode, **options)
+
+
+def _preflight_target(kind: str, entry: Path, resolved: Path) -> None:
+    """Check metadata/access for the operations this state kind will perform."""
+    try:
+        info = resolved.stat()
+    except FileNotFoundError:
+        info = None
+    if info is not None and (not stat.S_ISREG(info.st_mode) or not _can_access(resolved, os.R_OK)):
+        raise OperationsError("existing state target is not readable")
+
+    # ChatSettings resolves its leaf in __init__; the reply index keeps its
+    # original leaf for os.replace while following that leaf for reading.
+    destination = resolved if kind == "chat-settings" else entry
+    parent = destination.parent
+    try:
+        parent_info = parent.stat()
+    except FileNotFoundError:
+        ancestor = parent
+        while True:
+            ancestor = ancestor.parent
+            try:
+                ancestor_info = ancestor.stat()
+                break
+            except FileNotFoundError:
+                continue
+        if not stat.S_ISDIR(ancestor_info.st_mode) or not _can_access(ancestor, os.W_OK | os.X_OK):
+            raise OperationsError("state parent cannot be created")
+    else:
+        if not stat.S_ISDIR(parent_info.st_mode) or not _can_access(parent, os.R_OK | os.W_OK | os.X_OK):
+            raise OperationsError("state parent is not accessible")
+        if os.name == "posix" and parent_info.st_mode & stat.S_ISVTX:
+            try:
+                entry_info = destination.lstat()
+            except FileNotFoundError:
+                entry_info = None
+            uid = os.geteuid()
+            if entry_info is not None and uid not in (0, parent_info.st_uid, entry_info.st_uid):
+                raise OperationsError("sticky directory prevents replacing state entry")
+
+    if kind == "chat-settings":
+        lock = destination.with_name(destination.name + ".lock")
+        try:
+            lock_info = lock.lstat()
+        except FileNotFoundError:
+            lock_info = None
+        if lock_info is not None and (not stat.S_ISREG(lock_info.st_mode)
+                                      or not _can_access(lock, os.R_OK | os.W_OK)):
+            raise OperationsError("state lock is not readable and writable")
 
 
 def state_plan(db_path: Path, mount_args: list[str]) -> dict[str, object]:
@@ -164,17 +212,22 @@ def state_plan(db_path: Path, mount_args: list[str]) -> dict[str, object]:
         )
         target = paths.effective
         legacy = paths.legacy
-        host_target = _map_path(target, mounts, write=True) if mounts else target
-        host_legacy = (
-            _map_path(legacy, mounts, write=False)
-            if mounts and paths.migration_target is not None else legacy
-        )
+        if mounts:
+            entry, resolved = _map_path(target, mounts, write=True)
+            _preflight_target(kind, entry, resolved)
+            host_target = resolved if kind == "chat-settings" else entry
+            host_legacy = (_map_path(legacy, mounts, write=False)[1]
+                           if paths.migration_target is not None else legacy)
+        else:
+            host_target, host_legacy = target, legacy
         action = "none"
         if paths.migration_target is not None and host_legacy.exists():
             if host_target.exists():
                 action = "validate-existing"
             elif host_legacy.resolve(strict=False) != host_target.resolve(strict=False):
-                if not host_legacy.is_file() or not os.access(host_legacy, os.R_OK):
+                if mounts and entry.is_symlink() and not resolved.exists():
+                    raise OperationsError("legacy state cannot be copied to a dangling target")
+                if mounts and (not host_legacy.is_file() or not _can_access(host_legacy, os.R_OK)):
                     raise OperationsError("legacy state file is not readable")
                 action = "copy-if-absent"
         plans[kind] = {
