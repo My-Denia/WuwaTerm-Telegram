@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -19,15 +20,17 @@ def state_paths(
     filename: str,
     explicit_path: str | Path | None,
     state_dir: str | None,
+    resolve: Callable[[Path], Path] | None = None,
 ) -> StatePaths:
     """Match the bot's existing explicit-path and state-dir precedence."""
-    legacy = Path(db_path).resolve(strict=False).parent / filename
+    resolve = resolve or (lambda path: path.resolve(strict=False))
+    legacy = resolve(Path(db_path)).parent / filename
     target = Path(state_dir).expanduser() / filename if state_dir else None
     if explicit_path:
         explicit = Path(explicit_path).expanduser()
         if target is not None and (
-            explicit.resolve(strict=False) == legacy.resolve(strict=False)
-            or explicit.resolve(strict=False) == target.resolve(strict=False)
+            resolve(explicit) == resolve(legacy)
+            or resolve(explicit) == resolve(target)
         ):
             return StatePaths(target, legacy, target)
         return StatePaths(explicit, legacy, None)

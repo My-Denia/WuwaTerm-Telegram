@@ -174,24 +174,30 @@ def test_mounted_plan_fails_closed_and_reports_original_source(monkeypatch, tmp_
 
 
 def test_explicit_custom_unmapped_is_rejected(monkeypatch, tmp_path):
-    state = tmp_path / "state"
+    data, state = tmp_path / "data", tmp_path / "state"
+    data.mkdir()
     state.mkdir()
     monkeypatch.setenv("WUWATERM_STATE_DIR", "/app/state")
     monkeypatch.setenv("WUWATERM_SETTINGS_PATH", "/outside/custom-name.json")
-    result = run_ops("state-plan", "--db", "/app/data/terms.db", "--mount", mount("/app/state", state))
+    result = run_ops("state-plan", "--db", "/app/data/terms.db",
+                     "--mount", mount("/app/data", data, True), "--mount", mount("/app/state", state))
     assert result.returncode == 1
+    assert "state path has no supplied mount" in result.stderr
     assert not list(state.iterdir())
 
 
 def test_mapping_escape_through_symlink_is_rejected(monkeypatch, tmp_path):
-    state, outside = tmp_path / "state", tmp_path / "outside"
+    data, state, outside = tmp_path / "data", tmp_path / "state", tmp_path / "outside"
+    data.mkdir()
     state.mkdir()
     outside.mkdir()
-    (state / "escape").symlink_to(outside, target_is_directory=True)
+    (state / "escape").symlink_to("../outside", target_is_directory=True)
     monkeypatch.setenv("WUWATERM_SETTINGS_PATH", "/app/state/escape/custom.json")
     monkeypatch.setenv("WUWATERM_CHANNEL_REPLY_INDEX_PATH", "/app/state/replies.json")
-    result = run_ops("state-plan", "--db", "/app/data/terms.db", "--mount", mount("/app/state", state))
+    result = run_ops("state-plan", "--db", "/app/data/terms.db",
+                     "--mount", mount("/app/data", data, True), "--mount", mount("/app/state", state))
     assert result.returncode == 1
+    assert "unsupported mount traversal" in result.stderr
     assert not list(outside.iterdir())
 
 
@@ -260,17 +266,20 @@ def test_identity_refuses_changed_wheel_or_lock_version(tmp_path):
 
 
 def test_mapped_settings_lock_cannot_point_outside_mount(monkeypatch, tmp_path):
-    state, outside = tmp_path / "state", tmp_path / "outside"
+    data, state, outside = tmp_path / "data", tmp_path / "state", tmp_path / "outside"
+    data.mkdir()
     state.mkdir()
     outside.mkdir()
     other_lock = outside / "foreign-lock"
     other_lock.write_text("existing", encoding="utf-8")
-    (state / "chat_settings.json.lock").symlink_to(other_lock)
+    (state / "chat_settings.json.lock").symlink_to("../outside/foreign-lock")
     monkeypatch.setenv("WUWATERM_SETTINGS_PATH", "/app/state/chat_settings.json")
     monkeypatch.setenv("WUWATERM_CHANNEL_REPLY_INDEX_PATH", "/app/state/replies.json")
     before = snapshot([other_lock])
-    result = run_ops("state-plan", "--db", "/app/data/terms.db", "--mount", mount("/app/state", state))
+    result = run_ops("state-plan", "--db", "/app/data/terms.db",
+                     "--mount", mount("/app/data", data, True), "--mount", mount("/app/state", state))
     assert result.returncode == 1
+    assert "state lock is not readable and writable" in result.stderr
     assert snapshot([other_lock]) == before
 
 
@@ -336,7 +345,7 @@ def _prepare_access_case(root, case):
         referent_dir.mkdir()
         referent = referent_dir / "stored.json"
         referent.write_text('{"version":1,"entries":[]}', encoding="utf-8")
-        (entry_dir / "custom-replies.json").symlink_to(referent)
+        (entry_dir / "custom-replies.json").symlink_to("../referent/stored.json")
         config["channel"] = "/app/state/entry/custom-replies.json"
     if case.startswith("settings-link-"):
         entry_dir, referent_dir = state / "entry", state / "referent"
@@ -344,7 +353,7 @@ def _prepare_access_case(root, case):
         referent_dir.mkdir()
         referent = referent_dir / "stored-settings.json"
         referent.write_text('{"public":{},"allowed":[]}', encoding="utf-8")
-        (entry_dir / "custom-settings.json").symlink_to(referent)
+        (entry_dir / "custom-settings.json").symlink_to("../referent/stored-settings.json")
         config["settings"] = "/app/state/entry/custom-settings.json"
     if case.endswith("parent-symlink-dotdot"):
         nested = state / "real" / "nested"
