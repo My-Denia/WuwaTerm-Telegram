@@ -414,7 +414,7 @@ class ChannelReplyIndex:
         try:
             with self.storage_path.open(encoding="utf-8") as f:
                 payload = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             self._record_load_failure()
             return
         try:
