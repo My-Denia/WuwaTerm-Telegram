@@ -316,11 +316,23 @@ def state_plan(db_path: Path, mount_args: list[str]) -> dict[str, object]:
     return {"database_path": str(db_path), "kinds": plans}
 
 
+def _max_age(value: str) -> int:
+    try:
+        age = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("max age must be an integer") from exc
+    if not 1 <= age <= 3600:
+        raise argparse.ArgumentTypeError("max age must be between 1 and 3600 seconds")
+    return age
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     identity_parser = commands.add_parser("identity", help="report offline installed/build identity")
     identity_parser.add_argument("--artifact-root", type=Path, default=Path("/app"))
+    health_parser = commands.add_parser("health", help="check recent successful SDK polling")
+    health_parser.add_argument("--max-age", type=_max_age, default=90, metavar="SECONDS")
     plan_parser = commands.add_parser("state-plan", help="plan state paths without writes")
     plan_parser.add_argument("--db", type=Path, required=True)
     plan_parser.add_argument(
@@ -329,7 +341,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        result = identity(args.artifact_root) if args.command == "identity" else state_plan(args.db, args.mount)
+        if args.command == "identity":
+            result = identity(args.artifact_root)
+        elif args.command == "health":
+            from .poll_health import health
+
+            result = health(args.max_age)
+        else:
+            result = state_plan(args.db, args.mount)
     except OperationsError as exc:
         print(f"could not determine {args.command}: {exc}", file=sys.stderr)
         return 1

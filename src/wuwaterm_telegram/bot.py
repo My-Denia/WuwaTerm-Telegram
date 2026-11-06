@@ -17,14 +17,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from telegram import ChatMember, Message, MessageEntity, Update
-from telegram.error import BadRequest, NetworkError, TelegramError
+from telegram.error import BadRequest, InvalidToken, NetworkError, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
+    ExtBot,
     MessageHandler,
+    Updater,
     filters,
 )
 
@@ -53,6 +55,7 @@ from .channel_reply_index import ChannelReplyIndex
 from .channel_reply_schema import ChannelReplyPayloadError, parse_channel_reply_payload
 from .channel_runtime import ChannelRuntime
 from .core_compat import verify_core_compatibility, verify_dictionary
+from . import poll_health
 from .runtime_keys import (
     ADMIN_CACHE_KEY,
     CHANNEL_REPLY_INDEX_KEY,
@@ -197,6 +200,80 @@ class BotConfigError(ValueError):
 
 class StateMigrationError(RuntimeError):
     """Legacy runtime state could not be copied into the configured state dir."""
+
+
+class PollHealthBot(ExtBot):
+    """Keep the normal SDK requests and observe only completed SDK polls."""
+
+    __slots__ = ("_health_updater", "_health_warning_at")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._health_updater = None
+        self._health_warning_at = 0.0
+
+    async def get_updates(self, *args, **kwargs):
+        try:
+            updates = await super().get_updates(*args, **kwargs)
+        except InvalidToken:
+            if self._health_updater is not None:
+                self._health_updater._close_health_fd()
+            raise
+        updater = self._health_updater
+        if updater is not None and updater.running and updater.health_fd is not None:
+            try:
+                poll_health.record_success(updater.health_fd)
+            except (OSError, ValueError):
+                now = time.monotonic()
+                if now >= self._health_warning_at:
+                    LOGGER.warning("Polling health record unavailable")
+                    self._health_warning_at = now + 60
+        return updates
+
+
+class PollHealthUpdater(Updater):
+    """Close a process-local sentinel as soon as polling stops."""
+
+    __slots__ = ("_health_fd",)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._health_fd = None
+
+    @property
+    def health_fd(self):
+        return self._health_fd
+
+    def _close_health_fd(self):
+        fd, self._health_fd = self._health_fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                LOGGER.warning("Polling health sentinel could not be closed")
+
+    async def start_polling(self, *args, **kwargs):
+        if self.running:
+            return await super().start_polling(*args, **kwargs)
+        try:
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            self._health_fd = read_fd
+        except OSError:
+            LOGGER.warning("Polling health sentinel unavailable")
+        try:
+            return await super().start_polling(*args, **kwargs)
+        except BaseException:
+            self._close_health_fd()
+            raise
+
+    async def stop(self):
+        if self.running:
+            self._close_health_fd()
+        try:
+            return await super().stop()
+        finally:
+            self._close_health_fd()
 
 
 def _env_int(
@@ -824,16 +901,19 @@ def create_application(
     config: BotConfig | None = None,
     chat_settings: ChatSettings | None = None,
 ) -> Application:
+    health_enabled = poll_health.enabled()
     config = config or BotConfig.from_env()
     _validate_llm_config_env()
     if chat_settings is None:
         chat_settings = ChatSettings(_chat_settings_path_from_env(db_path))
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .post_shutdown(_close_translator_on_shutdown)
-        .build()
-    )
+    if health_enabled:
+        health_bot = PollHealthBot(token=token)
+        updater = PollHealthUpdater(bot=health_bot, update_queue=asyncio.Queue())
+        health_bot._health_updater = updater
+        builder = ApplicationBuilder().updater(updater)
+    else:
+        builder = ApplicationBuilder().token(token)
+    app = builder.post_shutdown(_close_translator_on_shutdown).build()
     app.bot_data[SERVICE_KEY] = build_term_service(db_path)
     translator = build_translator(
         db_path,

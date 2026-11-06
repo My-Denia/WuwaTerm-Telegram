@@ -12,9 +12,12 @@ services:
     environment:
       WUWATERM_DB_PATH: /app/data/terms.db
       WUWATERM_STATE_DIR: /app/state
+      WUWATERM_POLL_HEALTH: ${WUWATERM_POLL_HEALTH:-0}
       WUWATERM_API_WEB_ENABLED: ""
       WUWATERM_API_WEB_DEVICE_TOKEN: ""
       WUWATERM_API_WEB_EDGE_SECRET: ""
     volumes:
       - ../data:/app/data:ro
       - ../state:/app/state
+    tmpfs:
+      - /run/wuwaterm-telegram:rw,noexec,nosuid,nodev,size=1m,mode=0700
