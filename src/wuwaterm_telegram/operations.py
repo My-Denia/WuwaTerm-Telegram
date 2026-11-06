@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
 import hashlib
 from importlib import metadata
 import json
@@ -125,35 +127,146 @@ def _mounts(values: list[str]) -> list[tuple[Path, Path, bool]]:
     return sorted(mounts, key=lambda item: len(item[0].parts), reverse=True)
 
 
-def _map_path(path: Path, mounts: list[tuple[Path, Path, bool]], *, write: bool) -> Path:
-    absolute = path.resolve(strict=False)
-    for container, host, read_only in mounts:
+_Mount = tuple[Path, Path, bool]
+
+
+@dataclass(frozen=True)
+class _MappedPath:
+    container: Path
+    host: Path
+    mount: _Mount
+
+
+@dataclass(frozen=True)
+class _ResolvedPath:
+    entry: _MappedPath
+    referent: _MappedPath
+
+
+class _MountResolver:
+    """Inspect one declared mount at a time in the container namespace."""
+
+    def __init__(self, mounts: list[_Mount]) -> None:
+        self.mounts = mounts  # longest container prefix first
+
+    def _mount_for(self, path: Path) -> _Mount | None:
+        return next((mount for mount in self.mounts if path.is_relative_to(mount[0])), None)
+
+    def _resolve(self, path: Path, *, follow_leaf: bool) -> _MappedPath:
+        absolute = path if path.is_absolute() else Path.cwd() / path
+        mount = self._mount_for(absolute)
+        if mount is None:
+            raise OperationsError("state path has no supplied mount")
+        container, host, _read_only = mount
+        # A direct nested mapping is usable only when its declared parent is
+        # reached without an unestablished alias in an enclosing mount.
+        enclosing = self._mount_for(container.parent)
+        if enclosing is not None and enclosing != mount:
+            parent = self._resolve(container.parent, follow_leaf=True)
+            if parent.container != container.parent or not parent.host.is_dir():
+                raise OperationsError("unsupported mount traversal")
+        pending = deque(absolute.relative_to(container).parts)
+        current = container
+        links = 0
+        while pending:
+            component = pending.popleft()
+            candidate = current.parent if component == ".." else current / component
+            # Check before lstat/readlink: an outer backing tree may contain a
+            # completely different entry hidden by a nested container mount.
+            if self._mount_for(candidate) != mount:
+                raise OperationsError("unsupported mount traversal")
+            current = candidate
+            if component == ".." or (not pending and not follow_leaf):
+                continue
+            inspection = host / current.relative_to(container)
+            try:
+                info = inspection.lstat()
+            except FileNotFoundError:
+                # A later component may still cross a nested mount.
+                continue
+            if not stat.S_ISLNK(info.st_mode):
+                continue
+            links += 1
+            if links > 40:
+                raise OperationsError("unsupported mount traversal")
+            link = Path(os.readlink(inspection))
+            if link.is_absolute():
+                try:
+                    parts = link.relative_to(container).parts
+                except ValueError:
+                    raise OperationsError("unsupported mount traversal") from None
+                current = container
+            else:
+                parts = link.parts
+                current = current.parent
+            pending.extendleft(reversed(parts))
+        return _MappedPath(current, host / current.relative_to(container), mount)
+
+    def entry(self, path: Path) -> _MappedPath:
+        return self._resolve(path, follow_leaf=False)
+
+    def resolve(self, path: Path) -> _ResolvedPath:
+        entry = self.entry(path)
+        return _ResolvedPath(entry, self._resolve(entry.container, follow_leaf=True))
+
+
+def _can_access(path: Path, mode: int) -> bool:
+    options = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
+    return os.access(path, mode, **options)
+
+
+def _preflight_target(kind: str, entry: Path, resolved: Path, lock: Path | None = None) -> None:
+    """Check metadata/access for the operations this state kind will perform."""
+    try:
+        info = resolved.stat()
+    except FileNotFoundError:
+        info = None
+    if info is not None and (not stat.S_ISREG(info.st_mode) or not _can_access(resolved, os.R_OK)):
+        raise OperationsError("existing state target is not readable")
+
+    # ChatSettings resolves its leaf in __init__; the reply index keeps its
+    # original leaf for os.replace while following that leaf for reading.
+    destination = resolved if kind == "chat-settings" else entry
+    parent = destination.parent
+    try:
+        parent_info = parent.stat()
+    except FileNotFoundError:
+        ancestor = parent
+        while True:
+            ancestor = ancestor.parent
+            try:
+                ancestor_info = ancestor.stat()
+                break
+            except FileNotFoundError:
+                continue
+        if not stat.S_ISDIR(ancestor_info.st_mode) or not _can_access(ancestor, os.W_OK | os.X_OK):
+            raise OperationsError("state parent cannot be created")
+    else:
+        if not stat.S_ISDIR(parent_info.st_mode) or not _can_access(parent, os.R_OK | os.W_OK | os.X_OK):
+            raise OperationsError("state parent is not accessible")
+        if os.name == "posix" and parent_info.st_mode & stat.S_ISVTX:
+            try:
+                entry_info = destination.lstat()
+            except FileNotFoundError:
+                entry_info = None
+            uid = os.geteuid()
+            if entry_info is not None and uid not in (0, parent_info.st_uid, entry_info.st_uid):
+                raise OperationsError("sticky directory prevents replacing state entry")
+
+    if kind == "chat-settings":
+        assert lock is not None
         try:
-            relative = absolute.relative_to(container)
-        except ValueError:
-            continue
-        mapped = (host / relative).resolve(strict=False)
-        if not mapped.is_relative_to(host):
-            raise OperationsError("mapped path escapes mount")
-        if write and read_only:
-            raise OperationsError("target is mounted read-only")
-        if write:
-            parent = mapped.parent
-            while not parent.exists():
-                parent = parent.parent
-            if not parent.is_dir() or not parent.stat().st_mode & 0o222 or not os.access(parent, os.W_OK | os.X_OK):
-                raise OperationsError("state target is not writable")
-            if mapped.exists() and not stat.S_ISREG(mapped.stat().st_mode):
-                raise OperationsError("state target is not a regular file")
-            lock = mapped.with_name(mapped.name + ".lock")
-            if lock.is_symlink() or (lock.exists() and (not lock.is_file() or not os.access(lock, os.W_OK))):
-                raise OperationsError("state lock is not writable")
-        return mapped
-    raise OperationsError("state path has no supplied mount")
+            lock_info = lock.lstat()
+        except FileNotFoundError:
+            lock_info = None
+        if lock_info is not None and (not stat.S_ISREG(lock_info.st_mode)
+                                      or not _can_access(lock, os.R_OK | os.W_OK)):
+            raise OperationsError("state lock is not readable and writable")
 
 
 def state_plan(db_path: Path, mount_args: list[str]) -> dict[str, object]:
     mounts = _mounts(mount_args)
+    resolver = _MountResolver(mounts) if mounts else None
     plans = {}
     for kind, (filename, variable) in _KINDS.items():
         paths = state_paths(
@@ -161,20 +274,36 @@ def state_plan(db_path: Path, mount_args: list[str]) -> dict[str, object]:
             filename=filename,
             explicit_path=os.getenv(variable, "").strip() or None,
             state_dir=os.getenv("WUWATERM_STATE_DIR", "").strip() or None,
+            resolve=(lambda path: resolver.resolve(path).referent.container) if resolver else None,
         )
         target = paths.effective
         legacy = paths.legacy
-        host_target = _map_path(target, mounts, write=True) if mounts else target
-        host_legacy = (
-            _map_path(legacy, mounts, write=False)
-            if mounts and paths.migration_target is not None else legacy
-        )
+        if resolver:
+            mapped = resolver.resolve(target)
+            destination = mapped.referent if kind == "chat-settings" else mapped.entry
+            if destination.mount[2]:
+                raise OperationsError("target is mounted read-only")
+            lock = None
+            if kind == "chat-settings":
+                lock = resolver.entry(destination.container.with_name(destination.container.name + ".lock"))
+                if lock.mount[2]:
+                    raise OperationsError("target is mounted read-only")
+            _preflight_target(kind, mapped.entry.host, mapped.referent.host, lock.host if lock else None)
+            host_target = destination.host
+            mapped_legacy = (resolver.resolve(legacy).referent
+                             if paths.migration_target is not None else None)
+            host_legacy = mapped_legacy.host if mapped_legacy else legacy
+        else:
+            host_target, host_legacy = target, legacy
         action = "none"
         if paths.migration_target is not None and host_legacy.exists():
-            if host_target.exists():
+            if (mapped.referent.host.exists() if resolver else host_target.exists()):
                 action = "validate-existing"
-            elif host_legacy.resolve(strict=False) != host_target.resolve(strict=False):
-                if not host_legacy.is_file() or not os.access(host_legacy, os.R_OK):
+            elif ((mapped_legacy.container != mapped.referent.container) if resolver
+                  else host_legacy.resolve(strict=False) != host_target.resolve(strict=False)):
+                if resolver and mapped.entry.host.is_symlink() and not mapped.referent.host.exists():
+                    raise OperationsError("legacy state cannot be copied to a dangling target")
+                if mounts and (not host_legacy.is_file() or not _can_access(host_legacy, os.R_OK)):
                     raise OperationsError("legacy state file is not readable")
                 action = "copy-if-absent"
         plans[kind] = {
@@ -220,6 +349,9 @@ def main(argv: list[str] | None = None) -> int:
             result = health(args.max_age)
         else:
             result = state_plan(args.db, args.mount)
+    except OperationsError as exc:
+        print(f"could not determine {args.command}: {exc}", file=sys.stderr)
+        return 1
     except (OSError, UnicodeError, ValueError, metadata.PackageNotFoundError) as exc:
         print(f"could not determine {args.command}: {type(exc).__name__}", file=sys.stderr)
         return 1
