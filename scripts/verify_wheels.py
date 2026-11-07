@@ -58,20 +58,41 @@ def verify(args: argparse.Namespace) -> None:
     check_wheel(args.telegram, args.telegram_sha256, "wuwaterm-telegram", product["project"]["version"])
 
 
-def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
+def parser(description: str | None = __doc__) -> argparse.ArgumentParser:
+    """Official mode: --lock + --core. Explicit local mode: --local-core-wheel + --local-core-sha256.
+
+    The older ``--core`` + ``--local-core-sha256`` spelling stays accepted for
+    the same explicit local mode. A local Core never changes the committed lock.
+    """
+    p = argparse.ArgumentParser(description=description)
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--lock", type=Path)
     group.add_argument("--local-core-sha256")
-    p.add_argument("--core", type=Path, required=True)
+    wheel = p.add_mutually_exclusive_group(required=True)
+    wheel.add_argument("--core", type=Path)
+    wheel.add_argument("--local-core-wheel", type=Path)
     p.add_argument("--telegram", type=Path, required=True)
     p.add_argument("--telegram-sha256", required=True)
     return p
 
 
+def finish(p: argparse.ArgumentParser, args: argparse.Namespace) -> argparse.Namespace:
+    """Resolve the Core wheel path and reject mixed official/local inputs."""
+    if args.local_core_wheel is not None:
+        if args.local_core_sha256 is None:
+            p.error("--local-core-wheel requires --local-core-sha256")
+        args.core = args.local_core_wheel
+    return args
+
+
+def parse_args(argv: list[str] | None = None, p: argparse.ArgumentParser | None = None) -> argparse.Namespace:
+    p = p or parser()
+    return finish(p, p.parse_args(argv))
+
+
 if __name__ == "__main__":
     try:
-        verify(parser().parse_args())
+        verify(parse_args())
     except LockError as exc:
         raise SystemExit(str(exc)) from exc
     print("Both wheel checks passed")
