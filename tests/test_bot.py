@@ -3116,6 +3116,28 @@ def test_short_english_word_is_not_hijacked_by_pinyin_fuzzy(monkeypatch, sample_
     assert "声骸" not in message.replies[0][0]
 
 
+def test_full_pinyin_and_abbrev_queries_still_answer_from_dictionary(monkeypatch, sample_db):
+    from wuwaterm.application import _fuzzy_dictionary_answer
+
+    service = TermService(sample_db)
+    assert _fuzzy_dictionary_answer(service, "shenghai", to_chinese=False) == "Echo"
+    assert _fuzzy_dictionary_answer(service, "sh", to_chinese=False) == "Echo"
+    assert _fuzzy_dictionary_answer(service, "he", to_chinese=False) is None
+    assert _fuzzy_dictionary_answer(service, "eng", to_chinese=False) is None
+
+    calls = []
+    enable_mock_llm(monkeypatch, calls, lambda _t, _l: "should not run")
+    for query in ("shenghai", "sh"):
+        update, message = fake_update()
+        context = fake_context(sample_db, ["--to", "en", query])
+
+        asyncio.run(term_command(update, context))
+
+        assert message.replies == [("Echo", None)]
+        assert message.reply_kwargs == [{"do_quote": False}]
+    assert calls == []
+
+
 
 def test_tr_inline_formatted_text_uses_html_pipeline(monkeypatch, sample_db):
     calls = []
