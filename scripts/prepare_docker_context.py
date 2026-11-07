@@ -6,18 +6,13 @@ import shutil
 from pathlib import Path
 
 from core_lock import ROOT, LockError
-from verify_wheels import verify
+from verify_wheels import parse_args, parser, verify
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--lock", type=Path, required=True)
-    p.add_argument("--core", type=Path, required=True)
-    p.add_argument("--telegram", type=Path, required=True)
-    p.add_argument("--telegram-sha256", required=True)
+    p: argparse.ArgumentParser = parser(__doc__)
     p.add_argument("--output-dir", type=Path, required=True)
-    args = p.parse_args()
-    args.local_core_sha256 = None
+    args = parse_args(p=p)
     try:
         verify(args)
         if args.core.name == args.telegram.name:
@@ -27,13 +22,17 @@ def main() -> None:
         args.output_dir.mkdir(parents=True)
         for name in ("scripts", "src/wuwaterm_telegram", "wheels"):
             (args.output_dir / name).mkdir(parents=True, exist_ok=True)
+        # An explicit local Core carries no reviewed lock; the committed one is
+        # neither copied nor changed, and the image records no official lock.
+        lock = [(args.lock, "core-lock.json")] if args.lock else []
         for source, target in (
-            (args.lock, "core-lock.json"),
+            *lock,
             (ROOT / "pyproject.toml", "pyproject.toml"),
             (ROOT / "src/wuwaterm_telegram/core_compat.py", "src/wuwaterm_telegram/core_compat.py"),
             (ROOT / "scripts/core_lock.py", "scripts/core_lock.py"),
             (ROOT / "scripts/verify_wheels.py", "scripts/verify_wheels.py"),
             (ROOT / "scripts/install_verified.py", "scripts/install_verified.py"),
+            (ROOT / "scripts/install_probe.py", "scripts/install_probe.py"),
             (args.core, f"wheels/{args.core.name}"),
             (args.telegram, f"wheels/{args.telegram.name}"),
         ):
@@ -44,6 +43,8 @@ def main() -> None:
     except (LockError, OSError) as exc:
         raise SystemExit(f"Docker context preparation failed: {exc}") from exc
     print("Verified Docker build context prepared")
+    if args.local_core_sha256:
+        print(f"Local Core: build with --build-arg CORE_WHEEL_SHA256={args.local_core_sha256}")
 
 
 if __name__ == "__main__":

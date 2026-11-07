@@ -5,11 +5,11 @@ import subprocess
 import sys
 
 from core_lock import LockError
-from verify_wheels import parser, verify
+from verify_wheels import parse_args, verify
 
 
 def main() -> None:
-    args = parser().parse_args()
+    args = parse_args()
     try:
         verify(args)
     except LockError as exc:

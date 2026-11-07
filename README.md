@@ -84,6 +84,10 @@ cp deploy/env.example .env
 docker compose -f deploy/docker-compose.yml up --build -d
 ```
 
+For an offline or local build, pass one explicit Core wheel instead of the lock: `--local-core-wheel <wheel> --local-core-sha256 <sha256>` replaces `--lock`/`--core`. The wheel must match that hash and the exact Core version; the committed lock is not read or changed, and the context carries no lock. Build it with the printed `--build-arg CORE_WHEEL_SHA256=<sha256>`; the image then records no reviewed Core lock.
+
+The final image layer only adds `/usr/local/share/wuwaterm/install-probe.json`, a build-time report of the installed files and their SHA-256 values for `wuwaterm` and `wuwaterm-telegram`.
+
 An optional `WUWATERM_SOURCE_REVISION` build argument may be supplied as a full lowercase commit SHA after verifying the wheel provenance. The image records it as an unverified claim. Compose keeps API Web credentials out of the bot container even when a shared `.env` contains them.
 
 Place the database at `data/terms.db`; Compose mounts `data/` read-only and `state/` read-write. The prepared Docker context contains only the lock, wheel artifacts and verification code, not the workspace or `.env`. Stop the old bot before starting a replacement against the same state.
