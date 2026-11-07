@@ -11,8 +11,61 @@ permissions:
 jobs:
   validate:
     uses: ./.github/workflows/ci.yml
-  publish:
+  # One image per tag, built from the tagged commit with the reviewed Core wheel.
+  # The sealed bundle is a build claim for offline verification and acquisition;
+  # nothing is pushed to a registry or deployed here.
+  image-bundle:
     needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Fetch the pinned Core wheel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/fetch_core.py --lock core-lock.json --output-dir artifacts
+      - uses: actions/download-artifact@v7
+        with:
+          name: telegram-package
+          path: dist
+      - name: Build and seal the image bundle
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          core=(artifacts/*.whl)
+          telegram=(dist/*.whl)
+          test "${#core[@]}" -eq 1 && test "${#telegram[@]}" -eq 1
+          # The builder never pulls; the base image digest is recorded in the bundle.
+          docker pull python:3.11-slim
+          python scripts/build_delivery.py --out delivery --commit "$GITHUB_SHA" --tag "$RELEASE_TAG" \
+            --core-wheel "${core[0]}" --telegram-wheel "${telegram[0]}" --authority official-ci 9>&-
+      # The attempt directory is named after a never-reused ID; publishing must not
+      # depend on it. Stage the four release files under fixed names, plus the inputs
+      # offline verification needs, so the download side reads exactly these paths.
+      - name: Stage the sealed attempt for publication
+        run: |
+          attempts=(delivery/attempts/*/)
+          test "${#attempts[@]}" -eq 1
+          attempt="${attempts[0]}"
+          mkdir -p release-assets
+          cp "$attempt/bundle/bundle.json" "$attempt/bundle/install-probe.json" \
+            "$attempt/bundle/image.oci.tar" "$attempt/inputs/source.tar" release-assets/
+          cp -r "$attempt/inputs/wheels" release-assets/wheels
+          (cd release-assets && sha256sum bundle.json install-probe.json image.oci.tar source.tar > SHA256SUMS)
+          (cd release-assets && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: telegram-image-bundle
+          path: release-assets
+          if-no-files-found: error
+  publish:
+    needs: [validate, image-bundle]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -30,10 +83,25 @@ jobs:
         with:
           name: telegram-package
           path: dist
+      - uses: actions/download-artifact@v7
+        with:
+          name: telegram-image-bundle
+          path: release-assets
       - name: Verify artifacts and publish
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           (cd dist && sha256sum -c SHA256SUMS)
-          gh release create "$RELEASE_TAG" --verify-tag --generate-notes dist/*.whl dist/*.tar.gz dist/SHA256SUMS
+          # The staged bundle keeps the digest it was sealed with, independent of the
+          # attempt ID and of how the artifact was packed.
+          (cd release-assets && sha256sum -c SHA256SUMS)
+          # Exactly the paths gh release create publishes; offline verification of the
+          # bundle also needs release-assets/wheels, which stays in the artifact.
+          test -f release-assets/bundle.json
+          test -f release-assets/install-probe.json
+          test -f release-assets/image.oci.tar
+          test -f release-assets/source.tar
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes dist/*.whl dist/*.tar.gz dist/SHA256SUMS \
+            release-assets/bundle.json release-assets/install-probe.json release-assets/image.oci.tar \
+            release-assets/source.tar
