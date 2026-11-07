@@ -17,6 +17,10 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      # Core authors the probe; this copy must stay byte-identical to it. Change
+      # the digest only together with Core's scripts/install_probe.py.
+      - name: Verify the install probe matches Core's copy
+        run: echo "5d4e3579e9c1e34c621415c53ee6619f6c6240d574ca7aae80033878d380bf0d  scripts/install_probe.py" | sha256sum -c -
       # The committed lock is the trust root. A missing/inaccessible producer,
       # wrong run, expired artifact or mismatched wheel stops here before pip.
       # The token belongs to this consumer repository. Its cross-repository
