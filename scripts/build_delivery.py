@@ -23,6 +23,7 @@ container itself, never calls BuildKit, and starts every child process with
 from __future__ import annotations
 
 import argparse
+import configparser
 import csv
 import dataclasses
 from email.parser import BytesParser
@@ -578,6 +579,29 @@ def compiled_cache(path: str) -> bool:
     return path.endswith((".pyc", ".pyo")) or "__pycache__" in path.split("/")
 
 
+def installer_path(path: str) -> bool:
+    """A wheel member an installer does not install verbatim.
+
+    ``*.data`` content is relocated to the installation prefix, and ``RECORD`` and
+    its neighbours are written by the installer itself rather than shipped.
+    """
+    top, _, rest = path.partition("/")
+    return ".data/" in path or (top.endswith(".dist-info") and rest in INSTALLER_FILES)
+
+
+def relocated_data(members: dict[str, str], digest: str, target: str, data_root: str) -> bool:
+    """Whether ``target`` is a wheel's ``*.data/data`` member, bound by the member's bytes."""
+    for member, member_digest in members.items():
+        top, _, rest = member.partition("/")
+        if not top.endswith(".data") or not rest.startswith("data/") or member_digest != digest:
+            continue
+        relative = rest[len("data/"):]
+        if relative and not relative.startswith("bin/") \
+                and target == posixpath.normpath(posixpath.join(data_root, relative)):
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------
 # inputs
 # --------------------------------------------------------------------------
@@ -616,6 +640,43 @@ def wheel_members(path: Path, package: str, version: str) -> dict[str, str]:
             return {n: sha(wheel.read(n)) for n in names if not n.endswith("/")}
     except (OSError, zipfile.BadZipFile, KeyError, ValueError) as exc:
         raise BuildError(path.name + ": unreadable wheel") from exc
+
+
+def wheel_script_names(path: Path) -> frozenset[str]:
+    """Script names an installer creates from entry points and ``*.data/scripts`` members."""
+    names: set[str] = set()
+    try:
+        with zipfile.ZipFile(path) as wheel:
+            members = wheel.namelist()
+            for member in members:
+                if member.endswith("/"):
+                    continue
+                top, _, rest = member.partition("/")
+                if top.endswith(".data") and rest.startswith("scripts/"):
+                    script = rest[len("scripts/"):]
+                    if "/" in script:
+                        fail(path.name + ": wheel script member is not a plain file")
+                    names.add(script)
+            meta = [n for n in members if n.count("/") == 1 and n.endswith(".dist-info/METADATA")]
+            if len(meta) != 1:
+                fail(path.name + ": wheel metadata is invalid")
+            entry = meta[0].rsplit("/", 1)[0] + "/entry_points.txt"
+            if entry in members:
+                parser = configparser.ConfigParser(interpolation=None)
+                parser.optionxform = str
+                try:
+                    parser.read_string(wheel.read(entry).decode("utf-8"))
+                except (UnicodeError, configparser.Error) as exc:
+                    raise BuildError(path.name + ": invalid wheel entry points") from exc
+                for section in ("console_scripts", "gui_scripts"):
+                    if parser.has_section(section):
+                        names.update(name.strip() for name, _ in parser.items(section))
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise BuildError(path.name + ": unreadable wheel") from exc
+    for name in names:
+        if not name or "/" in name or name in (".", "..") or "\x00" in name:
+            fail(path.name + ": wheel script name is not a plain file")
+    return frozenset(names)
 
 
 def check_wheel_matches_source(wheel_path: Path, source_dir: Path) -> None:
@@ -799,6 +860,7 @@ def check_sealed(attempt: Path) -> dict[str, Any]:
     if bundle["build_result"]["iid"] not in (image.facts["manifest_digest"], image.facts["config_digest"]):
         fail("build image ID differs from the sealed archive")
     wheels: dict[str, dict[str, str]] = {}
+    wheel_scripts: dict[str, frozenset[str]] = {}
     wheel_hashes: dict[str, str] = {}
     for wheel in bundle["wheels"]:
         path = attempt / "inputs" / "wheels" / wheel["filename"]
@@ -806,14 +868,15 @@ def check_sealed(attempt: Path) -> dict[str, Any]:
             fail("wheel bytes differ from the bundle: " + wheel["filename"])
         if wheel["role"] in ("core", "telegram"):
             wheels[wheel["package"]] = wheel_members(path, wheel["package"], wheel["version"])
+            wheel_scripts[wheel["package"]] = wheel_script_names(path)
             wheel_hashes[wheel["package"]] = wheel["sha256"]
-    check_image(image, bundle, report, members, wheels, wheel_hashes)
+    check_image(image, bundle, report, members, wheels, wheel_scripts, wheel_hashes)
     return bundle
 
 
 def check_image(image: OciArchive, bundle: dict[str, Any], report_raw: bytes,
                 source_members: dict[str, tuple[int, str, int]], wheels: dict[str, dict[str, str]],
-                wheel_hashes: dict[str, str]) -> None:
+                wheel_scripts: dict[str, frozenset[str]], wheel_hashes: dict[str, str]) -> None:
     """Bind the sealed claims to the reconstructed filesystem, not to the report's word."""
     probe = bundle["install_probe"]
     if probe["report_path"] != REPORT_PATH:
@@ -831,11 +894,12 @@ def check_image(image: OciArchive, bundle: dict[str, Any], report_raw: bytes,
         fail("installed Core version differs from the Core binding")
     if versions.get("wuwaterm-telegram") != bundle["version"]:
         fail("installed Telegram version differs from the bundle")
-    check_installed(image.rootfs, report, wheels, wheel_hashes, source_members)
+    check_installed(image.rootfs, report, wheels, wheel_scripts, wheel_hashes, source_members)
 
 
 def check_installed(rootfs: RootFS, report: dict[str, Any], wheels: dict[str, dict[str, str]],
-                    wheel_hashes: dict[str, str], source_members: dict[str, tuple[int, str, int]]) -> None:
+                    wheel_scripts: dict[str, frozenset[str]], wheel_hashes: dict[str, str],
+                    source_members: dict[str, tuple[int, str, int]]) -> None:
     """Every reported file must be the image's bytes and a verified wheel's bytes."""
     for package in report["packages"]:
         name, location = package["name"], package["location"]
@@ -883,12 +947,35 @@ def check_installed(rootfs: RootFS, report: dict[str, Any], wheels: dict[str, di
         if name not in wheels:
             fail("no verified wheel for the probed package: " + name)
         for path, digest in wheels[name].items():
-            generated = path.split("/", 1)[0].endswith(".dist-info") \
-                and posixpath.basename(path) in INSTALLER_FILES
-            if generated or ".data/" in path:
+            if installer_path(path):
                 continue
             if installed.get(path) != digest:
                 fail("installed file differs from the verified wheel: " + path)
+        # The wheel inventory also bounds what may be installed. A reported file is
+        # either a wheel member bytes-for-bytes, an installer-written dist-info file,
+        # a launcher the wheel's entry points (or ``*.data/scripts``) declare, or a
+        # ``*.data/data`` member the installer relocated to the prefix. A path is never
+        # normalized after the fact: ``zz.data/../evil.pth`` and a ``*.data`` member
+        # left where no installer puts it are not installed content.
+        dist_info_name = posixpath.basename(dist_info)
+        bin_dir = posixpath.dirname(report["interpreter"])
+        data_root = posixpath.normpath(posixpath.join(location, "../../.."))
+        for path, digest in installed.items():
+            if posixpath.normpath(path) != path:
+                fail("installed file path is not normalized: " + name + " " + path)
+            if path in wheels[name]:
+                if ".data/" in path:
+                    fail("installed file is an unrelocated wheel data member: " + name + " " + path)
+                continue
+            if posixpath.dirname(path) == dist_info_name and posixpath.basename(path) in INSTALLER_FILES:
+                continue
+            if path.startswith("../"):
+                target = posixpath.normpath(posixpath.join(location, path))
+                if posixpath.dirname(target) == bin_dir and posixpath.basename(target) in wheel_scripts[name]:
+                    continue
+                if relocated_data(wheels[name], digest, target, data_root):
+                    continue
+            fail("installed file is not in the verified wheel: " + name + " " + path)
         direct = package["direct_url"]
         hashes = direct.get("archive_info", {}).get("hashes", {}) if type(direct) is dict else {}
         if type(hashes) is dict and "sha256" in hashes and hashes["sha256"] != wheel_hashes[name]:
@@ -953,7 +1040,8 @@ def build(args: argparse.Namespace) -> int:
         if run([*git, "rev-parse", "--verify", "refs/tags/" + args.tag + "^{commit}"], capture=True) != commit:
             fail(f"tag {args.tag} does not peel to {commit}")
         tag = {"object": tag_object, "peeled_commit": commit}
-    attempt = begin(args.out, new_id())
+    # Absolutized: git -C resolves a relative archive output beneath --source, not here.
+    attempt = begin(args.out, new_id()).resolve()
     print("build_delivery: attempt " + attempt.name, file=sys.stderr)
 
     source_tar, source_dir = attempt / "inputs" / "source.tar", attempt / "context" / "source"
