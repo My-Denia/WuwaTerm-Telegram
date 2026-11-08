@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,9 @@ import build_delivery as bd  # noqa: E402
 
 CORE_COMMIT = "c" * 40
 SITE = "/usr/local/lib/python3.11/site-packages"
+INTERPRETER = "/usr/local/bin/python"
+BIN = posixpath.dirname(INTERPRETER)
+DATA_ROOT = posixpath.normpath(posixpath.join(SITE, "../../.."))
 PROGRAM_PATH = "/app/scripts/install_probe.py"
 REPORT_DIRS = ("usr", "usr/local", "usr/local/share", "usr/local/share/wuwaterm")
 REPORT_NAME = bd.REPORT_PATH.lstrip("/")
@@ -204,13 +208,20 @@ def dist_info(name: str, version: str) -> str:
     return f"{name.replace('-', '_')}-{version}.dist-info"
 
 
-def wheel(path: Path, name: str, version: str, files: dict[str, bytes] | None = None) -> Path:
+def wheel(path: Path, name: str, version: str, files: dict[str, bytes] | None = None,
+          scripts: dict[str, str] | None = None, data_files: dict[str, bytes] | None = None) -> Path:
     info = dist_info(name, version)
     with zipfile.ZipFile(path, "w") as z:
         z.writestr(f"{info}/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
         z.writestr(f"{info}/WHEEL", "Wheel-Version: 1.0\nGenerator: fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
         for member, data in (files or {}).items():
             z.writestr(member, data)
+        if scripts:
+            z.writestr(f"{info}/entry_points.txt", "[console_scripts]\n" + "".join(
+                f"{script} = {target}\n" for script, target in scripts.items()))
+        data_dir = info.removesuffix(".dist-info") + ".data"
+        for member, data in (data_files or {}).items():
+            z.writestr(f"{data_dir}/data/{member}", data)
         z.writestr(f"{info}/RECORD", f"{info}/METADATA,,\n{info}/RECORD,,\n")
     return path
 
@@ -234,22 +245,40 @@ def file_entries(files: dict[str, bytes]) -> list[tuple[str, str, bytes]]:
 class Layout:
     """The installed filesystem and the probe report a correct image has to agree on."""
 
-    def __init__(self, replace: dict[str, bytes] | None = None) -> None:
+    def __init__(self, replace: dict[str, bytes] | None = None,
+                 extra: dict[str, dict[str, bytes]] | None = None) -> None:
         self.files: dict[str, bytes] = {}
         self.packages: list[dict] = []
         self.replace = replace or {}
+        self.extra = extra or {}
 
-    def add(self, name: str, version: str, path: Path) -> None:
+    def add(self, name: str, version: str, path: Path, bin_scripts: dict[str, bytes] | None = None) -> None:
         members = wheel_members(path)
         info = next(top for top in {n.split("/", 1)[0] for n in members} if top.endswith(".dist-info"))
-        installed = {n: d for n, d in members.items() if n != f"{info}/RECORD"}
+        data_dir = info.removesuffix(".dist-info") + ".data"
+        installed: dict[str, bytes] = {}
+        for member, data in members.items():
+            if member == f"{info}/RECORD":
+                continue
+            top, _, rest = member.partition("/")
+            if top == data_dir and rest.startswith("data/"):
+                # An installer moves ``*.data/data`` content to the installation prefix.
+                installed[posixpath.relpath(posixpath.join(DATA_ROOT, rest[len("data/"):]), SITE)] = data
+            elif top == data_dir and rest.startswith("scripts/"):
+                installed[posixpath.relpath(posixpath.join(BIN, rest[len("scripts/"):]), SITE)] = data
+            else:
+                installed[member] = data
         installed.update({n: d for n, d in self.replace.items() if n in installed})
+        installed.update(self.extra.get(name, {}))
         installed[f"{info}/direct_url.json"] = bd.canonical({
             "archive_info": {"hashes": {"sha256": sha(path.read_bytes())}}, "url": "file:///wheels/" + path.name})
+        for script, data in (bin_scripts or {}).items():
+            installed[posixpath.relpath(posixpath.join(BIN, script), SITE)] = data
         rows = [f"{n},sha256={sha(d)},{len(d)}" for n, d in sorted(installed.items())] + [f"{info}/RECORD,,"]
         installed[f"{info}/RECORD"] = ("\n".join(rows) + "\n").encode()
         for member, data in installed.items():
-            self.files[SITE + "/" + member] = data
+            # RECORD keeps the stored path; the image holds the bytes where the installer put them.
+            self.files[posixpath.normpath(posixpath.join(SITE, member))] = data
         self.packages.append({
             "name": name, "version": version, "location": SITE,
             "direct_url": json.loads(installed[f"{info}/direct_url.json"]), "record_entries": len(rows),
@@ -259,7 +288,7 @@ class Layout:
 
     def report(self) -> bytes:
         return bd.canonical({"schema_version": 1, "kind": "install-probe", "product": "telegram",
-                             "interpreter": "/usr/local/bin/python", "python_version": "3.11.0",
+                             "interpreter": INTERPRETER, "python_version": "3.11.0",
                              "site_packages": SITE, "packages": self.packages, "extra_files": []})
 
     def layers(self, tamper: str | None = None) -> list[list[tuple[str, str, bytes]]]:
@@ -279,7 +308,8 @@ class Delivery:
     """A throwaway repository holding this tree's build inputs, a fake daemon and synthetic wheels."""
 
     def __init__(self, tmp_path: Path, *, archive: bytes | None = None, tamper: str | None = None,
-                 replace: dict[str, bytes] | None = None, iid: str | None = None) -> None:
+                 replace: dict[str, bytes] | None = None, extra: dict[str, dict[str, bytes]] | None = None,
+                 iid: str | None = None) -> None:
         self.tmp = tmp_path
         self.repo = tmp_path / "repo"
         for name in ("pyproject.toml", "deploy/Dockerfile", ".github/workflows/release.yml"):
@@ -290,7 +320,11 @@ class Delivery:
         import core_lock
         self.core_version = core_lock.product_core_version()
         self.core = wheel(tmp_path / f"wuwaterm-{self.core_version}-py3-none-any.whl", "wuwaterm", self.core_version,
-                          {"wuwaterm/__init__.py": b'"""Core fixture."""\n'})
+                          {"wuwaterm/__init__.py": b'"""Core fixture."""\n',
+                           "wuwaterm/cli.py": b"def main():\n    return 0\n",
+                           "wuwaterm_api/__init__.py": b'"""Core API fixture."""\n',
+                           "wuwaterm_api/cli.py": b"def main():\n    return 0\n"},
+                          scripts={"wuwaterm": "wuwaterm.cli:main", "wuwaterm-api": "wuwaterm_api.cli:main"})
         self.core_sha = sha(self.core.read_bytes())
         lock = json.loads((ROOT / "core-lock.json").read_text())
         lock.update(sha256=self.core_sha, expires_at="2999-01-01T00:00:00Z")
@@ -305,10 +339,15 @@ class Delivery:
         version = tomllib.loads((self.repo / "pyproject.toml").read_text())["project"]["version"]
         package = {f"wuwaterm_telegram/{p.relative_to(self.repo / 'src/wuwaterm_telegram').as_posix()}": p.read_bytes()
                    for p in (self.repo / "src/wuwaterm_telegram").rglob("*") if p.is_file()}
-        self.telegram = wheel(tmp_path / f"wuwaterm_telegram-{version}-py3-none-any.whl", "wuwaterm-telegram", version, package)
-        self.layout = Layout(replace)
-        self.layout.add("wuwaterm", self.core_version, self.core)
-        self.layout.add("wuwaterm-telegram", version, self.telegram)
+        self.telegram = wheel(tmp_path / f"wuwaterm_telegram-{version}-py3-none-any.whl", "wuwaterm-telegram", version,
+                              package, scripts={"wuwaterm-telegram": "wuwaterm_telegram.cli:main"},
+                              data_files={"share/doc/wuwaterm-telegram/PROVENANCE.md": b"# fixture provenance\n"})
+        self.layout = Layout(replace, extra)
+        self.layout.add("wuwaterm", self.core_version, self.core, bin_scripts={
+            "wuwaterm": f"#!{INTERPRETER}\nfrom wuwaterm.cli import main\n".encode(),
+            "wuwaterm-api": f"#!{INTERPRETER}\nfrom wuwaterm_api.cli import main\n".encode()})
+        self.layout.add("wuwaterm-telegram", version, self.telegram, bin_scripts={
+            "wuwaterm-telegram": f"#!{INTERPRETER}\nfrom wuwaterm_telegram.cli import main\n".encode()})
         self.home = tmp_path / "daemon"
         self.home.mkdir()
         raw = archive if archive is not None else oci_archive(self.layout.layers(tamper))
@@ -321,13 +360,14 @@ class Delivery:
         self.env = dict(os.environ, PATH=f"{fake.parent}:{os.environ['PATH']}", FAKE_DOCKER_HOME=str(self.home))
         self.out = tmp_path / "delivery"
 
-    def run(self, *extra: str, local: bool = True, shell_prefix: str = "9>&-") -> subprocess.CompletedProcess:
+    def run(self, *extra: str, local: bool = True, shell_prefix: str = "9>&-", out: str | None = None,
+            cwd: Path | None = None) -> subprocess.CompletedProcess:
         core = (["--local-core-wheel", str(self.core), "--local-core-sha256", self.core_sha,
                  "--local-core-source-commit", CORE_COMMIT] if local else ["--core-wheel", str(self.core)])
-        command = [sys.executable, str(SCRIPT), "--source", str(self.repo), "--out", str(self.out),
+        command = [sys.executable, str(SCRIPT), "--source", str(self.repo), "--out", out or str(self.out),
                    "--telegram-wheel", str(self.telegram), *core, *extra]
         return subprocess.run(["sh", "-c", f'exec "$@" {shell_prefix}', "sh", *command], env=self.env,
-                              capture_output=True, text=True, check=False)
+                              capture_output=True, text=True, check=False, cwd=cwd)
 
     def attempt(self) -> Path:
         (only,) = (self.out / "attempts").iterdir()
@@ -382,6 +422,16 @@ def test_the_self_check_rebuilds_the_installed_filesystem(delivery):
     ({"tamper": "missing-program"}, "not a regular file: " + PROGRAM_PATH),
     ({"tamper": "unrecorded-file"}, "unrecorded file in the installed package"),
     ({"replace": {"wuwaterm_telegram/__init__.py": b"# not the wheel\n"}}, "installed file differs from the verified wheel"),
+    ({"extra": {"wuwaterm-telegram": {"wuwaterm_telegram/injected.py": b"# in RECORD and the report, in no wheel\n"}}},
+     "installed file is not in the verified wheel: wuwaterm-telegram wuwaterm_telegram/injected.py"),
+    ({"extra": {"wuwaterm-telegram": {"../site-packages/evil.pth": b"# import-time hook beside the package\n"}}},
+     "installed file is not in the verified wheel: wuwaterm-telegram ../site-packages/evil.pth"),
+    ({"extra": {"wuwaterm-telegram": {"../sitecustomize.py": b"# import-time hook outside the package tree\n"}}},
+     "installed file is not in the verified wheel: wuwaterm-telegram ../sitecustomize.py"),
+    ({"extra": {"wuwaterm-telegram": {"zz.data/../evil.pth": b"# unnormalized path that resolves inside site-packages\n"}}},
+     "installed file path is not normalized: wuwaterm-telegram zz.data/../evil.pth"),
+    ({"extra": {"wuwaterm-telegram": {"x.data/evil.py": b"# wheel data member that was never relocated\n"}}},
+     "installed file is not in the verified wheel: wuwaterm-telegram x.data/evil.py"),
 ])
 def test_the_self_check_refuses_a_tampered_installed_state(tmp_path, options, reason):
     delivery = Delivery(tmp_path, **options)
@@ -390,6 +440,22 @@ def test_the_self_check_refuses_a_tampered_installed_state(tmp_path, options, re
     assert reason in result.stderr
     assert (delivery.attempt() / "bundle" / "install-probe.json").is_file()
     assert not (delivery.attempt() / "state" / "sealed.json").exists()
+
+
+def test_declared_console_scripts_and_relocated_data_are_installed_content(delivery):
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr
+    report = json.loads((delivery.attempt() / "bundle" / "install-probe.json").read_text())
+    paths = {item["path"] for package in report["packages"] for item in package["files"]}
+    assert {"../../../bin/wuwaterm", "../../../bin/wuwaterm-api", "../../../bin/wuwaterm-telegram",
+            "../../../share/doc/wuwaterm-telegram/PROVENANCE.md"} <= paths
+
+
+def test_a_relative_output_directory_is_resolved_before_archiving_another_source(delivery):
+    result = delivery.run(out="relative-delivery", cwd=delivery.tmp)
+    assert result.returncode == 0, result.stderr
+    (attempt,) = (delivery.tmp / "relative-delivery" / "attempts").iterdir()
+    assert (attempt / "inputs" / "source.tar").is_file() and (attempt / "bundle" / "bundle.json").is_file()
 
 
 def test_the_build_is_a_plain_untagged_build_without_inherited_descriptors(delivery):
