@@ -82,7 +82,8 @@ def report_layer(extra: list[tuple[str, str, bytes]] = (), report: bytes | None 
 
 
 def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict | None = None, repo_tags=None,
-                corrupt_layer: bool = False, stray: bool = False) -> bytes:
+                corrupt_layer: bool = False, stray: bool = False,
+                extra_blobs: dict[str, bytes] | None = None) -> bytes:
     blobs: dict[str, bytes] = {}
     descriptors, diff_ids = [], []
     for number, entries in enumerate(layers):
@@ -114,6 +115,8 @@ def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict
                 ("oci-layout", "file", b'{"imageLayoutVersion":"1.0.0"}')]
     if stray:
         entries.append(("repositories", "file", b"{}"))
+    for data in (extra_blobs or {}).values():
+        entries.append(("blobs/sha256/" + sha(data), "file", data))
     return tar_bytes(entries)
 
 
@@ -175,6 +178,44 @@ def test_read_oci_refuses_a_tampered_or_named_archive(tmp_path, raw, reason):
 def test_probe_report_must_be_the_canonical_telegram_record(raw):
     with pytest.raises(bd.BuildError):
         bd.check_report(raw)
+
+
+# ------------------------------------------------------------ image store layer records
+
+def layer_record() -> bytes:
+    """What the classic image store writes beside an image for a metadata-only layer."""
+    return json.dumps({"id": "sha256:" + "1" * 64, "parent": "", "created": "2026-11-08T00:00:00Z"}).encode()
+
+
+def test_store_layer_records_are_dropped_before_the_archive_is_checked(tmp_path):
+    record = layer_record()
+    path = tmp_path / "image.oci.tar"
+    path.write_bytes(image(extra_blobs={"record": record}))
+    assert bd.prune_store_layer_records(path) == 1
+    with tarfile.open(path) as tar:
+        assert "blobs/sha256/" + sha(record) not in [member.name for member in tar]
+    archive = bd.read_oci(path)
+    assert archive.facts["archive_sha256"] == sha(path.read_bytes())
+    assert archive.report == stub_report()
+    # The daemon may export no records at all, and pruning never repeats itself.
+    assert bd.prune_store_layer_records(path) == 0
+
+
+@pytest.mark.parametrize("blob", [b"payload", b'{"id": 3}', json.dumps({"id": "x" * 70000}).encode()])
+def test_an_unreferenced_blob_that_is_not_a_layer_record_is_still_refused(tmp_path, blob):
+    path = tmp_path / "image.oci.tar"
+    path.write_bytes(image(extra_blobs={"stray": blob}))
+    assert bd.prune_store_layer_records(path) == 0
+    with pytest.raises(bd.BuildError, match="unreferenced OCI archive content"):
+        bd.read_oci(path)
+
+
+def test_an_archive_without_records_is_left_byte_identical(tmp_path):
+    path = tmp_path / "image.oci.tar"
+    path.write_bytes(image())
+    before = path.read_bytes()
+    assert bd.prune_store_layer_records(path) == 0
+    assert path.read_bytes() == before
 
 
 # ------------------------------------------------------------ the whole command, with a fake daemon
@@ -407,6 +448,20 @@ def test_local_core_build_seals_a_bundle_in_the_core_layout(delivery):
     assert bd.check_sealed(attempt)["version"] == bundle["version"]
     source = tarfile.open(attempt / "inputs" / "source.tar")
     assert source.pax_headers["comment"] == delivery.commit
+
+
+def test_the_build_seals_away_the_records_a_daemon_exported_beside_the_image(delivery):
+    record = layer_record()
+    with tarfile.open(delivery.home / "archive.tar", mode="a") as tar:
+        info = tarfile.TarInfo("blobs/sha256/" + sha(record))
+        info.size = len(record)
+        tar.addfile(info, io.BytesIO(record))
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr
+    assert "dropped 1 image-store layer records" in result.stderr
+    with tarfile.open(delivery.attempt() / "bundle" / "image.oci.tar") as tar:
+        assert "blobs/sha256/" + sha(record) not in [member.name for member in tar]
+    assert bd.check_sealed(delivery.attempt())["version"]
 
 
 def test_the_self_check_rebuilds_the_installed_filesystem(delivery):

@@ -67,6 +67,9 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 GIT = re.compile(r"[0-9a-f]{40}\Z")
 CHUNK = 1024 * 1024
 MAX_JSON = 16 * 1024 * 1024
+# A layer record the classic image store exports beside an image is a few
+# hundred bytes of JSON; anything larger is not a record and is never dropped.
+RECORD_MAX = 64 * 1024
 MAX_CAPTURE = 16 * 1024 * 1024
 PROGRAM_PATH = "/app/scripts/install_probe.py"
 FINAL_LAYER_DIRS = {"usr", "usr/local", "usr/local/share", "usr/local/share/wuwaterm"}
@@ -364,6 +367,79 @@ def parse_json(raw: bytes) -> Any:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeError, ValueError) as exc:
         raise BuildError("invalid JSON") from exc
+
+
+def prune_store_layer_records(path: Path) -> int:
+    """Drop the image store's per-layer JSON records from a saved archive.
+
+    The classic image store keeps a JSON record for each metadata-only layer,
+    and ``docker image save`` writes those records as blobs beside the image even
+    though nothing in the index reaches them. They are store bookkeeping, not
+    image content, so the sealed archive keeps exactly the reachable closure.
+    Only records are dropped: any other unreferenced member stays and
+    :func:`read_oci` keeps refusing it. A malformed archive is left untouched so
+    the reader reports the reason.
+    """
+    try:
+        with tarfile.open(path, mode="r:") as tar:
+            infos = [(member_name(member.name), member) for member in tar]
+            by_name = dict(infos)
+            index_raw = extract_member(tar, by_name.get("index.json"))
+            manifests = parse_json(index_raw)["manifests"]
+            if type(manifests) is not list or len(manifests) != 1:
+                return 0
+            referenced = {"oci-layout", "index.json", "blobs", "blobs/sha256", "manifest.json"}
+            manifest_name = "blobs/sha256/" + blob_digest(manifests[0]["digest"])
+            referenced.add(manifest_name)
+            manifest = parse_json(extract_member(tar, by_name.get(manifest_name)))
+            referenced.add("blobs/sha256/" + blob_digest(manifest["config"]["digest"]))
+            referenced.update("blobs/sha256/" + blob_digest(layer["digest"]) for layer in manifest["layers"])
+            dropped = [name for name, member in infos
+                       if member.isfile() and name.startswith("blobs/sha256/") and name not in referenced]
+            if not dropped:
+                return 0
+            for name in dropped:
+                record = parse_json(extract_member(tar, by_name.get(name), cap=RECORD_MAX))
+                if type(record) is not dict or type(record.get("id")) is not str:
+                    return 0
+        temporary = path.parent / ("." + path.name + ".pruned-" + secrets.token_hex(8))
+        try:
+            with tarfile.open(path, mode="r:") as tar, tarfile.open(temporary, mode="w") as out:
+                for member in tar:
+                    if member_name(member.name) in dropped:
+                        continue
+                    out.addfile(member, tar.extractfile(member) if member.isfile() else None)
+            fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        fsync_dir(path.parent)
+        return len(dropped)
+    except (OSError, EOFError, tarfile.TarError, KeyError, IndexError, TypeError, ValueError, AttributeError,
+            BuildError):
+        return 0
+
+
+def extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo | None, *, cap: int = MAX_JSON) -> bytes:
+    """Read one regular member; the archive's own validator reports what is wrong."""
+    handle = tar.extractfile(member) if member is not None and member.isfile() else None
+    if handle is None or member.size > cap:
+        raise BuildError("OCI entry missing or oversized")
+    data = handle.read()
+    if len(data) != member.size:
+        raise BuildError("OCI entry truncated")
+    return data
+
+
+def blob_digest(digest: Any) -> str:
+    if type(digest) is not str or not DIGEST.fullmatch(digest):
+        raise BuildError("invalid OCI descriptor")
+    return digest[7:]
 
 
 def read_oci(path: Path) -> OciArchive:
@@ -1118,6 +1194,9 @@ def build(args: argparse.Namespace) -> int:
         fail("docker build wrote no full image ID")
     archive = attempt / "bundle" / ARCHIVE_FILE
     run(["docker", "image", "save", "-o", str(archive), iid])
+    dropped = prune_store_layer_records(archive)
+    if dropped:
+        print(f"build_delivery: dropped {dropped} image-store layer records", file=sys.stderr)
 
     image = read_oci(archive)
     raw = seal(
