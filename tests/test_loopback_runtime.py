@@ -91,7 +91,10 @@ def loopback_service():
                 elif mode == 'to_zh':
                     result = source.replace('hello', '你好')
                 else:
-                    result = source.replace('天地', 'world').replace('你好', 'hello')
+                    # Chinese source: terms reach the model as contextual
+                    # references, so the model itself renders them.
+                    result = (source.replace('天地', 'world').replace('你好', 'hello')
+                              .replace('今汐', 'Jinhsi').replace('声骸', 'Echo'))
                 payload = {'choices': [{'message': {'content': result}}]}
             elif method == 'getMe':
                 payload = {'ok': True, 'result': {'id': 123456, 'is_bot': True, 'first_name': 'Fixture', 'username': 'fixture_bot'}}

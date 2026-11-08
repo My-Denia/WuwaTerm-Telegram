@@ -14,15 +14,48 @@ from zipfile import ZipFile
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 import core_lock  # noqa: E402
 import fetch_core  # noqa: E402
 import install_verified  # noqa: E402
 
 
+def artifact_lock() -> dict:
+    """A synthetic Actions-artifact lock; the committed lock pins a release."""
+    version = core_lock.product_core_version()
+    return {
+        "schema": 2,
+        "kind": "github-actions-artifact",
+        "repository": "My-Denia/WuwaTerm",
+        "repository_id": 101,
+        "workflow": ".github/workflows/ci.yml",
+        "workflow_id": 102,
+        "package_workflow": ".github/workflows/python-package.yml",
+        "event": "pull_request",
+        "run_id": 103,
+        "run_attempt": 1,
+        "run_head_sha": "a" * 40,
+        "checkout_sha": "b" * 40,
+        "checkout_tree": "c" * 40,
+        "artifact_id": 104,
+        "artifact_name": "python-package",
+        "artifact_sha256": "0" * 64,
+        "artifact_bytes": 1,
+        "expires_at": "2999-01-01T00:00:00Z",
+        "version": version,
+        "filename": f"wuwaterm-{version}-py3-none-any.whl",
+        "sha256": "0" * 64,
+        "sdist_filename": f"wuwaterm-{version}.tar.gz",
+        "sdist_sha256": "0" * 64,
+    }
+
+
 @pytest.fixture()
-def producer(monkeypatch):
-    lock = core_lock.load_lock(Path(__file__).resolve().parents[1] / "core-lock.json")
+def producer(monkeypatch, tmp_path):
+    lock_file = tmp_path / "artifact-lock.json"
+    lock_file.write_text(json.dumps(artifact_lock()))
+    lock = core_lock.load_lock(lock_file)
     wheel = b"synthetic wheel for transport verification"
     sdist = b"synthetic sdist for transport verification"
     lock["sha256"] = hashlib.sha256(wheel).hexdigest()
@@ -212,13 +245,52 @@ def test_http_redirect_is_rejected_without_credential_in_error():
     assert token not in str(error.value)
 
 
-def test_lock_expiry_rejected_before_installation(tmp_path):
-    lock = json.loads((Path(__file__).resolve().parents[1] / "core-lock.json").read_text())
+def test_artifact_lock_expiry_rejected_before_installation(tmp_path):
+    lock = artifact_lock()
     lock["expires_at"] = "2001-01-01T00:00:00Z"
     path = tmp_path / "expired.json"
     path.write_text(json.dumps(lock))
     with pytest.raises(core_lock.LockError, match="expired"):
         core_lock.load_lock(path)
+
+
+def test_committed_lock_pins_the_stable_core_release():
+    lock = core_lock.load_lock(ROOT / "core-lock.json")
+    assert lock["kind"] == "github-release"
+    assert lock["version"] == core_lock.product_core_version()
+    assert lock["filename"] == f"wuwaterm-{lock['version']}-py3-none-any.whl"
+    assert lock["tag"] == f"v{lock['version']}"
+
+
+def release_fetch(lock: dict, wheel: bytes, source: str, calls: list[str]):
+    def fake_fetch(url, **kwargs):
+        calls.append(url)
+        if "/releases/tags/" in url:
+            return {"tag_name": lock["tag"], "draft": False,
+                    "assets": [{"name": lock["filename"], "browser_download_url": lock["url"]}]}
+        if "/git/ref/tags/" in url:
+            return {"object": {"type": "commit", "sha": source}}
+        if url == lock["url"]:
+            return wheel
+        raise AssertionError("unexpected release request")
+    return fake_fetch
+
+
+def test_release_wheel_verifies_tag_asset_and_download(monkeypatch):
+    lock = core_lock.load_lock(ROOT / "core-lock.json")
+    wheel = b"synthetic release wheel"
+    calls: list[str] = []
+    monkeypatch.setattr(fetch_core, "fetch", release_fetch(lock, wheel, lock["source_commit"], calls))
+    assert fetch_core.release_wheel(lock) == wheel
+    assert calls == [f"{fetch_core.API}/releases/tags/{lock['tag']}",
+                     f"{fetch_core.API}/git/ref/tags/{lock['tag']}", lock["url"]]
+
+
+def test_release_tag_moved_away_from_the_pinned_source_is_refused(monkeypatch):
+    lock = core_lock.load_lock(ROOT / "core-lock.json")
+    monkeypatch.setattr(fetch_core, "fetch", release_fetch(lock, b"must not be used", "0" * 40, []))
+    with pytest.raises(core_lock.LockError, match="tag source"):
+        fetch_core.release_wheel(lock)
 
 
 def test_wrong_wheel_hash_never_starts_pip(tmp_path, monkeypatch):
@@ -251,7 +323,7 @@ def test_denied_download_creates_no_wheel(tmp_path, monkeypatch):
     assert not output.exists()
 
 
-def test_reviewed_lock_is_not_mutated(producer):
+def test_artifact_lock_is_not_mutated(producer):
     lock, records, _, _ = producer
     before = copy.deepcopy(lock), copy.deepcopy(records)
     fetch_core.actions_wheel(lock)
