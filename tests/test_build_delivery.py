@@ -83,7 +83,8 @@ def report_layer(extra: list[tuple[str, str, bytes]] = (), report: bytes | None 
 
 def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict | None = None, repo_tags=None,
                 corrupt_layer: bool = False, stray: bool = False,
-                extra_blobs: dict[str, bytes] | None = None) -> bytes:
+                extra_blobs: dict[str, bytes] | None = None, compat_extra: dict | None = None,
+                compat_layers: list[str] | None = None) -> bytes:
     blobs: dict[str, bytes] = {}
     descriptors, diff_ids = [], []
     for number, entries in enumerate(layers):
@@ -108,7 +109,9 @@ def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict
                             "annotations": dict({"org.opencontainers.image.created": "2026-11-07T00:00:00Z"},
                                                 **(annotations or {}))}]}
     docker = [{"Config": "blobs/sha256/" + sha(config), "RepoTags": repo_tags,
-               "Layers": ["blobs/sha256/" + d["digest"][7:] for d in descriptors]}]
+               "Layers": compat_layers if compat_layers is not None
+               else ["blobs/sha256/" + d["digest"][7:] for d in descriptors]}]
+    docker[0].update(compat_extra or {})
     entries = [("blobs", "dir", b""), ("blobs/sha256", "dir", b"")]
     entries += [("blobs/sha256/" + k, "file", v) for k, v in sorted(blobs.items())]
     entries += [("index.json", "file", json.dumps(index).encode()), ("manifest.json", "file", json.dumps(docker).encode()),
@@ -191,21 +194,21 @@ def test_store_layer_records_are_dropped_before_the_archive_is_checked(tmp_path)
     record = layer_record()
     path = tmp_path / "image.oci.tar"
     path.write_bytes(image(extra_blobs={"record": record}))
-    assert bd.prune_store_layer_records(path) == 1
+    assert bd.normalize_saved_archive(path) == ["dropped 1 image-store layer records"]
     with tarfile.open(path) as tar:
         assert "blobs/sha256/" + sha(record) not in [member.name for member in tar]
     archive = bd.read_oci(path)
     assert archive.facts["archive_sha256"] == sha(path.read_bytes())
     assert archive.report == stub_report()
-    # The daemon may export no records at all, and pruning never repeats itself.
-    assert bd.prune_store_layer_records(path) == 0
+    # The daemon may export no records at all, and normalising never repeats itself.
+    assert bd.normalize_saved_archive(path) == []
 
 
 @pytest.mark.parametrize("blob", [b"payload", b'{"id": 3}', json.dumps({"id": "x" * 70000}).encode()])
 def test_an_unreferenced_blob_that_is_not_a_layer_record_is_still_refused(tmp_path, blob):
     path = tmp_path / "image.oci.tar"
     path.write_bytes(image(extra_blobs={"stray": blob}))
-    assert bd.prune_store_layer_records(path) == 0
+    assert bd.normalize_saved_archive(path) == []
     with pytest.raises(bd.BuildError, match="unreferenced OCI archive content"):
         bd.read_oci(path)
 
@@ -214,8 +217,30 @@ def test_an_archive_without_records_is_left_byte_identical(tmp_path):
     path = tmp_path / "image.oci.tar"
     path.write_bytes(image())
     before = path.read_bytes()
-    assert bd.prune_store_layer_records(path) == 0
+    assert bd.normalize_saved_archive(path) == []
     assert path.read_bytes() == before
+
+
+def test_unsupported_compat_manifest_keys_are_dropped(tmp_path):
+    path = tmp_path / "image.oci.tar"
+    path.write_bytes(image(compat_extra={"LayerSources": {"sha256:" + "1" * 64: {"mediaType": "x", "size": 1}}}))
+    with pytest.raises(bd.BuildError, match="invalid docker archive manifest"):
+        bd.read_oci(path)
+    assert bd.normalize_saved_archive(path) == ["dropped unsupported keys from the compat manifest"]
+    with tarfile.open(path) as tar:
+        compat = json.loads(tar.extractfile("manifest.json").read())
+    assert list(compat[0]) == ["Config", "RepoTags", "Layers"]
+    assert bd.read_oci(path).report == stub_report()
+
+
+@pytest.mark.parametrize("options", [{"compat_layers": ["blobs/sha256/" + "0" * 64]},
+                                     {"compat_layers": [], "compat_extra": {"LayerSources": {}}}])
+def test_a_compat_manifest_that_disagrees_with_the_image_is_refused(tmp_path, options):
+    path = tmp_path / "image.oci.tar"
+    path.write_bytes(image(**options))
+    assert bd.normalize_saved_archive(path) == []
+    with pytest.raises(bd.BuildError, match="docker archive manifest|invalid docker archive manifest"):
+        bd.read_oci(path)
 
 
 # ------------------------------------------------------------ the whole command, with a fake daemon
@@ -450,17 +475,39 @@ def test_local_core_build_seals_a_bundle_in_the_core_layout(delivery):
     assert source.pax_headers["comment"] == delivery.commit
 
 
-def test_the_build_seals_away_the_records_a_daemon_exported_beside_the_image(delivery):
+def test_the_build_seals_away_what_the_daemon_exported_beside_the_image(delivery):
+    archive = delivery.home / "archive.tar"
+    # What Docker 28 on the runner writes: an unreferenced layer record blob and
+    # a compat manifest key Core's verifier does not accept.
+    rewritten = io.BytesIO()
+    with tarfile.open(fileobj=rewritten, mode="w") as out, tarfile.open(archive) as tar:
+        for member in tar:
+            if member.name == "manifest.json":
+                entry = json.load(tar.extractfile(member))
+                entry[0]["LayerSources"] = {"sha256:" + "1" * 64: {"mediaType": "x", "size": 1}}
+                raw = json.dumps(entry).encode()
+                member.size = len(raw)
+                out.addfile(member, io.BytesIO(raw))
+            else:
+                out.addfile(member, tar.extractfile(member) if member.isfile() else None)
     record = layer_record()
-    with tarfile.open(delivery.home / "archive.tar", mode="a") as tar:
+    staged = delivery.home / "staged.tar"
+    staged.write_bytes(rewritten.getvalue())
+    with tarfile.open(staged, mode="a") as tar:
         info = tarfile.TarInfo("blobs/sha256/" + sha(record))
         info.size = len(record)
         tar.addfile(info, io.BytesIO(record))
+    archive.write_bytes(staged.read_bytes())
+    staged.unlink()
     result = delivery.run()
     assert result.returncode == 0, result.stderr
     assert "dropped 1 image-store layer records" in result.stderr
-    with tarfile.open(delivery.attempt() / "bundle" / "image.oci.tar") as tar:
+    assert "dropped unsupported keys from the compat manifest" in result.stderr
+    sealed = delivery.attempt() / "bundle" / "image.oci.tar"
+    with tarfile.open(sealed) as tar:
         assert "blobs/sha256/" + sha(record) not in [member.name for member in tar]
+        compat = json.loads(tar.extractfile("manifest.json").read())
+    assert list(compat[0]) == ["Config", "RepoTags", "Layers"]
     assert bd.check_sealed(delivery.attempt())["version"]
 
 

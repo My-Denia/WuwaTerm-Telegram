@@ -369,46 +369,66 @@ def parse_json(raw: bytes) -> Any:
         raise BuildError("invalid JSON") from exc
 
 
-def prune_store_layer_records(path: Path) -> int:
-    """Drop the image store's per-layer JSON records from a saved archive.
+COMPAT_KEYS = ("Config", "RepoTags", "Layers")
 
-    The classic image store keeps a JSON record for each metadata-only layer,
-    and ``docker image save`` writes those records as blobs beside the image even
-    though nothing in the index reaches them. They are store bookkeeping, not
-    image content, so the sealed archive keeps exactly the reachable closure.
-    Only records are dropped: any other unreferenced member stays and
-    :func:`read_oci` keeps refusing it. A malformed archive is left untouched so
-    the reader reports the reason.
+
+def normalize_saved_archive(path: Path) -> list[str]:
+    """Make a saved archive exactly what the image says it is.
+
+    Two pieces of image-store bookkeeping are dropped: the JSON record the
+    classic store keeps for each metadata-only layer, which ``docker image save``
+    writes as an unreferenced blob, and any compat ``manifest.json`` key beside
+    Config, RepoTags and Layers, which Core's verifier refuses. Neither is image
+    content, so the sealed archive keeps the reachable closure and stays readable
+    by the consumer. Anything that diverges — an unreferenced member that is not
+    a layer record, a compat file that disagrees with the OCI manifest — is left
+    in place for :func:`read_oci` to refuse. A malformed archive is untouched, so
+    the reader reports the reason itself.
     """
     try:
         with tarfile.open(path, mode="r:") as tar:
             infos = [(member_name(member.name), member) for member in tar]
             by_name = dict(infos)
-            index_raw = extract_member(tar, by_name.get("index.json"))
-            manifests = parse_json(index_raw)["manifests"]
+            manifests = parse_json(extract_member(tar, by_name.get("index.json")))["manifests"]
             if type(manifests) is not list or len(manifests) != 1:
-                return 0
+                return []
             referenced = {"oci-layout", "index.json", "blobs", "blobs/sha256", "manifest.json"}
             manifest_name = "blobs/sha256/" + blob_digest(manifests[0]["digest"])
             referenced.add(manifest_name)
             manifest = parse_json(extract_member(tar, by_name.get(manifest_name)))
-            referenced.add("blobs/sha256/" + blob_digest(manifest["config"]["digest"]))
-            referenced.update("blobs/sha256/" + blob_digest(layer["digest"]) for layer in manifest["layers"])
+            config_name = "blobs/sha256/" + blob_digest(manifest["config"]["digest"])
+            layer_names = ["blobs/sha256/" + blob_digest(layer["digest"]) for layer in manifest["layers"]]
+            referenced.add(config_name)
+            referenced.update(layer_names)
             dropped = [name for name, member in infos
                        if member.isfile() and name.startswith("blobs/sha256/") and name not in referenced]
-            if not dropped:
-                return 0
             for name in dropped:
                 record = parse_json(extract_member(tar, by_name.get(name), cap=RECORD_MAX))
                 if type(record) is not dict or type(record.get("id")) is not str:
-                    return 0
-        temporary = path.parent / ("." + path.name + ".pruned-" + secrets.token_hex(8))
+                    return []
+            compat_raw = None
+            compat = by_name.get("manifest.json")
+            if compat is not None and compat.isfile():
+                entry = parse_json(extract_member(tar, compat))
+                if type(entry) is list and len(entry) == 1 and type(entry[0]) is dict \
+                        and entry[0].get("Config") == config_name and entry[0].get("Layers") == layer_names:
+                    extra = set(entry[0]) - set(COMPAT_KEYS)
+                    if extra:
+                        compat_raw = json.dumps([{key: entry[0][key] for key in COMPAT_KEYS if key in entry[0]}]).encode()
+        if not dropped and compat_raw is None:
+            return []
+        temporary = path.parent / ("." + path.name + ".normalized-" + secrets.token_hex(8))
         try:
             with tarfile.open(path, mode="r:") as tar, tarfile.open(temporary, mode="w") as out:
                 for member in tar:
-                    if member_name(member.name) in dropped:
+                    name = member_name(member.name)
+                    if name in dropped:
                         continue
-                    out.addfile(member, tar.extractfile(member) if member.isfile() else None)
+                    if name == "manifest.json" and compat_raw is not None:
+                        member.size = len(compat_raw)
+                        out.addfile(member, io.BytesIO(compat_raw))
+                    else:
+                        out.addfile(member, tar.extractfile(member) if member.isfile() else None)
             fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
                 os.fsync(fd)
@@ -419,10 +439,15 @@ def prune_store_layer_records(path: Path) -> int:
             if temporary.exists():
                 temporary.unlink()
         fsync_dir(path.parent)
-        return len(dropped)
+        changes = []
+        if dropped:
+            changes.append(f"dropped {len(dropped)} image-store layer records")
+        if compat_raw is not None:
+            changes.append("dropped unsupported keys from the compat manifest")
+        return changes
     except (OSError, EOFError, tarfile.TarError, KeyError, IndexError, TypeError, ValueError, AttributeError,
             BuildError):
-        return 0
+        return []
 
 
 def extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo | None, *, cap: int = MAX_JSON) -> bytes:
@@ -534,8 +559,15 @@ def read_oci(path: Path) -> OciArchive:
                 referenced.add("manifest.json")
                 compat = parse_json(read("manifest.json"))
                 if type(compat) is not list or len(compat) != 1 or type(compat[0]) is not dict \
-                        or compat[0].get("RepoTags") not in (None, []):
+                        or set(compat[0]) - set(COMPAT_KEYS):
+                    fail("invalid docker archive manifest")
+                if compat[0].get("RepoTags") not in (None, []):
                     fail("OCI archive carries RepoTags")
+                # The compat file is optional, but when present it has to describe
+                # the same image Core's verifier will read.
+                if compat[0].get("Config") != "blobs/sha256/" + config_digest[7:] \
+                        or compat[0].get("Layers") != ["blobs/sha256/" + d["digest"][7:] for d in manifest["layers"]]:
+                    fail("docker archive manifest differs from the OCI manifest")
             layers, rootfs = [], RootFS()
             for number, (desc, diff_id) in enumerate(zip(layer_descs, diff_ids, strict=True)):
                 digest, size, _ = descriptor_blob(desc, LAYER_GZIP | LAYER_TAR, data=False)
@@ -1194,9 +1226,9 @@ def build(args: argparse.Namespace) -> int:
         fail("docker build wrote no full image ID")
     archive = attempt / "bundle" / ARCHIVE_FILE
     run(["docker", "image", "save", "-o", str(archive), iid])
-    dropped = prune_store_layer_records(archive)
-    if dropped:
-        print(f"build_delivery: dropped {dropped} image-store layer records", file=sys.stderr)
+    dropped = normalize_saved_archive(archive)
+    for change in dropped:
+        print("build_delivery: " + change, file=sys.stderr)
 
     image = read_oci(archive)
     raw = seal(
