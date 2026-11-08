@@ -206,8 +206,8 @@ def test_installed_identity_has_no_token_or_network_requirement(tmp_path, monkey
     result = run_ops("identity", "--artifact-root", tmp_path)
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
-    assert value["telegram_version"] == "0.1.0.dev1"
-    assert value["core_version"] == "0.7.0.dev1"
+    assert value["telegram_version"] == "0.1.0"
+    assert value["core_version"] == "0.7.0"
     assert value["source_revision_claim"] is None
     assert value["artifacts_matching_supplied_records"] is None
     assert "synthetic-token-never-print" not in result.stdout + result.stderr
@@ -227,14 +227,14 @@ def test_identity_refuses_changed_wheel_or_lock_version(tmp_path):
     import hashlib
     wheels = tmp_path / "wheels"
     wheels.mkdir()
-    core = wheels / "wuwaterm-0.7.0.dev1-py3-none-any.whl"
-    telegram = wheels / "wuwaterm_telegram-0.1.0.dev1-py3-none-any.whl"
+    core = wheels / "wuwaterm-0.7.0-py3-none-any.whl"
+    telegram = wheels / "wuwaterm_telegram-0.1.0-py3-none-any.whl"
     core.write_bytes(b"synthetic core artifact")
     telegram.write_bytes(b"synthetic telegram artifact")
     core_hash = hashlib.sha256(core.read_bytes()).hexdigest()
     tg_hash = hashlib.sha256(telegram.read_bytes()).hexdigest()
     lock = {"schema": 2, "repository": "My-Denia/WuwaTerm", "kind": "github-actions-artifact",
-            "filename": core.name, "version": "0.7.0.dev1", "sha256": core_hash, "checkout_sha": "b" * 40}
+            "filename": core.name, "version": "0.7.0", "sha256": core_hash, "checkout_sha": "b" * 40}
     (tmp_path / "core-lock.json").write_text(json.dumps(lock), encoding="utf-8")
     (wheels / "core.filename").write_text(core.name, encoding="ascii")
     (wheels / "telegram.filename").write_text(telegram.name, encoding="ascii")

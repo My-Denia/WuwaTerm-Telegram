@@ -476,7 +476,7 @@ def test_official_core_uses_the_committed_lock_and_passes_no_local_argument(deli
     (build,) = delivery.builds()
     assert not any(a.startswith("CORE_WHEEL_SHA256") for a in build["args"])
     bundle = json.loads((delivery.attempt() / "bundle" / "bundle.json").read_text())
-    assert bundle["core_binding"]["core_source_commit"] == delivery.lock["checkout_sha"]
+    assert bundle["core_binding"]["core_source_commit"] == delivery.lock["source_commit"]
     assert bundle["recipe"]["lock_sha256"] == sha((delivery.repo / "core-lock.json").read_bytes())
 
 
@@ -502,7 +502,8 @@ def test_inherited_descriptor_nine_is_refused_before_any_work(delivery):
 
 
 def test_a_wheel_that_is_not_the_selected_commit_never_reaches_docker(delivery):
-    wheel(delivery.telegram, "wuwaterm-telegram", "0.1.0.dev1", {"wuwaterm_telegram/__init__.py": b"# other\n"})
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    wheel(delivery.telegram, "wuwaterm-telegram", version, {"wuwaterm_telegram/__init__.py": b"# other\n"})
     result = delivery.run()
     assert result.returncode == 2 and "differs from the selected source commit" in result.stderr
     assert delivery.builds() == [] and not (delivery.attempt() / "state" / "sealed.json").exists()

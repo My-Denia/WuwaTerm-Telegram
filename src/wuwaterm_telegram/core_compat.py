@@ -9,7 +9,7 @@ from pathlib import Path
 import sqlite3
 
 
-CORE_VERSION = "0.7.0.dev1"
+CORE_VERSION = "0.7.0"
 DATABASE_SCHEMA_VERSION = "2"
 
 
