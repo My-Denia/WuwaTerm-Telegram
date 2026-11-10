@@ -9,7 +9,7 @@ from pathlib import Path
 import sqlite3
 
 
-CORE_VERSION = "0.7.0"
+CORE_VERSION = "0.8.0"
 DATABASE_SCHEMA_VERSION = "2"
 
 
@@ -18,12 +18,16 @@ class CoreCompatibilityError(RuntimeError):
 
 
 # What `/review` needs from Core 0.8.0 (semantic-review-v1, segmentation-v1).
-# `verify_core_compatibility` does not require these while the lock is on Core
-# 0.7.0, where they cannot exist; `/review` probes this list at run time and
-# falls back to the dictionary-only track. The change that moves the lock to
-# 0.8.0 adds this list to the required symbols (docs/review-core-contract.md).
+# `verify_core_compatibility` requires all of them: the adapter is built for
+# exactly this Core. Whether the model track is *on* is a separate, run-time
+# matter (`semantic_review_enabled()` and a configured model).
 REVIEW_CORE_SYMBOLS: dict[str, tuple[str, ...]] = {
-    "wuwaterm.application": ("semantic_review_async",),
+    "wuwaterm.application": (
+        "ContextBefore",
+        "SemanticReviewJob",
+        "semantic_review_async",
+        "semantic_review_enabled",
+    ),
     "wuwaterm.segmentation": ("SEGMENT_LIMIT", "pair_segments", "segment_text"),
 }
 
@@ -71,6 +75,9 @@ def verify_core_compatibility() -> None:
             raise AttributeError("protected translation guard")
         if "before_llm_call" not in signature(app.translate_request_async).parameters:
             raise AttributeError("application translation guard")
+        missing = missing_review_symbols()
+        if missing:
+            raise AttributeError("review symbols: " + ", ".join(missing))
     except (ImportError, AttributeError, TypeError, ValueError) as exc:
         raise CoreCompatibilityError(
             "installed WuwaTerm Core lacks the required Telegram adapter capabilities"

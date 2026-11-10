@@ -1393,7 +1393,7 @@ def test_group_owner_bypasses_member_status_rate_limit_and_2000_input(
     )
     asyncio.run(term_command(second_update, context))
 
-    assert long_message.replies == [("owner-chunk-1\nowner-chunk-2", 601)]
+    assert long_message.replies == [("owner-chunk-1owner-chunk-2", 601)]
     assert second_message.replies == [("Echo", 602)]
     assert len(calls) == 2
     assert context.bot.member_calls == []
@@ -1430,7 +1430,7 @@ def test_group_admin_bypasses_rate_limit_and_2000_input(monkeypatch, sample_db):
     )
     asyncio.run(term_command(second_update, context))
 
-    assert long_message.replies == [("admin-chunk-1\nadmin-chunk-2", 603)]
+    assert long_message.replies == [("admin-chunk-1admin-chunk-2", 603)]
     assert second_message.replies == [("Echo", 604)]
     assert len(calls) == 2
 

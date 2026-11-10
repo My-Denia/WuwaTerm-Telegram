@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wuwaterm-telegram"
-version = "0.1.1"
+version = "0.2.0"
 description = "Standalone Telegram adapter for WuwaTerm"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Peter"}]
 dependencies = [
-  "wuwaterm==0.7.0",
+  "wuwaterm==0.8.0",
   "python-telegram-bot>=22.7,<23",
 ]
 
