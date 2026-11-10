@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from review_fakes import FakeBackend, wire_response
+from telegram.error import NetworkError
 
 from wuwaterm_telegram import review_bot
 from wuwaterm_telegram.bot import (
@@ -33,8 +34,12 @@ class Msg:
         self.from_user, self.sender_chat = from_user, None
         self.sent = []  # (text, kwargs)
         self._next = message_id * 100
+        self.fail_times = 0  # the next N sends raise a Telegram network error
 
     async def reply_text(self, text, **kwargs):
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise NetworkError("timed out")
         self.sent.append((text, kwargs))
         self._next += 1
         return SimpleNamespace(message_id=self._next)
@@ -85,8 +90,9 @@ def update_for(message, *, user_id=OWNER, chat_type="private", query=None):
     )
 
 
-def command(context, text, *, reply_to=None, user_id=OWNER, chat_type="private", message_id=10):
+def command(context, text, *, reply_to=None, user_id=OWNER, chat_type="private", message_id=10, fail_times=0):
     message = Msg(message_id, text, reply_to=reply_to)
+    message.fail_times = fail_times
     update = update_for(message, user_id=user_id, chat_type=chat_type)
     asyncio.run(review_bot.review_command(update, context))
     return message
@@ -449,3 +455,31 @@ def test_a_recent_tr_result_can_be_reviewed_while_the_model_track_is_off(monkeyp
     answer = command(context, "/review", reply_to=bot_message)
     body = "\n".join(texts(answer))
     assert "需核对" in body and review_bot.NO_TRANSLATION_RECORD_NOTICE not in body
+
+
+def test_a_result_that_could_not_be_sent_is_resent_without_another_model_call(tmp_path):
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    failed = command(context, "/review 甲\n---\na", fail_times=1)
+    assert len(backend.calls) == 1
+    # the result send failed; one short notice went out instead of the result
+    assert texts(failed) == [review_bot.DELIVERY_FAILED_NOTICE]
+    job = store.latest_done(CHAT)
+    assert job.delivered is False and job.result_message_ids == []
+    again = command(context, "/review 甲\n---\na", message_id=11)
+    assert len(backend.calls) == 1  # no new model call
+    assert "语义疑点（实验性" in "\n".join(texts(again))  # the full result
+    assert job.delivered is True and job.result_message_ids
+    third = command(context, "/review 甲\n---\na", message_id=12)  # now an ordinary duplicate
+    assert len(backend.calls) == 1 and len(third.sent) == 1 and "语义疑点（实验性" not in third.sent[0][0]
+
+
+def test_when_even_the_failure_notice_cannot_be_sent_nothing_is_retried_or_raised(tmp_path):
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    silent = command(context, "/review 甲\n---\na", fail_times=2)
+    assert silent.sent == [] and len(backend.calls) == 1
+    assert store.latest_done(CHAT).delivered is False
+    # /review last also delivers the stored result instead of pointing at nothing
+    last = command(context, "/review last", message_id=11)
+    assert "语义疑点（实验性" in "\n".join(texts(last)) and len(backend.calls) == 1

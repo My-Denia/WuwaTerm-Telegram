@@ -53,6 +53,9 @@ class ReviewJob:
     skipped: set[str] = field(default_factory=set)
     result_message_ids: list[int] = field(default_factory=list)
     keyboard_message_id: int | None = None
+    # True once the result reached the chat (message ids are known). A finished
+    # job that is not delivered is sent again from the stored report.
+    delivered: bool = False
     finished_at: float | None = None
 
 
