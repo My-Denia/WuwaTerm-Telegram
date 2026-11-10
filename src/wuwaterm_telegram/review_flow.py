@@ -43,7 +43,7 @@ MAX_REVIEW_PAIRS = 12
 CONTEXT_SCALARS = 400
 EXPLAIN_LANGUAGE = "zh"
 
-SEMANTIC_OFF_NOTE = "语义审校需要 Core 0.8.0 并配置模型；本次只做词典术语检查。"
+SEMANTIC_OFF_NOTE = "语义疑点未开启（实验性功能，服务端默认关闭），本次只做词典术语检查。"
 NO_READY_NOTE = "没有可审校的段落（见下方说明）。"
 STOP_NOTES = {
     "rate_limited": "模型请求被限流",

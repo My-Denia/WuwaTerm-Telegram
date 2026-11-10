@@ -125,7 +125,7 @@ def test_sections_are_separate_and_worded_by_nature():
         issues=(issue(),),
     )
     text = strip_telegram_html("\n\n".join(format_report(r)))
-    terms, semantic = text.index("术语（词典，确定性）"), text.index("语义疑点（模型，可能有误）")
+    terms, semantic = text.index("术语（词典，确定性）"), text.index("语义疑点（实验性，可能有误）")
     assert terms < semantic
     term_part = text[terms:semantic]
     assert "与官方译名不一致" in term_part and "Jinhsi" in term_part and "需核对" in term_part
@@ -200,8 +200,8 @@ def test_excerpt_falls_back_to_truncated_span_text():
 
 def test_unavailable_stopped_and_partial_states():
     unavailable = strip_telegram_html("\n".join(format_report(report(semantic_state="unavailable"))))
-    assert "本次未运行语义审校" in unavailable
-    assert "语义疑点（模型" not in unavailable
+    assert "语义疑点未开启" in unavailable
+    assert "语义疑点（实验性" not in unavailable
     with_note = strip_telegram_html(
         "\n".join(format_report(report(semantic_state="unavailable", semantic_note="no <model>")))
     )

@@ -121,7 +121,7 @@ def test_without_the_semantic_track_only_the_dictionary_track_runs():
     backend = FakeBackend(semantic=False)
     report = run(backend, "甲", "a")
     assert backend.calls == [] and backend.term_calls == 1
-    assert report.semantic_state == SEMANTIC_UNAVAILABLE and "0.8.0" in report.semantic_note
+    assert report.semantic_state == SEMANTIC_UNAVAILABLE and "未开启" in report.semantic_note
 
 
 def test_manual_split_pairs_send_nothing_and_are_listed():

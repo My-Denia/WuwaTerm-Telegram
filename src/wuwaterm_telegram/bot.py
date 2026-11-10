@@ -1761,11 +1761,6 @@ def _telegram_reply(outcome: TranslationOutcome) -> TranslationReply:
     )
 
 
-def _telegram_llm_splitter(text: str, limit: int) -> list[str]:
-    """UTF-16 aware splitter so Telegram length semantics stay unchanged."""
-    return split_telegram_text(text, limit=limit)
-
-
 def _telegram_markup_translator(translator: SentenceTranslator):
     """Adapter hook: translate Telegram HTML with its markup preserved."""
 
@@ -1825,7 +1820,6 @@ async def translate_query_async(
         service,
         translator,
         TranslationJob(text=query, forced_to_chinese=forced_to_chinese),
-        splitter=_telegram_llm_splitter,
         # The dictionary stage (exact + full-table fuzzy over sqlite) is
         # synchronous; keep it off the event loop like the API does.
         offload=asyncio.to_thread,
@@ -1840,7 +1834,7 @@ async def telegram_translation_reply(
     *,
     input_limit: int = LLM_INPUT_CHAR_LIMIT,
 ) -> TranslationReply:
-    """Run the shared pipeline with the Telegram markup and splitter hooks."""
+    """Run the shared pipeline with the Telegram markup hook."""
     outcome = await translate_request_async(
         service,
         translator,
@@ -1851,7 +1845,6 @@ async def telegram_translation_reply(
         ),
         input_limit=input_limit,
         markup_translator=_telegram_markup_translator(translator),
-        splitter=_telegram_llm_splitter,
         offload=asyncio.to_thread,
     )
     return _telegram_reply(outcome)

@@ -109,7 +109,7 @@ def test_inline_form_replies_with_two_sections_and_a_keyboard_on_the_last_messag
     message = command(context, "/review 今汐来了\n---\nJinhsi arrives")
     assert len(backend.calls) == 1 and backend.calls[0]["direction"] == "en"
     body = "\n".join(texts(message))
-    assert "语义疑点" in body and "模型" in body
+    assert "语义疑点（实验性" in body
     assert all(kw.get("parse_mode") == "HTML" for _, kw in message.sent)
     markup = message.sent[-1][1]["reply_markup"]
     assert markup.inline_keyboard[0][0].callback_data.startswith("rv:")
@@ -367,3 +367,43 @@ def test_a_review_that_stopped_early_can_be_run_again(tmp_path):
     backend.errors = {}
     command(context, "/review 甲\n\n乙\n---\na\n\nb", message_id=11)
     assert len(backend.calls) == 4  # not treated as a duplicate of the unfinished run
+
+
+def test_long_tr_keeps_the_senders_blank_lines_and_adds_none(monkeypatch, sample_db):
+    from test_bot import fake_context, fake_update
+    from wuwaterm_telegram.bot import term_command
+
+    calls = []
+
+    async def fake_call(locked_text, locks, html_mode=False, to_chinese=False, timeout_seconds=45.0,
+                        transport=None, references=()):
+        calls.append(locked_text)
+        return f"part-{len(calls)}"
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+    monkeypatch.setattr("wuwaterm.sentence._call_llm_async", fake_call)
+    text = "甲" * 1000 + "\n\n" + "乙" * 1000 + "\n\n" + "丙" * 1000
+    context = fake_context(sample_db, [text], member_status="administrator")
+    update, message = fake_update(chat_id=-2001, chat_type="supergroup", message_id=801, user_id=42)
+    asyncio.run(term_command(update, context))
+    assert len(calls) == 3  # one request per segmentation-v1 segment
+    assert message.replies[0][0] == "part-1\n\npart-2\n\npart-3"
+
+
+def test_review_with_the_experimental_track_off_gives_terms_only_and_does_not_claim_more(
+    monkeypatch, tmp_path, sample_db
+):
+    from wuwaterm.application import TermService
+    from wuwaterm_telegram.review_backend import LiveReviewBackend
+
+    for name in ("WUWATERM_SEMANTIC_REVIEW_ENABLED", "WUWATERM_OPENAI_BASE_URL",
+                 "WUWATERM_OPENAI_API_KEY", "WUWATERM_OPENAI_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    context, _, _ = make_context(tmp_path, LiveReviewBackend(TermService(sample_db), object()))
+    message = command(context, "/review 今汐来了。\n---\nSomeone arrives.")
+    body = "\n".join(texts(message))
+    assert "术语（词典，确定性）" in body and "需核对" in body
+    assert "语义疑点未开启" in body and "语义疑点（实验性" not in body
+    assert "reply_markup" not in message.sent[-1][1]  # no model issues, no buttons

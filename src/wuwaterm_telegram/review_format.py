@@ -49,7 +49,7 @@ _EFFECT_HINTS = {
 }
 
 _NO_ISSUES = "未发现疑点。这只说明模型没有报告问题，不代表译文完全正确。"
-_UNAVAILABLE_DEFAULT = "本次未运行语义审校"
+_UNAVAILABLE_DEFAULT = "语义疑点未开启，本次只做词典术语检查。"
 
 _EXCERPT_UNITS = 200
 _SPAN_UNITS = 60
@@ -205,7 +205,7 @@ def summary_line(report: ReviewReport) -> str:
         parts.append(f"已审 {report.segments_reviewed}/{report.segments_total} 段")
     parts.append(f"术语发现 {_term_counts(report)} 处")
     if report.semantic_state == SEMANTIC_UNAVAILABLE:
-        parts.append("未运行语义审校")
+        parts.append("语义疑点未运行")
     else:
         parts.append(
             f"语义疑点 {len(report.issues)} 条（高 {high} / 中 {medium} / 较低 {low}）"
@@ -258,7 +258,7 @@ def _term_blocks(report: ReviewReport) -> list[str]:
 
 
 def _semantic_blocks(report: ReviewReport) -> list[str]:
-    title = "<b>语义疑点（模型，可能有误）</b>"
+    title = "<b>语义疑点（实验性，可能有误）</b>"
     lines: list[str] = []
     if report.semantic_state == SEMANTIC_STOPPED:
         note = _clip(report.semantic_note or "未说明", _NOTE_UNITS)
@@ -282,7 +282,7 @@ def _note_lines(report: ReviewReport) -> list[str]:
     lines: list[str] = []
     if report.semantic_state == SEMANTIC_UNAVAILABLE:
         reason = _clip(report.semantic_note or _UNAVAILABLE_DEFAULT, _NOTE_UNITS)
-        lines.append(f"语义审校未运行：{reason}")
+        lines.append(reason)
 
     def capped(items: list[str], more: int) -> None:
         lines.extend(items[:_MAX_NOTES_PER_KIND])
