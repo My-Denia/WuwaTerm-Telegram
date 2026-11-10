@@ -11,7 +11,7 @@ import re
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,6 +33,7 @@ from telegram.ext import (
 from wuwaterm.application import (
     DEFAULT_LLM_MAX_CONCURRENCY,
     DEFAULT_LLM_TIMEOUT_SECONDS,
+    KIND_LLM,
     LLM_INPUT_CHAR_LIMIT,
     LLMTranslationError,
     MarkupTranslation,
@@ -56,6 +57,7 @@ from .channel_reply_schema import ChannelReplyPayloadError, parse_channel_reply_
 from .channel_runtime import ChannelRuntime
 from .core_compat import verify_core_compatibility, verify_dictionary
 from . import poll_health
+from . import review_bot
 from .runtime_keys import (
     ADMIN_CACHE_KEY,
     CHANNEL_REPLY_INDEX_KEY,
@@ -570,6 +572,11 @@ class ParsedTranslationArgs:
 class TranslationReply:
     text: str
     parse_mode: str | None = None
+    # Set only for an LLM-produced translation: the plain translated text (no
+    # dictionary-miss flag, no markup) and its target language. `/review` reads
+    # these; the reply that is sent is unchanged.
+    review_target: str | None = field(default=None, compare=False)
+    review_direction: str | None = field(default=None, compare=False)
 
 
 def _parse_translation_args(args: list[str]) -> ParsedTranslationArgs:
@@ -730,17 +737,33 @@ def _telegram_html_has_tags(html: str) -> bool:
 
 
 async def reply_to_user(
-    update: Update, text: str, *, parse_mode: str | None = None, retry_gate=None
-) -> None:
+    update: Update,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    retry_gate=None,
+    reply_markup=None,
+    quote: bool = True,
+) -> list:
+    """Send ``text`` as one or more replies; return the sent messages.
+
+    ``reply_markup`` (an inline keyboard) is attached to the last chunk only.
+    ``quote=False`` skips the reply-quote in groups (follow-up parts of one
+    answer).
+    """
+    sent_messages: list = []
     message = update.effective_message
     if not message:
-        return
+        return sent_messages
     chat = update.effective_chat
     chat_type = chat.type if chat else "unknown"
     chunks, delivery_parse_mode = _reply_chunks(text, parse_mode)
-    first_reply_to_message_id = message.message_id if is_group_chat(update) else None
+    first_reply_to_message_id = (
+        message.message_id if quote and is_group_chat(update) else None
+    )
     for index, chunk in enumerate(chunks):
         reply_to_message_id = first_reply_to_message_id if index == 0 else None
+        chunk_markup = reply_markup if index == len(chunks) - 1 else None
         try:
             sent_message, sent_text = await _send_reply_chunk_with_html_fallback(
                 message,
@@ -748,6 +771,7 @@ async def reply_to_user(
                 reply_to_message_id=reply_to_message_id,
                 parse_mode=delivery_parse_mode,
                 retry_gate=retry_gate,
+                reply_markup=chunk_markup,
             )
         except BadRequest as exc:
             if delivery_parse_mode is not None and _bad_request_is_html_parse_error(exc):
@@ -760,10 +784,13 @@ async def reply_to_user(
                     redact_id(message.message_id),
                     safe_error_type(exc),
                 )
-                await reply_to_user(
-                    update, _strip_telegram_html(text), retry_gate=retry_gate
+                return await reply_to_user(
+                    update,
+                    _strip_telegram_html(text),
+                    retry_gate=retry_gate,
+                    reply_markup=reply_markup,
+                    quote=quote,
                 )
-                return
             if (
                 reply_to_message_id is None
                 or not _bad_request_is_missing_reply_target(exc)
@@ -783,7 +810,9 @@ async def reply_to_user(
                 reply_to_message_id=None,
                 parse_mode=delivery_parse_mode,
                 retry_gate=retry_gate,
+                reply_markup=chunk_markup,
             )
+        sent_messages.append(sent_message)
         LOGGER.info(
             "bot_reply chat_type=%s incoming_message=%s reply_message=%s "
             "reply_to_message=%s chunk=%s/%s parse_mode=%s text_len=%s",
@@ -796,6 +825,7 @@ async def reply_to_user(
             delivery_parse_mode,
             safe_text_len(sent_text),
         )
+    return sent_messages
 
 
 async def _send_reply_chunk_with_html_fallback(
@@ -805,6 +835,7 @@ async def _send_reply_chunk_with_html_fallback(
     reply_to_message_id: int | None,
     parse_mode: str | None,
     retry_gate=None,
+    reply_markup=None,
 ):
     try:
         sent_message = await _send_reply_chunk(
@@ -813,6 +844,7 @@ async def _send_reply_chunk_with_html_fallback(
             reply_to_message_id=reply_to_message_id,
             parse_mode=parse_mode,
             retry_gate=retry_gate,
+            reply_markup=reply_markup,
         )
         return sent_message, text
     except BadRequest as exc:
@@ -825,6 +857,7 @@ async def _send_reply_chunk_with_html_fallback(
             reply_to_message_id=reply_to_message_id,
             parse_mode=None,
             retry_gate=retry_gate,
+            reply_markup=reply_markup,
         )
         return sent_message, plain
 
@@ -836,10 +869,13 @@ async def _send_reply_chunk(
     reply_to_message_id: int | None,
     parse_mode: str | None,
     retry_gate=None,
+    reply_markup=None,
 ):
     kwargs = {}
     if parse_mode is not None:
         kwargs["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
     if reply_to_message_id is None:
         return await send_with_flood_retry(
             lambda: message.reply_text(text, do_quote=False, **kwargs),
@@ -937,6 +973,7 @@ def create_application(
     app.bot_data[CHAT_SETTINGS_KEY] = chat_settings
     app.add_handler(CommandHandler(["tr", "term"], term_command, block=False))
     app.add_handler(CommandHandler(["sentence", "sent"], sentence_command, block=False))
+    review_bot.register_review(app, app.bot_data[SERVICE_KEY], translator)
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("public", public_command))
@@ -1179,14 +1216,24 @@ async def _translation_command(
             redact_id(getattr(message, "message_id", None)),
         )
         return
-    await reply_to_user(
+    offer = review_bot.offer_translation_review(
+        update,
+        context,
+        source=request.text,
+        target=translated.review_target,
+        direction=translated.review_direction,
+    )
+    sent = await reply_to_user(
         update,
         translated.text,
         parse_mode=translated.parse_mode,
         # A flood-wait can outlive a /revoke or /public off; re-check before
         # the retry actually delivers the translation.
         retry_gate=lambda: _passes_delivery_gate(update, context),
+        reply_markup=offer.markup if offer is not None else None,
     )
+    if offer is not None:
+        review_bot.attach_sent_messages(offer, sent)
 
 
 async def public_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1692,16 +1739,26 @@ def _telegram_text(outcome: TranslationOutcome) -> str:
 
 def _telegram_reply(outcome: TranslationOutcome) -> TranslationReply:
     text = _telegram_text(outcome)
+    review_target: str | None = None
+    review_direction: str | None = None
+    if outcome.kind == KIND_LLM and outcome.text.strip():
+        review_target = (
+            _strip_telegram_html(outcome.text) if outcome.markup_used else outcome.text
+        ).strip()
+        review_direction = outcome.direction
     if outcome.markup_used:
         if _validate_telegram_html(text):
-            return TranslationReply(text, parse_mode="HTML")
-        return TranslationReply(_strip_telegram_html(text))
-    return TranslationReply(text)
-
-
-def _telegram_llm_splitter(text: str, limit: int) -> list[str]:
-    """UTF-16 aware splitter so Telegram length semantics stay unchanged."""
-    return split_telegram_text(text, limit=limit)
+            return TranslationReply(
+                text, "HTML", review_target=review_target, review_direction=review_direction
+            )
+        return TranslationReply(
+            _strip_telegram_html(text),
+            review_target=review_target,
+            review_direction=review_direction,
+        )
+    return TranslationReply(
+        text, review_target=review_target, review_direction=review_direction
+    )
 
 
 def _telegram_markup_translator(translator: SentenceTranslator):
@@ -1763,7 +1820,6 @@ async def translate_query_async(
         service,
         translator,
         TranslationJob(text=query, forced_to_chinese=forced_to_chinese),
-        splitter=_telegram_llm_splitter,
         # The dictionary stage (exact + full-table fuzzy over sqlite) is
         # synchronous; keep it off the event loop like the API does.
         offload=asyncio.to_thread,
@@ -1778,7 +1834,7 @@ async def telegram_translation_reply(
     *,
     input_limit: int = LLM_INPUT_CHAR_LIMIT,
 ) -> TranslationReply:
-    """Run the shared pipeline with the Telegram markup and splitter hooks."""
+    """Run the shared pipeline with the Telegram markup hook."""
     outcome = await translate_request_async(
         service,
         translator,
@@ -1789,7 +1845,6 @@ async def telegram_translation_reply(
         ),
         input_limit=input_limit,
         markup_translator=_telegram_markup_translator(translator),
-        splitter=_telegram_llm_splitter,
         offload=asyncio.to_thread,
     )
     return _telegram_reply(outcome)
@@ -1853,7 +1908,7 @@ async def _translation_actor_or_reject(
 
 
 async def _translation_actor(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, use_cache: bool = True
 ) -> TranslationActor | None:
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
     if is_group_chat(update):
@@ -1865,7 +1920,7 @@ async def _translation_actor(
             return None
         if _is_owner(update, config):
             return TranslationActor("owner", trusted=True, rate_limited=False)
-        if await _is_group_admin(update, context):
+        if await _is_group_admin(update, context, use_cache=use_cache):
             return TranslationActor("group_admin", trusted=True, rate_limited=False)
         message = update.effective_message
         if (

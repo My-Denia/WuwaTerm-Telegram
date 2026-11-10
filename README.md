@@ -4,7 +4,7 @@
 
 A standalone Telegram bot for WuwaTerm's Chinese–English game terminology. It uses the WuwaTerm Core dictionary and translation library directly; no HTTP API process is required. It supports `/tr` and `/term`, `/sentence` and `/sent`, group access settings, and linked-channel translation.
 
-Telegram `0.1.1` is the current stable release and builds against the published WuwaTerm Core `0.7.0` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
+Telegram `0.2.0` builds against the published WuwaTerm Core `0.8.0` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ Telegram `0.1.1` is the current stable release and builds against the published 
 
 ## Installation from verified artifacts
 
-Download the pinned Core wheel through the lock and the Telegram `v0.1.1` wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
+Download the pinned Core wheel through the lock and the Telegram `v0.2.0` wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
 
 ```sh
 python3 -m venv .venv
@@ -34,6 +34,18 @@ Set the environment variables needed by your deployment using [the example](depl
 ```
 
 `TELEGRAM_BOT_TOKEN` is required. `OWNER_USER_ID` controls owner-only commands and private translation access; without it, private translation is refused. The bot checks the installed Core version, required capabilities and the database before polling. Keep credentials out of the repository and logs.
+
+## Reviewing a translation
+
+`/review` (alias `/check`) checks a translation against its source. Give it the pair in one of three ways:
+
+1. Reply to the source message and write the translation after the command.
+2. Put the source, a line containing only `---`, and the translation in one message.
+3. Reply to a recent `/tr` result (kept in memory for 30 minutes).
+
+The result has two separate parts: dictionary findings (deterministic; a "surface match" only says that an official form appears) and, when enabled, semantic issues from the model (experimental, can be wrong; shown with the reason and a suggested change inside an expandable quote). Semantic review is off by default in Core (`WUWATERM_SEMANTIC_REVIEW_ENABLED`) and needs a configured model; while it is off `/review` gives the dictionary findings and says semantic issues are not enabled. Buttons under the result step through the issues, accept a suggestion and build a revised translation. `/review last` points back to the previous result. After a model translation, `/tr` adds a "审校这段译文" button when the model track is on.
+
+Texts over 2,000 characters are paired by [segmentation-v1](https://github.com/My-Denia/WuwaTerm/blob/main/docs/segmentation-v1.md) and reviewed one segment at a time, at most 12 per command. When the two sides cannot be paired the bot says so and asks for a blank line at matching places; it never guesses. Long `/tr` texts follow the same segmentation in Core, keep the sender's blank lines and carry the previous segment as context. Review state is memory-only (30 minutes, five per chat). Semantic review sends both texts to the configured model. Channel auto-translation has no review. Core assumptions and limits: [docs/review-core-contract.md](docs/review-core-contract.md).
 
 ## State and recovery
 

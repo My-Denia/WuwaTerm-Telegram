@@ -9,12 +9,42 @@ from pathlib import Path
 import sqlite3
 
 
-CORE_VERSION = "0.7.0"
+CORE_VERSION = "0.8.0"
 DATABASE_SCHEMA_VERSION = "2"
 
 
 class CoreCompatibilityError(RuntimeError):
     """The installed Core does not support this adapter."""
+
+
+# What `/review` needs from Core 0.8.0 (semantic-review-v1, segmentation-v1).
+# `verify_core_compatibility` requires all of them: the adapter is built for
+# exactly this Core. Whether the model track is *on* is a separate, run-time
+# matter (`semantic_review_enabled()` and a configured model).
+REVIEW_CORE_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "wuwaterm.application": (
+        "ContextBefore",
+        "SemanticReviewJob",
+        "semantic_review_async",
+        "semantic_review_enabled",
+    ),
+    "wuwaterm.segmentation": ("SEGMENT_LIMIT", "pair_segments", "segment_text"),
+}
+
+
+def missing_review_symbols() -> tuple[str, ...]:
+    """Names from `REVIEW_CORE_SYMBOLS` the installed Core does not provide."""
+    missing: list[str] = []
+    for module_name, names in REVIEW_CORE_SYMBOLS.items():
+        try:
+            module = import_module(module_name)
+        except ImportError:
+            missing.extend(f"{module_name}.{name}" for name in names)
+            continue
+        missing.extend(
+            f"{module_name}.{name}" for name in names if not hasattr(module, name)
+        )
+    return tuple(missing)
 
 
 def verify_core_compatibility() -> None:
@@ -45,6 +75,9 @@ def verify_core_compatibility() -> None:
             raise AttributeError("protected translation guard")
         if "before_llm_call" not in signature(app.translate_request_async).parameters:
             raise AttributeError("application translation guard")
+        missing = missing_review_symbols()
+        if missing:
+            raise AttributeError("review symbols: " + ", ".join(missing))
     except (ImportError, AttributeError, TypeError, ValueError) as exc:
         raise CoreCompatibilityError(
             "installed WuwaTerm Core lacks the required Telegram adapter capabilities"
