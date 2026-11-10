@@ -272,7 +272,11 @@ def _semantic_blocks(report: ReviewReport) -> list[str]:
     blocks = list(lines)
     if report.issues:
         blocks.extend(_issue_block(n, i) for n, i in enumerate(report.issues, 1))
-    else:
+    elif not (
+        report.segments_reviewed == 0
+        and report.semantic_state in (SEMANTIC_STOPPED, SEMANTIC_PARTIAL)
+    ):
+        # Nothing was reviewed: no statement about what the model did not find.
         blocks.append(_NO_ISSUES)
     blocks[0] = f"{title}\n{blocks[0]}"
     return blocks

@@ -283,3 +283,13 @@ def test_labels_and_summary_line():
     line = summary_line(r)
     assert "<" not in line and "\n" not in line
     assert "语义疑点 2 条（高 1 / 中 0 / 较低 1）" in line and "术语发现 1 处" in line
+
+
+def test_a_run_stopped_before_any_segment_makes_no_statement_about_issues():
+    from wuwaterm_telegram.review_format import format_report
+    from wuwaterm_telegram.review_model import SEMANTIC_STOPPED, ReviewReport
+
+    report = ReviewReport("甲", "a", "en", "zh", semantic_state=SEMANTIC_STOPPED,
+                          segments_total=1, segments_reviewed=0, semantic_note="模型请求被限流")
+    text = "\n".join(format_report(report))
+    assert "已完成 0/1 段" in text and "未发现疑点" not in text

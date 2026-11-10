@@ -1908,7 +1908,7 @@ async def _translation_actor_or_reject(
 
 
 async def _translation_actor(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, use_cache: bool = True
 ) -> TranslationActor | None:
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
     if is_group_chat(update):
@@ -1920,7 +1920,7 @@ async def _translation_actor(
             return None
         if _is_owner(update, config):
             return TranslationActor("owner", trusted=True, rate_limited=False)
-        if await _is_group_admin(update, context):
+        if await _is_group_admin(update, context, use_cache=use_cache):
             return TranslationActor("group_admin", trusted=True, rate_limited=False)
         message = update.effective_message
         if (

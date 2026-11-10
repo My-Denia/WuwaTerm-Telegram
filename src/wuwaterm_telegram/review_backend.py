@@ -113,6 +113,20 @@ def enforce_pair_limits(pairs: Sequence[PairInfo]) -> list[PairInfo]:
     return checked
 
 
+def _code_for_failure(error_code: str, reason: str | None) -> str:
+    """Keep what Core's diagnostic knows about a failure.
+
+    Core reports a bare HTTP 429 as `llm_unavailable` and keeps the real cause
+    only in the diagnostic (`rate_limit`). A run must stop on a rate limit, so
+    that cause wins over the coarse code.
+    """
+    if reason == "rate_limit":
+        return "rate_limited"
+    if reason == "budget":
+        return "llm_budget_exhausted"
+    return error_code
+
+
 class LiveReviewBackend:
     """Reaches Core in this process."""
 
@@ -230,13 +244,21 @@ class LiveReviewBackend:
             )
         except LLMTranslationError as exc:
             raise ReviewBackendError(
-                error_code_for_llm_reason(getattr(exc, "reason", None))
+                _code_for_failure(
+                    error_code_for_llm_reason(getattr(exc, "reason", None)),
+                    getattr(exc, "reason", None),
+                )
             ) from exc
         except Exception as exc:  # noqa: BLE001 - reduced to a code below
             LOGGER.warning("semantic review failed error_type=%s", type(exc).__name__)
             raise ReviewBackendError(CODE_INTERNAL) from exc
         if outcome.error_code is not None:
-            raise ReviewBackendError(outcome.error_code)
+            diagnostic = outcome.llm_failure
+            raise ReviewBackendError(
+                _code_for_failure(
+                    outcome.error_code, getattr(diagnostic, "reason", None)
+                )
+            )
         if not isinstance(outcome.body, Mapping):
             raise ReviewBackendError(CODE_INTERNAL)
         return outcome.body

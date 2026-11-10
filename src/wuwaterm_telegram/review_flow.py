@@ -13,7 +13,6 @@ import logging
 from typing import Awaitable, Callable
 
 from .review_backend import (
-    CODE_UNAVAILABLE,
     STOP_CODES,
     ReviewBackend,
     ReviewBackendError,
@@ -42,6 +41,8 @@ LOGGER = logging.getLogger(__name__)
 MAX_REVIEW_PAIRS = 12
 CONTEXT_SCALARS = 400
 EXPLAIN_LANGUAGE = "zh"
+# Two segments failing one after the other ends the run.
+MAX_FAILED_IN_A_ROW = 2
 
 SEMANTIC_OFF_NOTE = "语义疑点未开启（实验性功能，服务端默认关闭），本次只做词典术语检查。"
 NO_READY_NOTE = "没有可审校的段落（见下方说明）。"
@@ -49,6 +50,7 @@ STOP_NOTES = {
     "rate_limited": "模型请求被限流",
     "llm_budget_exhausted": "模型调用额度已用完",
     "aborted": "授权状态已变化",
+    "invalid_response": "模型回答不符合约定",
 }
 
 Gate = Callable[[], Awaitable[bool]]
@@ -131,6 +133,7 @@ async def run_review(
     previous: PairInfo | None = None
     previous_texts: tuple[str, str] | None = None
     stopped: str | None = None
+    failed_in_a_row = 0
     for pair in ready:
         if gate is not None and not await gate():
             raise ReviewAborted()
@@ -152,11 +155,13 @@ async def run_review(
             if exc.code in STOP_CODES:
                 stopped = exc.code
                 break
-            if exc.code == CODE_UNAVAILABLE and not outcomes:
-                report.semantic_state = SEMANTIC_UNAVAILABLE
-                report.semantic_note = SEMANTIC_OFF_NOTE
-                return report
             outcomes.append(SegmentOutcome(pair.index, "failed", exc.code))
+            failed_in_a_row += 1
+            if failed_in_a_row >= MAX_FAILED_IN_A_ROW:
+                # The model service is down or refusing: stop, do not wait out
+                # a timeout for every remaining segment.
+                stopped = exc.code
+                break
         else:
             try:
                 got, outcome = parse_semantic_response(
@@ -170,7 +175,12 @@ async def run_review(
             except SemanticResponseError:
                 LOGGER.warning("semantic review response rejected pair=%s", pair.index)
                 outcomes.append(SegmentOutcome(pair.index, "failed", "invalid_response"))
+                failed_in_a_row += 1
+                if failed_in_a_row >= MAX_FAILED_IN_A_ROW:
+                    stopped = "invalid_response"
+                    break
             else:
+                failed_in_a_row = 0
                 issues.extend(got)
                 outcomes.append(outcome)
         previous = pair
@@ -182,7 +192,7 @@ async def run_review(
     if stopped is not None:
         report.semantic_state = SEMANTIC_STOPPED
         report.stopped_code = stopped
-        report.semantic_note = STOP_NOTES.get(stopped, stopped)
+        report.semantic_note = STOP_NOTES.get(stopped, "模型服务连续失败")
     elif report.segments_reviewed < len(ready):
         report.semantic_state = SEMANTIC_PARTIAL
     else:

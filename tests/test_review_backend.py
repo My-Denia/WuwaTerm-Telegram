@@ -145,3 +145,32 @@ def test_compat_manifest_matches_the_pinned_core():
     from wuwaterm_telegram.core_compat import missing_review_symbols
 
     assert missing_review_symbols() == ()
+
+
+@pytest.mark.parametrize("kind, calls, code", [
+    ("rate", 2, "rate_limited"),  # a bare 429 after one success
+    ("budget", 1, "llm_budget_exhausted"),
+    ("upstream", 2, "internal"),  # two failed segments in a row end the run
+])
+def test_real_core_failures_stop_the_run_early(monkeypatch, sample_db, kind, calls, code):
+    configure(monkeypatch)
+    seen = []
+
+    def respond(request):
+        seen.append(request)
+        if kind == "budget":
+            return httpx.Response(429, json={"error": {"code": "insufficient_quota"}})
+        if kind == "rate" and len(seen) > 1:
+            return httpx.Response(429, json={})  # no structured body, as many gateways send
+        if kind == "upstream":
+            return httpx.Response(500, json={})
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"issues": []})}}]})
+
+    backend = real_backend(sample_db, respond)
+    source = "\n\n".join(["甲" * 1000] * 12)
+    target = "\n\n".join(["a" * 1000] * 12)
+    report = asyncio.run(run_review(backend, source, target, "en"))
+    assert len(seen) == calls  # not one request per remaining segment
+    assert report.semantic_state == "stopped" and report.segments_total == 12
+    if kind != "upstream":
+        assert report.stopped_code == code

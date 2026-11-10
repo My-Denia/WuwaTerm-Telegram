@@ -224,7 +224,7 @@ def _user_id(update: Update) -> int | None:
 @dataclass(frozen=True)
 class TranslationOffer:
     record: TranslationRecord
-    markup: InlineKeyboardMarkup
+    markup: InlineKeyboardMarkup | None  # None: the record is kept, no button
 
 
 def offer_translation_review(
@@ -235,7 +235,11 @@ def offer_translation_review(
     target: str | None,
     direction: str | None,
 ) -> TranslationOffer | None:
-    """A review button for a model translation, or None when it cannot be used."""
+    """Keep a time-limited source/translation record for a model translation.
+
+    The record always lets the user reply to the result with `/review`. The
+    button is offered only while the model track is on.
+    """
     if not target or direction not in ("en", "zh") or not source.strip():
         return None
     store: ReviewJobStore | None = context.application.bot_data.get(REVIEW_STORE_KEY)
@@ -243,10 +247,9 @@ def offer_translation_review(
     chat_id = _b().chat_id_for(update)
     if store is None or backend is None or chat_id is None:
         return None
-    if not backend.semantic_available():
-        return None  # no model track: nothing a button could add to /tr
     record = store.remember_translation(chat_id, _user_id(update), source, target, direction, ())
-    return TranslationOffer(record, tr_review_keyboard(record))
+    markup = tr_review_keyboard(record) if backend.semantic_available() else None
+    return TranslationOffer(record, markup)
 
 
 def attach_sent_messages(offer: TranslationOffer, sent: list) -> None:
@@ -460,7 +463,9 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     _, item_id, action, *rest = parts
     number = int(rest[0]) if rest and rest[0].isdigit() else None
-    actor = await b._translation_actor(update, context)
+    # Buttons change another user's review, so admin status is read live: a
+    # demoted admin must not keep the 5-minute cached verdict.
+    actor = await b._translation_actor(update, context, use_cache=False)
     if actor is None:
         await query.answer(DENIED_TOAST, show_alert=True)
         return

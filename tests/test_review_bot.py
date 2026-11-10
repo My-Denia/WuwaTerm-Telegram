@@ -281,7 +281,8 @@ def test_a_model_translation_offers_a_review_button_only_when_the_model_track_ex
     offer = review_bot.offer_translation_review(update, on_context, source="你好", target=reply.review_target, direction="en")
     assert offer is not None and offer.markup.inline_keyboard[0][0].callback_data == f"rv:{offer.record.id}:g"
     off_context, _, _ = make_context(tmp_path, FakeBackend(semantic=False))
-    assert review_bot.offer_translation_review(update, off_context, source="你好", target="Hello", direction="en") is None
+    kept = review_bot.offer_translation_review(update, off_context, source="你好", target="Hello", direction="en")
+    assert kept is not None and kept.markup is None  # the record is kept, the button is not shown
     assert review_bot.offer_translation_review(update, on_context, source="你好", target=None, direction=None) is None
 
 
@@ -407,3 +408,44 @@ def test_review_with_the_experimental_track_off_gives_terms_only_and_does_not_cl
     assert "术语（词典，确定性）" in body and "需核对" in body
     assert "语义疑点未开启" in body and "语义疑点（实验性" not in body
     assert "reply_markup" not in message.sent[-1][1]  # no model issues, no buttons
+
+
+def test_a_demoted_admin_loses_the_buttons_at_once(tmp_path):
+    from wuwaterm_telegram.runtime_keys import REVIEW_STORE_KEY as _  # noqa: F401
+
+    backend = FakeBackend(answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right"))
+    context, store, settings = make_context(tmp_path, backend)
+    settings.set_public(CHAT, True)
+    command(context, "/review 甲乙\n---\nthis is wrong", user_id=77, chat_type="supergroup")
+    job = store.latest_done(CHAT)
+    context.application.bot_data[ADMIN_CACHE_KEY].put(CHAT, 78, True)  # stale "admin" verdict
+    checks = []
+
+    async def now_a_member(chat_id, user_id):
+        checks.append(user_id)
+        return SimpleNamespace(status="member")
+
+    context.bot.get_chat_member = now_a_member
+    kb = Msg(job.keyboard_message_id, "summary")
+    query = press(context, f"rv:{job.id}:a:1", kb, user_id=78, chat_type="supergroup")
+    assert checks == [78]  # asked Telegram, did not trust the cache
+    assert query.answers == [(review_bot.NOT_OWNER_TOAST, True)] and not job.accepted and query.edits == []
+
+
+def test_a_recent_tr_result_can_be_reviewed_while_the_model_track_is_off(monkeypatch, tmp_path, sample_db):
+    from wuwaterm.application import TermService
+    from wuwaterm_telegram.review_backend import LiveReviewBackend
+
+    for name in ("WUWATERM_SEMANTIC_REVIEW_ENABLED", "WUWATERM_OPENAI_BASE_URL",
+                 "WUWATERM_OPENAI_API_KEY", "WUWATERM_OPENAI_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    context, store, _ = make_context(tmp_path, LiveReviewBackend(TermService(sample_db), object()))
+    offer = review_bot.offer_translation_review(
+        update_for(Msg(1)), context, source="今汐来了。", target="Someone arrives.", direction="en"
+    )
+    assert offer is not None and offer.markup is None  # no button while off
+    review_bot.attach_sent_messages(offer, [SimpleNamespace(message_id=77)])
+    bot_message = Msg(77, "Someone arrives.", from_user=SimpleNamespace(id=999, is_bot=True))
+    answer = command(context, "/review", reply_to=bot_message)
+    body = "\n".join(texts(answer))
+    assert "需核对" in body and review_bot.NO_TRANSLATION_RECORD_NOTICE not in body
