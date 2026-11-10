@@ -35,6 +35,18 @@ Set the environment variables needed by your deployment using [the example](depl
 
 `TELEGRAM_BOT_TOKEN` is required. `OWNER_USER_ID` controls owner-only commands and private translation access; without it, private translation is refused. The bot checks the installed Core version, required capabilities and the database before polling. Keep credentials out of the repository and logs.
 
+## Reviewing a translation
+
+`/review` (alias `/check`) checks a translation against its source. Give it the pair in one of three ways:
+
+1. Reply to the source message and write the translation after the command.
+2. Put the source, a line containing only `---`, and the translation in one message.
+3. Reply to a recent `/tr` result (kept in memory for 30 minutes).
+
+The result has two separate parts: dictionary findings (deterministic; a "surface match" only says that an official form appears) and semantic issues from the model (can be wrong; shown with the reason and a suggested change inside an expandable quote). Buttons under the result step through the issues, accept a suggestion and build a revised translation. `/review last` points back to the previous result. After a model translation, `/tr` adds a "审校这段译文" button.
+
+Texts over 2,000 characters are paired by [segmentation-v1](https://github.com/My-Denia/WuwaTerm/blob/main/docs/segmentation-v1.md) and reviewed one segment at a time, at most 12 per command. When the two sides cannot be paired the bot says so and asks for a blank line at matching places; it never guesses. The model track needs Core 0.8.0 and a configured model; without them `/review` runs the dictionary track only and says so. Review state is memory-only (30 minutes, five per chat). Semantic review sends both texts to the configured model. Channel auto-translation has no review. Design notes and the Core assumptions to re-check: [docs/review-core-contract.md](docs/review-core-contract.md).
+
 ## State and recovery
 
 The bot reads the terms database and writes its settings and channel reply index separately. By default, `chat_settings.json` and `channel_replies.json` live beside the database; `WUWATERM_STATE_DIR` puts both in that directory, and `WUWATERM_SETTINGS_PATH` and `WUWATERM_CHANNEL_REPLY_INDEX_PATH` select individual paths. If a state directory is configured, an existing DB-adjacent legacy file is copied to the new location without replacing an existing target. An invalid existing state file is handled according to the application's fail-closed persistence rules.

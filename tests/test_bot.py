@@ -13,7 +13,12 @@ import httpx
 import pytest
 from telegram import Chat, MessageEntity, Update, User
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
-from telegram.ext import ChatMemberHandler, CommandHandler, MessageHandler
+from telegram.ext import (
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    MessageHandler,
+)
 
 from wuwaterm.logging_utils import REDACTION_SECRET_ENV, redact_id
 from wuwaterm_telegram.bot import (
@@ -2029,8 +2034,9 @@ def test_state_dir_invalid_channel_reply_target_with_legacy_fails_fast(
 
 
 def test_handler_set_is_exactly_commands_plus_channel_listener(sample_db):
-    """Pin evolution (deliberate): seven command handlers (/tr+/term,
-    /sentence+/sent, /about, /status, /public, /grant, /revoke), exactly one passive
+    """Pin evolution (deliberate): eight command handlers (/tr+/term,
+    /sentence+/sent, /review+/check, /about, /status, /public, /grant, /revoke), one
+    callback-query handler (the /review buttons), exactly one passive
     channel listener (the linked-channel hard boundary), and exactly one
     MY_CHAT_MEMBER handler (the group-authorization gate)."""
     app = create_application(
@@ -2044,8 +2050,10 @@ def test_handler_set_is_exactly_commands_plus_channel_listener(sample_db):
     message_handlers = [h for h in handlers if isinstance(h, MessageHandler)]
 
     chat_member_handlers = [h for h in handlers if isinstance(h, ChatMemberHandler)]
-    assert len(handlers) == 9  # 7 command + 1 message + 1 chat-member
-    assert len(command_handlers) == 7
+    callback_handlers = [h for h in handlers if isinstance(h, CallbackQueryHandler)]
+    assert len(handlers) == 11  # 8 command + 1 callback + 1 message + 1 chat-member
+    assert len(command_handlers) == 8
+    assert len(callback_handlers) == 1
     assert len(message_handlers) == 1
     assert len(chat_member_handlers) == 1
     # Repr verified against the installed PTB in this venv.

@@ -17,6 +17,32 @@ class CoreCompatibilityError(RuntimeError):
     """The installed Core does not support this adapter."""
 
 
+# What `/review` needs from Core 0.8.0 (semantic-review-v1, segmentation-v1).
+# `verify_core_compatibility` does not require these while the lock is on Core
+# 0.7.0, where they cannot exist; `/review` probes this list at run time and
+# falls back to the dictionary-only track. The change that moves the lock to
+# 0.8.0 adds this list to the required symbols (docs/review-core-contract.md).
+REVIEW_CORE_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "wuwaterm.application": ("semantic_review_async",),
+    "wuwaterm.segmentation": ("SEGMENT_LIMIT", "pair_segments", "segment_text"),
+}
+
+
+def missing_review_symbols() -> tuple[str, ...]:
+    """Names from `REVIEW_CORE_SYMBOLS` the installed Core does not provide."""
+    missing: list[str] = []
+    for module_name, names in REVIEW_CORE_SYMBOLS.items():
+        try:
+            module = import_module(module_name)
+        except ImportError:
+            missing.extend(f"{module_name}.{name}" for name in names)
+            continue
+        missing.extend(
+            f"{module_name}.{name}" for name in names if not hasattr(module, name)
+        )
+    return tuple(missing)
+
+
 def verify_core_compatibility() -> None:
     try:
         version = metadata.version("wuwaterm")
