@@ -1,0 +1,33 @@
+# Dependency update proposals, monthly and grouped.
+#
+# Grouped because the alternative is one pull request per dependency.
+# Consolidating into one pull request per ecosystem per month keeps
+# dependency review manageable for maintainers, and CI validates whether
+# the updates pass all package checks and test suites.
+#
+# Nothing here merges automatically. Each proposal is an ordinary pull request
+# that runs the standard CI gates as any other change.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+
+  # Python dependencies pinned in pyproject.toml.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
