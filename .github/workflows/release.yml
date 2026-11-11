@@ -29,7 +29,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python scripts/fetch_core.py --lock core-lock.json --output-dir artifacts
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: telegram-package
           path: dist
@@ -79,11 +79,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python scripts/release_preflight.py --lock core-lock.json --tag "$RELEASE_TAG"
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: telegram-package
           path: dist
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: telegram-image-bundle
           path: release-assets
