@@ -380,18 +380,31 @@ async def _start_review(
         return
 
     key = store.content_key(source, target, direction)
+    mine = store.find_owner_duplicate(chat_id, key, _user_id(update))
+    if mine is not None and _is_incomplete(mine):
+        mine = None  # a stopped or partial review may be run again
+    if mine is not None:
+        await _answer_own_duplicate(update, context, mine)
+        return
     duplicate = store.find_duplicate(chat_id, key)
     if duplicate is not None and _is_incomplete(duplicate):
         duplicate = None  # a stopped or partial review may be run again
-    if duplicate is not None and duplicate.state == "done" and not duplicate.delivered:
-        # Computed but never reached the chat: send it again, no model call.
-        await _deliver(update, context, duplicate)
-        return
     if duplicate is not None:
         if duplicate.state == "running":
             await b.reply_to_user(update, RUNNING_NOTICE)
-        else:
-            await _point_to_result(update, context, duplicate, f"这组内容刚审校过：{summary_line(duplicate.report)}" if duplicate.report else DONE_NOTICE)
+            return
+        if not duplicate.delivered:
+            # Computed but never reached the chat: send it again, no model call.
+            if not await _deliver(update, context, duplicate):
+                return
+        # Delivery can yield while another request creates this owner's job.
+        mine = store.find_owner_duplicate(chat_id, key, _user_id(update))
+        if mine is not None and not _is_incomplete(mine):
+            await _answer_own_duplicate(update, context, mine)
+            return
+        # The content was already reviewed for someone else in this chat: the
+        # report is reused, but this requester gets her own buttons and state.
+        await _share_result(update, context, duplicate)
         return
     if store.running(chat_id) is not None:
         await b.reply_to_user(update, BUSY_NOTICE)
@@ -443,6 +456,106 @@ async def _run_and_deliver(
         return
     store.finish(job, report)
     await _deliver(update, context, job)
+
+
+async def _answer_own_duplicate(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, job: ReviewJob
+) -> None:
+    """Answer a repeat submission with the requester's own earlier result."""
+    b = _b()
+    if job.state == "running":
+        await b.reply_to_user(update, RUNNING_NOTICE)
+        return
+    if not job.delivered:
+        # Computed but never reached the chat: send it again, no model call.
+        await _deliver(update, context, job)
+        return
+    text = (
+        f"这组内容刚审校过：{summary_line(job.report)}" if job.report else DONE_NOTICE
+    )
+    await _point_to_result(update, context, job, text)
+
+
+async def _share_result(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, source: ReviewJob
+) -> None:
+    """Give a second requester her own job over the already computed report.
+
+    The content stays deduplicated chat-wide, so this costs no model call and
+    no rate-limit slot; what is new is the job id, the message and the accepted
+    or skipped state. If the pointer cannot be sent, the job stays undelivered
+    and her next identical submission delivers the stored report instead.
+    """
+    b = _b()
+    chat_id = b.chat_id_for(update)
+    report = source.report
+    if chat_id is None or report is None:
+        return
+    store = _store(context)
+    try:
+        job = store.create_reusing(chat_id, _user_id(update), source)
+    except StoreFullError:
+        await b.reply_to_user(update, BUSY_NOTICE)
+        return
+    text = f"这组内容刚审校过：{summary_line(report)}"
+    markup = summary_keyboard(job)
+    sent_ids: list[int] = []
+    message = update.effective_message
+    target_id = source.result_message_ids[0] if source.result_message_ids else None
+    if message is not None and target_id is not None:
+        try:
+            sent = await send_with_flood_retry(
+                lambda: message.reply_text(
+                    text,
+                    reply_to_message_id=target_id,
+                    allow_sending_without_reply=False,
+                    reply_markup=markup,
+                ),
+                retry_gate=lambda: b._passes_delivery_gate(update, context),
+            )
+            sent_ids.extend(_message_ids([sent]))
+        except TelegramError as exc:
+            if not (
+                isinstance(exc, BadRequest)
+                and "message to be replied not found" in str(exc).lower()
+            ):
+                LOGGER.warning(
+                    "review result not delivered chat=%s error_type=%s",
+                    redact_id(job.chat_id),
+                    type(exc).__name__,
+                )
+                return
+            # Only a definitely missing reply target may use a plain answer.
+    if not sent_ids:
+        if not await b._passes_delivery_gate(update, context):
+            return
+        try:
+            sent_ids.extend(
+                _message_ids(
+                    await b.reply_to_user(
+                        update,
+                        text,
+                        retry_gate=lambda: b._passes_delivery_gate(update, context),
+                        reply_markup=markup,
+                    )
+                )
+            )
+        except TelegramError as exc:
+            LOGGER.warning(
+                "review result not delivered chat=%s error_type=%s",
+                redact_id(job.chat_id),
+                type(exc).__name__,
+            )
+            return
+    job.result_message_ids = sent_ids
+    job.keyboard_message_id = sent_ids[-1] if markup is not None and sent_ids else None
+    job.delivered = bool(sent_ids)
+
+
+def _message_ids(messages: list) -> list[int]:
+    return [
+        int(m.message_id) for m in messages if getattr(m, "message_id", None) is not None
+    ]
 
 
 async def _deliver(

@@ -112,3 +112,49 @@ def test_translation_records_ttl_eviction_and_message_lookup():
     clock.now += 100
     assert store.translation_for_message(1, 20) is None
     assert store.stats() == {"jobs": 0, "translations": 0}
+
+
+def test_owner_scoped_duplicate_keeps_each_requester_separate():
+    store, _ = make()
+    first = store.create(1, 7, "a", "b", "en")
+    store.finish(first, report())
+    key = first.content_key
+    assert store.find_owner_duplicate(1, key, 7) is first
+    assert store.find_owner_duplicate(1, key, 8) is None  # another member has no job yet
+    assert store.find_owner_duplicate(2, key, 7) is None  # chats stay isolated
+    assert store.find_duplicate(1, key) is first  # the chat-wide lookup is unchanged
+    store.fail(store.create(1, 8, "c", "d", "en"))
+    assert store.find_owner_duplicate(1, store.content_key("c", "d", "en"), 8) is None
+
+
+def test_create_reusing_shares_the_report_but_not_the_acceptance_state():
+    store, _ = make()
+    first = store.create(1, 7, "a", "b", "en")
+    store.finish(first, report())
+    first.accepted["0.1"] = 0
+    first.skipped.add("0.2")
+    first.result_message_ids.append(40)
+    first.delivered = True
+    job = store.create_reusing(1, 8, first)
+    assert job.id != first.id and job.content_key == first.content_key
+    assert job.report is first.report  # one computed report, not a copy framework
+    assert job.state == "done" and job.delivered is False  # its own delivery
+    assert job.user_id == 8 and job.result_message_ids == []
+    assert job.accepted == {} and job.skipped == set()
+    assert job.accepted is not first.accepted and job.skipped is not first.skipped
+    assert first.accepted == {"0.1": 0} and first.skipped == {"0.2"}
+
+
+def test_create_reusing_never_evicts_the_job_whose_report_it_reuses():
+    store, _ = make(max_per_chat=2)
+    oldest = store.create(1, 5, "x", "y", "en")
+    store.finish(oldest, report())
+    first = store.create(1, 7, "a", "b", "en")
+    store.finish(first, report())
+    job = store.create_reusing(1, 8, first)
+    assert store.get(1, first.id) is first and store.get(1, job.id) is job
+    assert store.get(1, oldest.id) is None  # the ordinary eviction rule still applies
+    running = store.create(1, 9, "p", "q", "en")
+    with pytest.raises(StoreFullError):
+        store.create_reusing(1, 10, job)
+    assert store.get(1, job.id) is job and store.get(1, running.id) is running
