@@ -110,6 +110,24 @@ class ReviewJobStore:
                 return job
         return None
 
+    def find_owner_duplicate(
+        self, chat_id: int, content_key: str, user_id: int | None
+    ) -> ReviewJob | None:
+        """The requester's own job for this content, if they already have one.
+
+        The chat-wide lookup keeps the model work deduplicated; this narrower
+        one answers a repeat submission with the buttons and acceptance state
+        that belong to the person who sent it, not to whoever asked first.
+        """
+        for job in reversed(self._live_jobs(chat_id)):
+            if (
+                job.content_key == content_key
+                and job.state != STATE_FAILED
+                and job.user_id == user_id
+            ):
+                return job
+        return None
+
     def create(
         self,
         chat_id: int,
@@ -117,11 +135,15 @@ class ReviewJobStore:
         source: str,
         target: str,
         direction: str,
+        *,
+        preserve: ReviewJob | None = None,
     ) -> ReviewJob:
         self.purge()
         jobs = self._jobs.setdefault(chat_id, [])
         while len(jobs) >= self._max:
-            victim = next((j for j in jobs if j.state != STATE_RUNNING), None)
+            victim = next(
+                (j for j in jobs if j.state != STATE_RUNNING and j is not preserve), None
+            )
             if victim is None:
                 raise StoreFullError("every review slot in this chat is running")
             jobs.remove(victim)
@@ -136,6 +158,26 @@ class ReviewJobStore:
             created_at=self._clock(),
         )
         jobs.append(job)
+        return job
+
+    def create_reusing(
+        self, chat_id: int, user_id: int | None, source: ReviewJob
+    ) -> ReviewJob:
+        """A later requester's own job over an already computed report.
+
+        The report is never mutated after `finish`, so both jobs read the same
+        object: reusing it costs no model call and no report copy. Acceptance,
+        skipped issues and message ids stay per job. `source` is never the job
+        evicted for the new one, so the first requester keeps her buttons.
+        """
+        if source.report is None:
+            raise ValueError("only a computed review report can be reused")
+        job = self.create(
+            chat_id, user_id, source.source, source.target, source.direction, preserve=source
+        )
+        job.report = source.report
+        job.state = STATE_DONE
+        job.finished_at = self._clock()
         return job
 
     def get(self, chat_id: int, job_id: str) -> ReviewJob | None:

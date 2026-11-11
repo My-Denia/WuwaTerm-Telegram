@@ -483,3 +483,88 @@ def test_when_even_the_failure_notice_cannot_be_sent_nothing_is_retried_or_raise
     # /review last also delivers the stored result instead of pointing at nothing
     last = command(context, "/review last", message_id=11)
     assert "语义疑点（实验性" in "\n".join(texts(last)) and len(backend.calls) == 1
+
+
+# --- the same content submitted by a second member -------------------------------
+
+
+def shared_content(tmp_path):
+    """A public-group member reviews a pair; another member submits it again."""
+    backend = FakeBackend(answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right"))
+    context, store, settings = make_context(tmp_path, backend)
+    settings.set_public(CHAT, True)
+    group = dict(chat_type="supergroup")
+    command(context, "/review 甲乙\n---\nthis is wrong", user_id=77, **group)
+    first = store.latest_done(CHAT)
+    second = command(context, "/review 甲乙\n---\nthis is wrong", user_id=88, message_id=21, **group)
+    return context, store, backend, first, second, group
+
+
+def job_from_markup(store, message):
+    (text, kwargs), = message.sent[-1:]
+    button = kwargs["reply_markup"].inline_keyboard[0][0]
+    return text, store.get(CHAT, button.callback_data.split(":")[1])
+
+
+def test_a_second_member_gets_own_controls_for_reused_content_without_a_model_call(tmp_path):
+    context, store, backend, first, second, group = shared_content(tmp_path)
+    assert len(backend.calls) == 1  # the report is reused, not recomputed
+    text, job = job_from_markup(store, second)
+    assert job is not None and job is not first
+    assert job.user_id == 88 and first.user_id == 77
+    assert job.state == "done" and job.report is first.report  # one immutable computed report
+    # Separate mutable state: nothing was copied from the first requester.
+    assert job.accepted == {} and job.skipped == set()
+    assert job.accepted is not first.accepted and job.skipped is not first.skipped
+    assert first.accepted == {} and first.delivered is True
+    assert "刚审校过" in text and job.result_message_ids
+    # The second member works their own copy; the first one is untouched.
+    own = press(context, f"rv:{job.id}:a:1", Msg(job.keyboard_message_id, "summary"), user_id=88, **group)
+    assert own.edits and job.accepted and first.accepted == {}
+    mine = press(context, f"rv:{first.id}:a:1", Msg(first.keyboard_message_id), user_id=77, **group)
+    assert mine.edits and first.accepted and job.accepted == {first.report.issues[0].key: 0}
+
+
+def test_a_second_member_still_cannot_press_the_first_members_buttons(tmp_path):
+    context, store, backend, first, second, group = shared_content(tmp_path)
+    assert store.get(CHAT, first.id) is not None
+    denied = press(context, f"rv:{first.id}:a:1", Msg(first.keyboard_message_id), user_id=88, **group)
+    assert denied.answers == [(review_bot.NOT_OWNER_TOAST, True)] and not first.accepted
+    assert denied.edits == []
+    _, job = job_from_markup(store, second)
+    assert job.accepted == {}
+
+
+def test_repeating_the_same_content_points_at_the_requesters_own_result(tmp_path):
+    context, store, backend, first, second, group = shared_content(tmp_path)
+    _, job = job_from_markup(store, second)
+    press(context, f"rv:{job.id}:a:1", Msg(job.keyboard_message_id), user_id=88, **group)
+    again = command(context, "/review 甲乙\n---\nthis is wrong", user_id=88, message_id=22, **group)
+    assert len(backend.calls) == 1 and store.stats()["jobs"] == 2  # no clone, no new call
+    (_, kwargs), = again.sent
+    assert kwargs["reply_to_message_id"] == job.result_message_ids[0]
+    assert kwargs["reply_to_message_id"] != first.result_message_ids[0]
+    assert job.accepted  # the second member's own state survives the repeat
+    # The first requester keeps pointing at her own result and state.
+    back = command(context, "/review 甲乙\n---\nthis is wrong", user_id=77, message_id=23, **group)
+    (_, back_kwargs), = back.sent
+    assert back_kwargs["reply_to_message_id"] == first.result_message_ids[0]
+    assert len(backend.calls) == 1 and store.stats()["jobs"] == 2
+
+
+def test_a_second_member_does_not_inherit_the_first_members_accepted_issues(tmp_path):
+    backend = FakeBackend(answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right"))
+    context, store, settings = make_context(tmp_path, backend)
+    settings.set_public(CHAT, True)
+    group = dict(chat_type="supergroup")
+    command(context, "/review 甲乙\n---\nthis is wrong", user_id=77, **group)
+    first = store.latest_done(CHAT)
+    press(context, f"rv:{first.id}:a:1", Msg(first.keyboard_message_id), user_id=77, **group)
+    assert first.accepted and first.delivered
+    first_result_ids, first_keyboard = list(first.result_message_ids), first.keyboard_message_id
+    second = command(context, "/review 甲乙\n---\nthis is wrong", user_id=88, message_id=21, **group)
+    _, job = job_from_markup(store, second)
+    assert job.accepted == {} and job.skipped == set()  # nothing was copied from the first member
+    assert first.accepted and first.result_message_ids == first_result_ids
+    assert first.keyboard_message_id == first_keyboard
+    assert len(backend.calls) == 1
