@@ -1221,7 +1221,10 @@ def run_bot(db_path: str | Path, token: str | None = None) -> None:
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     token = token or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+        raise SystemExit(
+            "wuwaterm-telegram: TELEGRAM_BOT_TOKEN is required; "
+            "set it in the bot environment or .env"
+        )
     app = create_application(token, db_path)
     app.run_polling()
 
