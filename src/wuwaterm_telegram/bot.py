@@ -179,6 +179,45 @@ REVOKE_USAGE = (
     "Usage (owner only): /revoke in a group to remove it; /revoke <chat_id> in "
     "private to remove by id."
 )
+# /help and /start answer with this list. It stays a literal string on purpose:
+# the reply writes no state, makes no model call and reads no chat data, so a
+# caller who is refused by the data-plane commands still learns what the bot
+# does and who is allowed to do it. tests/test_bot.py checks that every
+# registered command appears here, so the list cannot drift silently.
+HELP_TEXT = (
+    "wuwaterm 使用说明 / Help（/help、/start）\n"
+    "\n"
+    "翻译 / Translate\n"
+    "/tr [--to en|zh] <文本> — 词典优先翻译 / dictionary-first translation\n"
+    "/term — 同 /tr / same as /tr\n"
+    "/sentence [--to en|zh] <句子> — 整句输入，处理与 /tr 相同 / whole-sentence input, "
+    "same pipeline as /tr\n"
+    "/sent — 同 /sentence / same as /sentence\n"
+    "回复一条消息时只发 /tr 或 /sentence，即翻译那条消息。"
+    "Reply to a message with just /tr or /sentence to translate it.\n"
+    "私聊翻译仅 bot 主人可用 / translation in private chat is owner only\n"
+    "\n"
+    "审校 / Review\n"
+    "/review（/check）— 审校一段译文和它的原文 / review a translation against its source\n"
+    "1) 回复原文消息，在命令后写译文 / reply to the source, write the translation "
+    "after the command\n"
+    "2) 一条消息里依次写原文、单独一行 ---、译文 / source, a line with only ---, "
+    "then the translation\n"
+    "3) 回复 30 分钟内的 /tr 译文 / reply to a /tr result from the last 30 minutes\n"
+    "结果下的按钮可逐条处理、采纳建议并生成修订译文；/review last 回到上一条结果。"
+    "The buttons step through the issues, accept suggestions and build a revised "
+    "translation; /review last returns to the previous result.\n"
+    "\n"
+    "其它 / More\n"
+    "/about — 词典来源、词条数与限额 / dictionary source, term count and limits\n"
+    "/status — 运行状态，仅 bot 主人，其他人不回复 / runtime status, owner only; "
+    "other callers get no reply\n"
+    "/public on|off|status — 是否允许全体群成员使用翻译命令，仅群管理员 / open the "
+    "translate commands to all members, group admins only\n"
+    "/grant — 授权本群（/grant list 查看名单），仅 bot 主人 / authorize this chat "
+    "(/grant list lists them), owner only\n"
+    "/revoke — 撤销授权，仅 bot 主人 / revoke authorization, owner only"
+)
 # Inline rich text: the /command prefix and leading direction flags are cut
 # off the raw message text so the remaining tail's formatting entities can be
 # preserved. Flags mirror _parse_translation_args (lowercase only).
@@ -974,6 +1013,7 @@ def create_application(
     app.add_handler(CommandHandler(["tr", "term"], term_command, block=False))
     app.add_handler(CommandHandler(["sentence", "sent"], sentence_command, block=False))
     review_bot.register_review(app, app.bot_data[SERVICE_KEY], translator)
+    app.add_handler(CommandHandler(["help", "start"], help_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("public", public_command))
@@ -1597,6 +1637,17 @@ async def revoke_command(
             f"Left, but couldn't persist; re-run /revoke later (chat_id={target})."
         )
     await reply_to_user(update, note)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the commands and who may use them. `/start` answers the same way.
+
+    Informational only: no auth gate, no throttle, no state write, zero LLM
+    calls. The text is a constant, so it cannot disclose chat data.
+    """
+    if update.effective_message is None:
+        return
+    await reply_to_user(update, HELP_TEXT)
 
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

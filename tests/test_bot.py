@@ -30,6 +30,7 @@ from wuwaterm_telegram.bot import (
     DEFAULT_GROUP_TR_REJECT_TEXT,
     DEFAULT_PRIVATE_TR_REJECT_TEXT,
     DIRECTION_USAGE_NOTICE,
+    HELP_TEXT,
     LLM_INPUT_CHAR_LIMIT,
     PUBLIC_DISABLED_NOTICE,
     PUBLIC_ENABLED_NOTICE,
@@ -59,6 +60,7 @@ from wuwaterm_telegram.bot import (
     about_command,
     GRANT_USAGE,
     grant_command,
+    help_command,
     create_application,
     my_chat_member_handler,
     public_command,
@@ -2034,11 +2036,11 @@ def test_state_dir_invalid_channel_reply_target_with_legacy_fails_fast(
 
 
 def test_handler_set_is_exactly_commands_plus_channel_listener(sample_db):
-    """Pin evolution (deliberate): eight command handlers (/tr+/term,
-    /sentence+/sent, /review+/check, /about, /status, /public, /grant, /revoke), one
-    callback-query handler (the /review buttons), exactly one passive
-    channel listener (the linked-channel hard boundary), and exactly one
-    MY_CHAT_MEMBER handler (the group-authorization gate)."""
+    """Pin evolution (deliberate): nine command handlers (/tr+/term,
+    /sentence+/sent, /review+/check, /help+/start, /about, /status, /public,
+    /grant, /revoke), one callback-query handler (the /review buttons), exactly
+    one passive channel listener (the linked-channel hard boundary), and exactly
+    one MY_CHAT_MEMBER handler (the group-authorization gate)."""
     app = create_application(
         "123:ABC",
         sample_db,
@@ -2051,8 +2053,8 @@ def test_handler_set_is_exactly_commands_plus_channel_listener(sample_db):
 
     chat_member_handlers = [h for h in handlers if isinstance(h, ChatMemberHandler)]
     callback_handlers = [h for h in handlers if isinstance(h, CallbackQueryHandler)]
-    assert len(handlers) == 11  # 8 command + 1 callback + 1 message + 1 chat-member
-    assert len(command_handlers) == 8
+    assert len(handlers) == 12  # 9 command + 1 callback + 1 message + 1 chat-member
+    assert len(command_handlers) == 9
     assert len(callback_handlers) == 1
     assert len(message_handlers) == 1
     assert len(chat_member_handlers) == 1
@@ -2079,6 +2081,7 @@ def test_data_plane_handlers_are_non_blocking_control_handlers_block(sample_db):
     assert by_commands[frozenset({"sentence", "sent"})].block is False
     assert message_handlers[0].block is False
     assert bool(by_commands[frozenset({"public"})].block) is True
+    assert bool(by_commands[frozenset({"help", "start"})].block) is True
     assert bool(by_commands[frozenset({"status"})].block) is True
     assert bool(by_commands[frozenset({"grant"})].block) is True
     assert frozenset({"authorize"}) not in by_commands
@@ -3426,6 +3429,55 @@ def test_about_contains_full_commit_from_db(sample_db):
     reply = message.replies[0][0]
     assert "e9234ffe094b2d944d16b222d31102e8ab32d954" in reply
     assert re.search(r"[0-9a-f]{40}", reply) is not None
+
+
+# --- /help and /start ---
+
+
+def test_help_lists_every_registered_command(sample_db):
+    """The reply is the only command list inside Telegram: keep it complete."""
+    app = create_application(
+        "123:ABC",
+        sample_db,
+        config=BotConfig(),
+        chat_settings=ChatSettings(sample_db.parent / "chat_settings.json"),
+    )
+    handlers = [handler for group in app.handlers.values() for handler in group]
+    commands = {
+        name
+        for handler in handlers
+        if isinstance(handler, CommandHandler)
+        for name in handler.commands
+    }
+    assert commands  # a walk that found no command would pass vacuously
+    missing = [
+        name
+        for name in sorted(commands)
+        if re.search(rf"/{re.escape(name)}(?!\w)", HELP_TEXT) is None
+    ]
+    assert missing == []
+
+
+def test_help_has_no_auth_gate_and_stays_plain_text(sample_db):
+    # A non-owner in private still gets the list; the constant reply carries no
+    # chat data and no parse_mode, so nothing in it can break Telegram markup.
+    update, message = fake_update(chat_id=2, chat_type="private", user_id=22)
+    context = fake_context(
+        sample_db, [], config=BotConfig(rate_limit_per_minute=10, owner_user_id=11)
+    )
+
+    asyncio.run(help_command(update, context))
+
+    assert len(message.replies) == 1
+    assert message.replies[0][0] == HELP_TEXT
+    assert "parse_mode" not in message.reply_kwargs[0]
+    assert context.bot.member_calls == []
+
+
+def test_help_fits_one_message():
+    # FakeMessage raises on an over-long reply, but assert the margin directly
+    # so a future addition fails here instead of at delivery.
+    assert telegram_text_units(HELP_TEXT) <= TELEGRAM_TEXT_MESSAGE_LIMIT
 
 
 # --- /status owner diagnostics ---

@@ -6,6 +6,24 @@ A standalone Telegram bot for WuwaTerm's Chinese–English game terminology. It 
 
 Telegram `0.2.1` builds against the published WuwaTerm Core `0.8.1` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
 
+## Commands
+
+`/help` and `/start` print the same list inside Telegram, including who may use each command. A chat the owner adds the bot to is authorized automatically; if someone else adds it, the bot leaves unless the owner authorizes that chat with `/grant`. Translate commands in a group are admin-only until a group admin runs `/public on`.
+
+| Command | What it does |
+| --- | --- |
+| `/tr [--to en\|zh] <text>` | Dictionary-first translation. Replying to a message with `/tr` translates that message. |
+| `/term` | Same as `/tr`. |
+| `/sentence [--to en\|zh] <sentence>` | Whole-sentence input; same pipeline as `/tr`. Replying with `/sentence` translates that message. |
+| `/sent` | Same as `/sentence`. |
+| `/review` (alias `/check`) | Reviews a translation against its source; see [Reviewing a translation](#reviewing-a-translation). `/review last` returns to the previous result. |
+| `/about` | Dictionary source, pinned commit, term count, rate limit and whether a model is configured. |
+| `/status` | Owner-only runtime status. Other callers get no reply. |
+| `/public on\|off\|status` | Group admins only, in groups: open the translate commands to every member, or restore admins-only. |
+| `/grant`, `/revoke` | Owner-only group authorization: `/grant` authorizes the current group, `/grant <chat_id>` by id, `/grant list` lists them; `/revoke` removes the current group and leaves it. |
+
+Translation in a private chat is owner-only.
+
 ## Requirements
 
 - Python 3.11 or later.
