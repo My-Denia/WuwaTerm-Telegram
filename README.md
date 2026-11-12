@@ -104,6 +104,10 @@ An optional `WUWATERM_SOURCE_REVISION` build argument may be supplied as a full 
 
 Place the database at `data/terms.db`; Compose mounts `data/` read-only and `state/` read-write. The prepared Docker context contains only the lock, wheel artifacts and verification code, not the workspace or `.env`. Stop the old bot before starting a replacement against the same state.
 
+## Dependency audit
+
+CI audits the dependency set the container installs for critical and high advisories, on changes to the resolver inputs and weekly. See [dependency advisory audit](docs/dependency-audit.md) for what is audited, what fails the run, what it does not cover and how to run it locally.
+
 ## Source and license
 
 The extraction sources are recorded in [PROVENANCE.md](PROVENANCE.md). The code is available under the [MIT License](LICENSE). Wuthering Waves and its game terminology belong to their respective owners; this independent fan project is not affiliated with or endorsed by Kuro Games.
