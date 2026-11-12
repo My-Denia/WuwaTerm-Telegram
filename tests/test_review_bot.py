@@ -468,7 +468,9 @@ def test_a_result_that_could_not_be_sent_is_resent_without_another_model_call(tm
     assert job.delivered is False and job.result_message_ids == []
     again = command(context, "/review 甲\n---\na", message_id=11)
     assert len(backend.calls) == 1  # no new model call
-    assert "语义疑点（实验性" in "\n".join(texts(again))  # the full result
+    body = "\n".join(texts(again))
+    assert "语义疑点（实验性" in body  # the full result
+    assert review_bot.RESULT_HINT in body
     assert job.delivered is True and job.result_message_ids
     third = command(context, "/review 甲\n---\na", message_id=12)  # now an ordinary duplicate
     assert len(backend.calls) == 1 and len(third.sent) == 1 and "语义疑点（实验性" not in third.sent[0][0]

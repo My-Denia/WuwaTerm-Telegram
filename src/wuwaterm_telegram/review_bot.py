@@ -103,6 +103,11 @@ EXPIRED_TOAST = "结果已过期，请重新提交 /review"
 DENIED_TOAST = "无权操作 / Not allowed"
 NOT_OWNER_TOAST = "仅发起人或管理员可操作 / Only the requester or an admin can use this"
 RUNNING_NOTICE = "同一内容正在审校中，请等待结果。\nThis exact review is already running."
+
+RESULT_HINT = (
+    "用下方按钮逐条处理；/review last 回到上一条结果。\n"
+    "Use the buttons below to step through the issues; /review last returns to the previous result."
+)
 DONE_NOTICE = "这组内容刚审校过，见上一条结果。\nThis exact review was just done; see the previous result."
 NOTHING_ACCEPTED_TOAST = "还没有采纳任何建议 / No suggestion accepted yet"
 STALE_TOAST = "译文与审校时不一致，请重新审校 / The translation changed since the review; review again"
@@ -497,7 +502,7 @@ async def _share_result(
     except StoreFullError:
         await b.reply_to_user(update, BUSY_NOTICE)
         return
-    text = f"这组内容刚审校过：{summary_line(report)}"
+    text = f"这组内容刚审校过：{summary_line(report)}\n\n{RESULT_HINT}"
     markup = summary_keyboard(job)
     sent_ids: list[int] = []
     message = update.effective_message
@@ -574,7 +579,7 @@ async def _deliver(
     async def gate() -> bool:
         return await b._passes_delivery_gate(update, context)
 
-    messages = format_report(report)
+    messages = format_report(report, footer=RESULT_HINT)
     markup = summary_keyboard(job)
     sent_ids: list[int] = []
     try:
