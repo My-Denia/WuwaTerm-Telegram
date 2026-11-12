@@ -1,11 +1,11 @@
 # `/review`: what it relies on in Core
 
-`/review` is built for Core 0.8.1 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
+`/review` is built for Core 0.8.2 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
 `contracts/semantic-review-v1/`). All Core access is in `review_backend.py`;
 `core_compat.REVIEW_CORE_SYMBOLS` is the symbol list that
 `verify_core_compatibility` requires at start-up.
 
-## What the adapter uses (checked against Core v0.8.1, commit 5f0d962)
+## What the adapter uses (checked against Core v0.8.2, commit 21c061d)
 
 - `semantic_review_async(service, translator, SemanticReviewJob, *, request_id,
   before_llm_call, offload)` returns a `SemanticReviewOutcome` whose `body` is
