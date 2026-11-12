@@ -353,12 +353,14 @@ def _fallback_block(block: str, limit: int) -> str:
     return _clip(plain, limit)
 
 
-def format_report(report: ReviewReport) -> list[str]:
+def format_report(report: ReviewReport, *, footer: str = "") -> list[str]:
     blocks = [_overview_block(report)]
     blocks.extend(_term_blocks(report))
     if report.semantic_state != SEMANTIC_UNAVAILABLE:
         blocks.extend(_semantic_blocks(report))
     blocks.extend(_note_blocks(report))
+    if footer:
+        blocks.append(footer)
     messages = _pack(blocks, TELEGRAM_TEXT_MESSAGE_LIMIT - _MESSAGE_RESERVE)
     if len(messages) > 1:
         total = len(messages)
