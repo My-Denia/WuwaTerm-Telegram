@@ -1134,11 +1134,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def build(args: argparse.Namespace) -> int:
     # A container-driver builder would start a BuildKit container; refuse it.
+    buildkit = False
     if subprocess.run(["docker", "buildx", "version"], close_fds=True, pass_fds=(), stdin=subprocess.DEVNULL,
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
         driver = re.search(r"^Driver:\s*(\S+)", run(["docker", "buildx", "inspect"], capture=True), re.M)
         if not driver or driver.group(1) != "docker":
             fail("the current builder driver is not the daemon's docker driver")
+        buildkit = True
     git = ["git", "-C", str(args.source)]
     commit = run([*git, "rev-parse", "--verify", args.commit + "^{commit}"], capture=True)
     tree = run([*git, "rev-parse", "--verify", commit + "^{tree}"], capture=True)
@@ -1218,7 +1220,12 @@ def build(args: argparse.Namespace) -> int:
         fail("base images must be present locally with a full image ID (the build never pulls)")
     refuse_inherited_fd9()
     iid_file = attempt / "state" / "iid"
-    run(["docker", "build", "--pull=false", "--force-rm", "--platform", "linux/amd64", *network,
+    # BuildKit now adds provenance/SBOM attestations by default. The saved
+    # archive would then be an image index with extra annotated manifests,
+    # which read_oci deliberately refuses. Disable them where BuildKit is in
+    # use; the classic builder has no such flags and emits one manifest.
+    attestations = ["--provenance=false", "--sbom=false"] if buildkit else []
+    run(["docker", "build", *attestations, "--pull=false", "--force-rm", "--platform", "linux/amd64", *network,
          *[a for name, value in command_args for a in ("--build-arg", f"{name}={value}")],
          "--iidfile", str(iid_file), "--file", str(dockerfile), str(context)])
     iid = iid_file.read_text().strip()

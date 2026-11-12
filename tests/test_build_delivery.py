@@ -251,7 +251,10 @@ import json, os, shutil, sys
 home = os.environ["FAKE_DOCKER_HOME"]
 args = sys.argv[1:]
 if args[:2] == ["buildx", "version"]:
-    sys.exit(1)
+    sys.exit(0 if os.environ.get("FAKE_BUILDKIT") == "1" else 1)
+if args[:2] == ["buildx", "inspect"]:
+    print("Driver: docker")
+    sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     print("sha256:" + "b" * 64)
 elif args[0] == "build":
@@ -566,10 +569,22 @@ def test_the_build_is_a_plain_untagged_build_without_inherited_descriptors(deliv
     args = build["args"]
     assert "-t" not in args and "--tag" not in args and "--target" not in args
     assert {"--pull=false", "--force-rm", "--iidfile"} <= set(args)
+    assert "--provenance=false" not in args and "--sbom=false" not in args
     assert args[args.index("--platform") + 1] == "linux/amd64"
     assert f"CORE_WHEEL_SHA256={delivery.core_sha}" in args and "--network" not in args
     assert build["fd9"] is False
     assert build["dockerfile"] == (delivery.repo / "deploy/Dockerfile").read_text()
+
+
+def test_buildkit_attestations_are_disabled(delivery):
+    # The docker driver is BuildKit; its default provenance/SBOM manifests
+    # turn the saved archive into a multi-manifest index that read_oci refuses.
+    delivery.env["FAKE_BUILDKIT"] = "1"
+    result = delivery.run()
+    assert result.returncode == 0, result.stderr
+    (build,) = delivery.builds()
+    assert "--provenance=false" in build["args"]
+    assert "--sbom=false" in build["args"]
 
 
 def test_official_core_uses_the_committed_lock_and_passes_no_local_argument(delivery):
