@@ -62,6 +62,7 @@ CONFIG_MEDIA = "application/vnd.oci.image.config.v1+json"
 LAYER_GZIP = {"application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.docker.image.rootfs.diff.tar.gzip"}
 LAYER_TAR = {"application/vnd.oci.image.layer.v1.tar", "application/vnd.docker.image.rootfs.diff.tar"}
 NAME_ANNOTATIONS = ("org.opencontainers.image.ref.name", "io.containerd.image.name")
+INDEX_ANNOTATIONS = {"org.opencontainers.image.created", "config.digest"}
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 GIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -535,8 +536,11 @@ def read_oci(path: Path) -> OciArchive:
             for key in NAME_ANNOTATIONS:
                 if key in annotations:
                     fail("OCI archive carries an image name annotation (" + key + ")")
-            if set(annotations) - {"org.opencontainers.image.created"}:
+            if set(annotations) - INDEX_ANNOTATIONS:
                 fail("unexpected OCI index annotation")
+            config_annotation = annotations.get("config.digest")
+            if config_annotation is not None and (type(config_annotation) is not str or not DIGEST.fullmatch(config_annotation)):
+                fail("invalid OCI config digest annotation")
             manifest_digest, _, manifest_raw = descriptor_blob(
                 {k: descriptor.get(k) for k in ("mediaType", "digest", "size")}, {MANIFEST_MEDIA})
             manifest = parse_json(manifest_raw)
@@ -544,6 +548,8 @@ def read_oci(path: Path) -> OciArchive:
                     or manifest["schemaVersion"] != 2 or manifest["mediaType"] != MANIFEST_MEDIA:
                 fail("invalid OCI manifest")
             config_digest, _, config_raw = descriptor_blob(manifest["config"], {CONFIG_MEDIA})
+            if config_annotation is not None and config_annotation != config_digest:
+                fail("OCI config digest annotation differs")
             config = parse_json(config_raw)
             if type(config) is not dict or type(config.get("rootfs")) is not dict \
                     or type(config["rootfs"].get("diff_ids")) is not list:
