@@ -4,7 +4,7 @@
 
 A standalone Telegram bot for WuwaTerm's Chinese–English game terminology. It uses the WuwaTerm Core dictionary and translation library directly; no HTTP API process is required. It supports `/tr` and `/term`, `/sentence` and `/sent`, group access settings, and linked-channel translation.
 
-Telegram `0.2.3` builds against the published WuwaTerm Core `0.8.1` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
+Telegram `0.2.4` builds against the published WuwaTerm Core `0.8.1` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
 
 ## Commands
 
@@ -32,7 +32,7 @@ Translation in a private chat is owner-only.
 
 ## Installation from verified artifacts
 
-Download the pinned Core wheel through the lock and the Telegram `v0.2.3` wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
+Download the pinned Core wheel through the lock and the Telegram `v0.2.4` wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
 
 ```sh
 python3 -m venv .venv
