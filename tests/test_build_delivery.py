@@ -142,6 +142,16 @@ def test_read_oci_returns_facts_and_the_final_layer_report(tmp_path):
     assert archive.facts["archive_sha256"] == sha((tmp_path / "image.oci.tar").read_bytes())
 
 
+def test_a_config_digest_annotation_must_match_the_manifest(tmp_path):
+    # Docker's containerd image store writes this annotation on the index
+    # descriptor. It is harmless when it agrees with the manifest config.
+    facts = read(tmp_path, image()).facts
+    accepted = read(tmp_path, image(annotations={"config.digest": facts["config_digest"]}))
+    assert accepted.facts["config_digest"] == facts["config_digest"]
+    with pytest.raises(bd.BuildError, match="config digest annotation differs"):
+        read(tmp_path, image(annotations={"config.digest": "sha256:" + "0" * 64}))
+
+
 def test_the_reconstructed_filesystem_honours_whiteouts(tmp_path):
     archive = read(tmp_path, oci_archive([
         [("app", "dir", b""), ("app/gone", "file", b"x"), ("app/kept", "file", b"y")],
