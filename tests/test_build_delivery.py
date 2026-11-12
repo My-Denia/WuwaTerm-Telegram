@@ -84,7 +84,9 @@ def report_layer(extra: list[tuple[str, str, bytes]] = (), report: bytes | None 
 def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict | None = None, repo_tags=None,
                 corrupt_layer: bool = False, stray: bool = False,
                 extra_blobs: dict[str, bytes] | None = None, compat_extra: dict | None = None,
-                compat_layers: list[str] | None = None) -> bytes:
+                compat_layers: list[str] | None = None, docker_media: bool = False) -> bytes:
+    manifest_media = bd.DOCKER_MANIFEST_MEDIA if docker_media else bd.MANIFEST_MEDIA
+    config_media = bd.DOCKER_CONFIG_MEDIA if docker_media else bd.CONFIG_MEDIA
     blobs: dict[str, bytes] = {}
     descriptors, diff_ids = [], []
     for number, entries in enumerate(layers):
@@ -100,12 +102,12 @@ def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict
     config = json.dumps({"architecture": "amd64", "os": "linux", "config": {},
                          "rootfs": {"type": "layers", "diff_ids": diff_ids}}).encode()
     blobs[sha(config)] = config
-    manifest = json.dumps({"schemaVersion": 2, "mediaType": bd.MANIFEST_MEDIA,
-                           "config": {"mediaType": bd.CONFIG_MEDIA, "digest": "sha256:" + sha(config), "size": len(config)},
+    manifest = json.dumps({"schemaVersion": 2, "mediaType": manifest_media,
+                           "config": {"mediaType": config_media, "digest": "sha256:" + sha(config), "size": len(config)},
                            "layers": descriptors}).encode()
     blobs[sha(manifest)] = manifest
     index = {"schemaVersion": 2, "mediaType": bd.INDEX_MEDIA,
-             "manifests": [{"mediaType": bd.MANIFEST_MEDIA, "digest": "sha256:" + sha(manifest), "size": len(manifest),
+             "manifests": [{"mediaType": manifest_media, "digest": "sha256:" + sha(manifest), "size": len(manifest),
                             "annotations": dict({"org.opencontainers.image.created": "2026-11-07T00:00:00Z"},
                                                 **(annotations or {}))}]}
     docker = [{"Config": "blobs/sha256/" + sha(config), "RepoTags": repo_tags,
@@ -140,6 +142,13 @@ def test_read_oci_returns_facts_and_the_final_layer_report(tmp_path):
     assert len(archive.facts["layers"]) == 2
     assert all(bd.DIGEST.fullmatch(layer["diff_id"]) for layer in archive.facts["layers"])
     assert archive.facts["archive_sha256"] == sha((tmp_path / "image.oci.tar").read_bytes())
+
+
+def test_docker_v2_media_types_are_accepted(tmp_path):
+    # Docker's containerd store may save the image with Docker v2 descriptor
+    # media types instead of OCI ones.
+    archive = read(tmp_path, image(docker_media=True))
+    assert archive.facts["platform"] == {"os": "linux", "architecture": "amd64", "variant": None}
 
 
 def test_a_config_digest_annotation_must_match_the_manifest(tmp_path):

@@ -58,7 +58,11 @@ RECORDED_ARGS = ("WUWATERM_SOURCE_REVISION", "PIP_NO_INDEX", "PIP_FIND_LINKS")
 WHEELHOUSE_DIR = "wheels/deps"
 INDEX_MEDIA = "application/vnd.oci.image.index.v1+json"
 MANIFEST_MEDIA = "application/vnd.oci.image.manifest.v1+json"
+DOCKER_MANIFEST_MEDIA = "application/vnd.docker.distribution.manifest.v2+json"
+MANIFEST_MEDIA_TYPES = {MANIFEST_MEDIA, DOCKER_MANIFEST_MEDIA}
 CONFIG_MEDIA = "application/vnd.oci.image.config.v1+json"
+DOCKER_CONFIG_MEDIA = "application/vnd.docker.container.image.v1+json"
+CONFIG_MEDIA_TYPES = {CONFIG_MEDIA, DOCKER_CONFIG_MEDIA}
 LAYER_GZIP = {"application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.docker.image.rootfs.diff.tar.gzip"}
 LAYER_TAR = {"application/vnd.oci.image.layer.v1.tar", "application/vnd.docker.image.rootfs.diff.tar"}
 NAME_ANNOTATIONS = ("org.opencontainers.image.ref.name", "io.containerd.image.name")
@@ -542,12 +546,12 @@ def read_oci(path: Path) -> OciArchive:
             if config_annotation is not None and (type(config_annotation) is not str or not DIGEST.fullmatch(config_annotation)):
                 fail("invalid OCI config digest annotation")
             manifest_digest, _, manifest_raw = descriptor_blob(
-                {k: descriptor.get(k) for k in ("mediaType", "digest", "size")}, {MANIFEST_MEDIA})
+                {k: descriptor.get(k) for k in ("mediaType", "digest", "size")}, MANIFEST_MEDIA_TYPES)
             manifest = parse_json(manifest_raw)
             if type(manifest) is not dict or set(manifest) != {"schemaVersion", "mediaType", "config", "layers"} \
-                    or manifest["schemaVersion"] != 2 or manifest["mediaType"] != MANIFEST_MEDIA:
+                    or manifest["schemaVersion"] != 2 or manifest["mediaType"] not in MANIFEST_MEDIA_TYPES:
                 fail("invalid OCI manifest")
-            config_digest, _, config_raw = descriptor_blob(manifest["config"], {CONFIG_MEDIA})
+            config_digest, _, config_raw = descriptor_blob(manifest["config"], CONFIG_MEDIA_TYPES)
             if config_annotation is not None and config_annotation != config_digest:
                 fail("OCI config digest annotation differs")
             config = parse_json(config_raw)
