@@ -9,7 +9,7 @@ from pathlib import Path
 import sqlite3
 
 
-CORE_VERSION = "0.8.1"
+CORE_VERSION = "0.8.2"
 DATABASE_SCHEMA_VERSION = "2"
 
 
@@ -17,7 +17,7 @@ class CoreCompatibilityError(RuntimeError):
     """The installed Core does not support this adapter."""
 
 
-# What `/review` needs from Core 0.8.1 (semantic-review-v1, segmentation-v1).
+# What `/review` needs from Core 0.8.2 (semantic-review-v1, segmentation-v1).
 # `verify_core_compatibility` requires all of them: the adapter is built for
 # exactly this Core. Whether the model track is *on* is a separate, run-time
 # matter (`semantic_review_enabled()` and a configured model).
