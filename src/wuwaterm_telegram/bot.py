@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
-from telegram import ChatMember, Message, MessageEntity, Update
+from telegram import BotCommand, ChatMember, Message, MessageEntity, Update
 from telegram.error import BadRequest, InvalidToken, NetworkError, TelegramError
 from telegram.ext import (
     Application,
@@ -970,6 +970,30 @@ def _strip_telegram_html(text: str) -> str:
     return strip_telegram_html(text)
 
 
+BOT_COMMANDS = (
+    BotCommand("tr", "翻译 / Translate"),
+    BotCommand("sentence", "整句翻译 / Sentence translation"),
+    BotCommand("review", "审校译文 / Review translation"),
+    BotCommand("help", "使用说明 / Help"),
+    BotCommand("start", "开始 / Start"),
+    BotCommand("about", "词典来源与限额 / Dictionary info"),
+    BotCommand("status", "运行状态（主人） / Status (owner)"),
+    BotCommand("public", "群翻译开关（管理员） / Group translation switch"),
+    BotCommand("grant", "授权本群（主人） / Authorize this group"),
+    BotCommand("revoke", "撤销本群（主人） / Revoke this group"),
+)
+
+
+async def _publish_commands(application: Application) -> None:
+    """Best-effort Telegram command menu; a failed call must not stop polling."""
+    try:
+        await application.bot.set_my_commands(list(BOT_COMMANDS))
+    except Exception as exc:  # noqa: BLE001 - startup must continue
+        LOGGER.warning(
+            "set_my_commands failed error_type=%s", safe_error_type(exc)
+        )
+
+
 def create_application(
     token: str,
     db_path: str | Path,
@@ -988,6 +1012,7 @@ def create_application(
         builder = ApplicationBuilder().updater(updater)
     else:
         builder = ApplicationBuilder().token(token)
+    builder = builder.post_init(_publish_commands)
     app = builder.post_shutdown(_close_translator_on_shutdown).build()
     app.bot_data[SERVICE_KEY] = build_term_service(db_path)
     translator = build_translator(

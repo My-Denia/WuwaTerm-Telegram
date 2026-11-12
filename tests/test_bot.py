@@ -30,6 +30,7 @@ from wuwaterm_telegram.bot import (
     DEFAULT_GROUP_TR_REJECT_TEXT,
     DEFAULT_PRIVATE_TR_REJECT_TEXT,
     DIRECTION_USAGE_NOTICE,
+    BOT_COMMANDS,
     HELP_TEXT,
     LLM_INPUT_CHAR_LIMIT,
     PUBLIC_DISABLED_NOTICE,
@@ -72,6 +73,7 @@ from wuwaterm_telegram.bot import (
     translate_query_async,
     _inline_translation_html,
     _log_update_error,
+    _publish_commands,
     _validate_llm_config_env,
 )
 from wuwaterm.lookup import TermService
@@ -1721,6 +1723,36 @@ def test_delivery_gate_skip_logs_redacted_ids(monkeypatch, caplog, sample_db):
     assert "authorization changed before delivery chat=id:" in caplog.text
     assert "-887766" not in caplog.text
     assert "445566" not in caplog.text
+
+
+def test_command_menu_lists_every_canonical_command():
+    names = [command.command for command in BOT_COMMANDS]
+    assert names == ["tr", "sentence", "review", "help", "start", "about", "status", "public", "grant", "revoke"]
+    assert len(names) == len(set(names))
+    assert all(command.description.strip() and len(command.description) <= 256 for command in BOT_COMMANDS)
+
+
+def test_publish_commands_is_best_effort():
+    class FakeBot:
+        def __init__(self, fail: bool = False) -> None:
+            self.fail = fail
+            self.commands = None
+
+        async def set_my_commands(self, commands):
+            self.commands = commands
+            if self.fail:
+                raise NetworkError("synthetic failure")
+
+    class FakeApp:
+        def __init__(self, fail: bool = False) -> None:
+            self.bot = FakeBot(fail)
+
+    good = FakeApp()
+    asyncio.run(_publish_commands(good))
+    assert [command.command for command in good.bot.commands] == [command.command for command in BOT_COMMANDS]
+
+    bad = FakeApp(fail=True)
+    asyncio.run(_publish_commands(bad))  # startup must not raise
 
 
 def test_create_application_registers_error_handler(sample_db):
