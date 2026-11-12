@@ -100,17 +100,17 @@ FAILED_NOTICE = (
     "The review failed; please try again later."
 )
 EXPIRED_TOAST = "结果已过期，请重新提交 /review"
-DENIED_TOAST = "无权操作"
-NOT_OWNER_TOAST = "仅发起人或管理员可操作"
+DENIED_TOAST = "无权操作 / Not allowed"
+NOT_OWNER_TOAST = "仅发起人或管理员可操作 / Only the requester or an admin can use this"
 RUNNING_NOTICE = "同一内容正在审校中，请等待结果。\nThis exact review is already running."
 DONE_NOTICE = "这组内容刚审校过，见上一条结果。\nThis exact review was just done; see the previous result."
-NOTHING_ACCEPTED_TOAST = "还没有采纳任何建议"
-STALE_TOAST = "译文与审校时不一致，请重新审校"
+NOTHING_ACCEPTED_TOAST = "还没有采纳任何建议 / No suggestion accepted yet"
+STALE_TOAST = "译文与审校时不一致，请重新审校 / The translation changed since the review; review again"
 ACCEPT_REASONS = {
-    "no_suggestion": "这条没有可直接采纳的建议",
-    "bad_choice": "没有这个备选",
-    "stale": "译文与审校时不一致，请重新审校",
-    "unknown_issue": "这条疑点已失效",
+    "no_suggestion": "这条没有可直接采纳的建议 / No directly usable suggestion",
+    "bad_choice": "没有这个备选 / No such alternative",
+    "stale": "译文与审校时不一致，请重新审校 / The translation changed since the review; review again",
+    "unknown_issue": "这条疑点已失效 / This issue is no longer valid",
 }
 
 
