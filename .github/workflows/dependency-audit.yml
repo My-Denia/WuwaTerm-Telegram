@@ -1,0 +1,148 @@
+name: Dependency audit
+
+# Advisory gate for the dependency set the image actually installs.
+#
+# There is no lock file here to scan. `pyproject.toml` declares ranges,
+# `core-lock.json` pins the Core wheel's SHA-256 and not its dependency graph,
+# and `deploy/Dockerfile` lets pip resolve at image build time. So this workflow
+# rebuilds the same two wheels the release flow builds, installs them through
+# `scripts/install_verified.py` (the installer CI and the image use), freezes
+# the result and audits that pinned list with `--no-deps`.
+#
+# This is deliberately not a job inside ci.yml:
+#
+#   1. `pull_request.paths` is a workflow-level filter. Hanging it off ci.yml
+#      would skip the package build and the test suite on every pull request
+#      that does not touch a dependency file.
+#   2. The weekly schedule exists because advisories are published against
+#      versions that never change; running it through ci.yml would rebuild and
+#      re-verify the whole package once a week for no reason.
+#   3. `ci.yml` is also the reusable entry point for the release workflow. A
+#      mandatory audit job there would gate releases on OSV availability, which
+#      is not what the release check is for.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Only a change to the resolved set, the resolver inputs or the gate can
+    # change the answer. A pull request that touches none of these does not run
+    # this workflow at all.
+    paths:
+      - pyproject.toml
+      - core-lock.json
+      - scripts/install_verified.py
+      - scripts/verify_wheels.py
+      - scripts/fetch_core.py
+      - scripts/core_lock.py
+      - scripts/check_dependency_advisories.py
+      - tests/test_dependency_advisories.py
+      - .github/workflows/dependency-audit.yml
+  schedule:
+    # Advisories are published against versions that never change, so a week
+    # with no commit can still turn this red. Tuesday, 03:41 UTC.
+    - cron: "41 3 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    name: resolved runtime dependencies (critical/high)
+    runs-on: ubuntu-latest
+    # Fewer than ten resolved packages, one PyPI resolution, one build and one
+    # audit: this finishes in about a minute. Fifteen is the runaway ceiling.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      # The trust root first: a moved tag or a mismatched Core wheel stops here,
+      # before anything is resolved or audited. Same check as ci.yml.
+      - name: Fetch the pinned Core wheel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/fetch_core.py --lock core-lock.json --output-dir artifacts
+      - name: Build the Telegram wheel
+        run: |
+          python -m pip install --disable-pip-version-check build
+          python -m build
+      # Install order, wheel verification and the resolver are the image's, not
+      # a reimplementation: an audit of a set the deployment would not install
+      # answers a question nobody asked.
+      - name: Resolve and install the deployment set
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/runtime-env"
+          core=(artifacts/*.whl)
+          telegram=(dist/*.whl)
+          test "${#core[@]}" -eq 1 && test "${#telegram[@]}" -eq 1
+          sha=$(sha256sum "${telegram[0]}" | cut -d' ' -f1)
+          "$RUNNER_TEMP/runtime-env/bin/python" scripts/install_verified.py \
+            --lock core-lock.json --core "${core[0]}" \
+            --telegram "${telegram[0]}" --telegram-sha256 "$sha"
+          "$RUNNER_TEMP/runtime-env/bin/python" -m pip check
+          "$RUNNER_TEMP/runtime-env/bin/python" -m pip freeze > installed.txt
+          # The two wuwaterm distributions are local wheels, not PyPI releases,
+          # so the resolver must not be asked to fetch them again. pip freeze
+          # writes them as `<name> @ file://...`, which would also put a local
+          # path into the uploaded artifact. Everything else is exactly what the
+          # container runs.
+          grep -v '^wuwaterm' installed.txt > runtime-set.txt
+          cat runtime-set.txt
+          # A green audit over a short or empty list is the failure this gate
+          # exists to prevent, so the input is checked before it is trusted.
+          count=$(grep -c '==' runtime-set.txt || true)
+          echo "resolved ${count} pinned packages"
+          test "$count" -ge 4
+          grep -q '^python-telegram-bot==' runtime-set.txt || {
+            echo "::error title=Resolution::runtime-set.txt has no python-telegram-bot"
+            exit 1
+          }
+          ! grep -q '^wuwaterm' runtime-set.txt || {
+            echo "::error title=Resolution::local wheels leaked into the audited set"
+            exit 1
+          }
+      # pip-audit lives in its own environment so its own dependencies never
+      # join the set being audited. The version is pinned: an audit tool that
+      # changes its report shape under the gate is a second source of red.
+      - name: Audit the resolved set
+        # pip-audit exits 1 both for "found advisories" and for "the run
+        # failed", so the status is passed to the gate instead of being read as
+        # a verdict.
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/audit-env"
+          "$RUNNER_TEMP/audit-env/bin/python" -m pip install --disable-pip-version-check \
+            'pip-audit==2.10.1'
+          status=0
+          "$RUNNER_TEMP/audit-env/bin/python" -m pip_audit -r runtime-set.txt \
+            --no-deps --strict --progress-spinner off \
+            --format json -o pip-audit.json || status=$?
+          echo "pip-audit exit status: ${status}"
+          echo "PIP_AUDIT_STATUS=${status}" >> "$GITHUB_ENV"
+      - name: Fail on critical, high or unreadable advisories
+        run: |
+          python scripts/check_dependency_advisories.py pip-audit.json \
+            --audit-exit "$PIP_AUDIT_STATUS"
+      - name: Keep the audit report
+        # The report is the evidence for both outcomes. A red run nobody can
+        # inspect is a red run somebody will re-run until it is green.
+        # `run_attempt` is in the name because an artifact name must be unique
+        # within a run: without it, re-running a failed job after the advisory
+        # was fixed fails on the upload instead of reporting the new audit.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-audit-report-${{ github.run_attempt }}
+          path: |
+            pip-audit.json
+            runtime-set.txt
+            installed.txt
+          if-no-files-found: warn
