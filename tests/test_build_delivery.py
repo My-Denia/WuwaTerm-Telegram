@@ -84,7 +84,8 @@ def report_layer(extra: list[tuple[str, str, bytes]] = (), report: bytes | None 
 def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict | None = None, repo_tags=None,
                 corrupt_layer: bool = False, stray: bool = False,
                 extra_blobs: dict[str, bytes] | None = None, compat_extra: dict | None = None,
-                compat_layers: list[str] | None = None, docker_media: bool = False) -> bytes:
+                compat_layers: list[str] | None = None, docker_media: bool = False,
+                descriptor_media: str | None = None) -> bytes:
     manifest_media = bd.DOCKER_MANIFEST_MEDIA if docker_media else bd.MANIFEST_MEDIA
     config_media = bd.DOCKER_CONFIG_MEDIA if docker_media else bd.CONFIG_MEDIA
     blobs: dict[str, bytes] = {}
@@ -107,7 +108,8 @@ def oci_archive(layers: list[list[tuple[str, str, bytes]]], *, annotations: dict
                            "layers": descriptors}).encode()
     blobs[sha(manifest)] = manifest
     index = {"schemaVersion": 2, "mediaType": bd.INDEX_MEDIA,
-             "manifests": [{"mediaType": manifest_media, "digest": "sha256:" + sha(manifest), "size": len(manifest),
+             "manifests": [{"mediaType": descriptor_media or manifest_media,
+                            "digest": "sha256:" + sha(manifest), "size": len(manifest),
                             "annotations": dict({"org.opencontainers.image.created": "2026-11-07T00:00:00Z"},
                                                 **(annotations or {}))}]}
     docker = [{"Config": "blobs/sha256/" + sha(config), "RepoTags": repo_tags,
@@ -149,6 +151,16 @@ def test_docker_v2_media_types_are_accepted(tmp_path):
     # media types instead of OCI ones.
     archive = read(tmp_path, image(docker_media=True))
     assert archive.facts["platform"] == {"os": "linux", "architecture": "amd64", "variant": None}
+
+
+def test_a_manifest_and_its_descriptor_must_name_one_media_type(tmp_path):
+    # Core's verifier resolves the descriptor and then requires the manifest it
+    # addresses to name the same schema. Accepting one of each here would seal
+    # an archive the consumer cannot acquire.
+    with pytest.raises(bd.BuildError, match="media type differs from index descriptor"):
+        read(tmp_path, image(descriptor_media=bd.DOCKER_MANIFEST_MEDIA))
+    with pytest.raises(bd.BuildError, match="media type differs from index descriptor"):
+        read(tmp_path, image(docker_media=True, descriptor_media=bd.MANIFEST_MEDIA))
 
 
 def test_a_config_digest_annotation_must_match_the_manifest(tmp_path):

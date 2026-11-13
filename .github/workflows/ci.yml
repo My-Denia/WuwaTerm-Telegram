@@ -66,3 +66,76 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
+  # The producer's own claim about a bundle is worth nothing to the consumer.
+  # This job builds a real bundle and hands it to the pinned Core release's own
+  # component_artifact.py, which alone decides whether acquisition would work.
+  delivery-handoff:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The wheel comes from this run's own artifact, through the same read scope
+      # the other jobs use to fetch one.
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          name: telegram-package
+          path: dist
+      - name: Read the pinned Core source
+        id: core
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          lock = json.load(open("core-lock.json", encoding="utf-8"))
+          assert lock["repository"] == "My-Denia/WuwaTerm"
+          print("repository=" + lock["repository"])
+          print("tag=" + lock["tag"])
+          print("commit=" + lock["source_commit"])
+          PY
+      # The verifier that judges the bundle is the pinned release's own file,
+      # checked out at the commit the lock names. It sits outside the workspace
+      # so the build's source archive stays exactly the checked-out commit.
+      - name: Check out Core at the pinned commit
+        env:
+          CORE_REPOSITORY: ${{ steps.core.outputs.repository }}
+          CORE_TAG: ${{ steps.core.outputs.tag }}
+          CORE_COMMIT: ${{ steps.core.outputs.commit }}
+        run: |
+          git init -q "$RUNNER_TEMP/core-source"
+          git -C "$RUNNER_TEMP/core-source" remote add origin "https://github.com/$CORE_REPOSITORY"
+          git -C "$RUNNER_TEMP/core-source" fetch -q --depth 1 origin "refs/tags/$CORE_TAG"
+          git -C "$RUNNER_TEMP/core-source" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/core-source" rev-parse HEAD)" = "$CORE_COMMIT"
+      - name: Fetch the pinned Core wheel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/fetch_core.py --lock core-lock.json --output-dir "$RUNNER_TEMP/core-wheel"
+      - name: Build, seal and self-check the delivery bundle
+        run: |
+          core=("$RUNNER_TEMP"/core-wheel/*.whl)
+          telegram=(dist/*.whl)
+          test "${#core[@]}" -eq 1 && test "${#telegram[@]}" -eq 1
+          # The builder never pulls; the base image digest is recorded in the bundle.
+          docker pull python:3.11-slim
+          python scripts/build_delivery.py --out "$RUNNER_TEMP/delivery" --commit "$GITHUB_SHA" \
+            --core-wheel "${core[0]}" --telegram-wheel "${telegram[0]}" --authority local-source \
+            --core-tool "$RUNNER_TEMP/core-source/scripts/component_artifact.py" 9>&-
+      - name: Acquire and verify the sealed bundle with the pinned Core
+        env:
+          CORE_TOOL: ${{ runner.temp }}/core-source/scripts/component_artifact.py
+        run: |
+          mapfile -t attempts < <(find "$RUNNER_TEMP/delivery/attempts" -mindepth 1 -maxdepth 1 -type d)
+          test "${#attempts[@]}" -eq 1
+          mkdir -p "$RUNNER_TEMP/deploy-store/.deployments"
+          python -I -B "$CORE_TOOL" acquire \
+            --bundle "${attempts[0]}/bundle/bundle.json" --root "$RUNNER_TEMP/deploy-store" 9>&- \
+            > "$RUNNER_TEMP/acquire.json"
+          acquisition=$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["receipt"]["acquisition_id"])' \
+            "$RUNNER_TEMP/acquire.json")
+          python -I -B "$CORE_TOOL" verify \
+            --receipt "$RUNNER_TEMP/deploy-store/.deployments/artifacts/acquisitions/$acquisition.json" 9>&-

@@ -551,6 +551,11 @@ def read_oci(path: Path) -> OciArchive:
             if type(manifest) is not dict or set(manifest) != {"schemaVersion", "mediaType", "config", "layers"} \
                     or manifest["schemaVersion"] != 2 or manifest["mediaType"] not in MANIFEST_MEDIA_TYPES:
                 fail("invalid OCI manifest")
+            # Core's component_artifact.py requires the index descriptor and the
+            # manifest it addresses to name one media type; a mismatch here would
+            # seal an archive the consumer refuses.
+            if manifest["mediaType"] != descriptor.get("mediaType"):
+                fail("OCI manifest media type differs from index descriptor")
             config_digest, _, config_raw = descriptor_blob(manifest["config"], CONFIG_MEDIA_TYPES)
             if config_annotation is not None and config_annotation != config_digest:
                 fail("OCI config digest annotation differs")

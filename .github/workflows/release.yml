@@ -25,6 +25,31 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      - name: Read the pinned Core source
+        id: core
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          lock = json.load(open("core-lock.json", encoding="utf-8"))
+          assert lock["repository"] == "My-Denia/WuwaTerm"
+          print("repository=" + lock["repository"])
+          print("tag=" + lock["tag"])
+          print("commit=" + lock["source_commit"])
+          PY
+      # The bundle is judged by the pinned release's own verifier, checked out at
+      # the commit the lock names and kept outside the workspace so the build's
+      # source archive stays exactly the checked-out tag commit.
+      - name: Check out Core at the pinned commit
+        env:
+          CORE_REPOSITORY: ${{ steps.core.outputs.repository }}
+          CORE_TAG: ${{ steps.core.outputs.tag }}
+          CORE_COMMIT: ${{ steps.core.outputs.commit }}
+        run: |
+          git init -q "$RUNNER_TEMP/core-source"
+          git -C "$RUNNER_TEMP/core-source" remote add origin "https://github.com/$CORE_REPOSITORY"
+          git -C "$RUNNER_TEMP/core-source" fetch -q --depth 1 origin "refs/tags/$CORE_TAG"
+          git -C "$RUNNER_TEMP/core-source" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/core-source" rev-parse HEAD)" = "$CORE_COMMIT"
       - name: Fetch the pinned Core wheel
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -44,7 +69,8 @@ jobs:
           # The builder never pulls; the base image digest is recorded in the bundle.
           docker pull python:3.11-slim
           python scripts/build_delivery.py --out delivery --commit "$GITHUB_SHA" --tag "$RELEASE_TAG" \
-            --core-wheel "${core[0]}" --telegram-wheel "${telegram[0]}" --authority official-ci 9>&-
+            --core-wheel "${core[0]}" --telegram-wheel "${telegram[0]}" --authority official-ci \
+            --core-tool "$RUNNER_TEMP/core-source/scripts/component_artifact.py" 9>&-
       # The attempt directory is named after a never-reused ID; publishing must not
       # depend on it. Stage the four release files under fixed names, plus the inputs
       # offline verification needs, so the download side reads exactly these paths.
@@ -59,6 +85,31 @@ jobs:
           cp -r "$attempt/inputs/wheels" release-assets/wheels
           (cd release-assets && sha256sum bundle.json install-probe.json image.oci.tar source.tar > SHA256SUMS)
           (cd release-assets && sha256sum -c SHA256SUMS)
+      # The download side holds only the six published files. Rebuilding the
+      # attempt layout from them and acquiring it proves the release is
+      # consumable without any internal CI state: no attempt directory, no
+      # wheels artifact, no workspace.
+      - name: Prove the published files acquire with the pinned Core
+        env:
+          CORE_TOOL: ${{ runner.temp }}/core-source/scripts/component_artifact.py
+        run: |
+          attempts=(delivery/attempts/*/)
+          test "${#attempts[@]}" -eq 1
+          attempt_id=$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["attempt_id"])' \
+            "${attempts[0]}bundle/bundle.json")
+          stage="$RUNNER_TEMP/public-handoff/attempts/$attempt_id"
+          mkdir -p "$stage/bundle" "$stage/inputs/wheels" "$RUNNER_TEMP/public-store/.deployments"
+          cp release-assets/bundle.json release-assets/install-probe.json release-assets/image.oci.tar \
+            "$stage/bundle/"
+          cp release-assets/source.tar "$stage/inputs/"
+          cp dist/*.whl artifacts/*.whl "$stage/inputs/wheels/"
+          python -I -B "$CORE_TOOL" acquire \
+            --bundle "$stage/bundle/bundle.json" --root "$RUNNER_TEMP/public-store" 9>&- \
+            > "$RUNNER_TEMP/public-acquire.json"
+          acquisition=$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["receipt"]["acquisition_id"])' \
+            "$RUNNER_TEMP/public-acquire.json")
+          python -I -B "$CORE_TOOL" verify \
+            --receipt "$RUNNER_TEMP/public-store/.deployments/artifacts/acquisitions/$acquisition.json" 9>&-
       - uses: actions/upload-artifact@v7
         with:
           name: telegram-image-bundle
@@ -96,12 +147,24 @@ jobs:
           # The staged bundle keeps the digest it was sealed with, independent of the
           # attempt ID and of how the artifact was packed.
           (cd release-assets && sha256sum -c SHA256SUMS)
-          # Exactly the paths gh release create publishes; offline verification of the
-          # bundle also needs release-assets/wheels, which stays in the artifact.
+          # Exactly the paths the release publishes. Offline verification of the
+          # bundle also needs release-assets/wheels, which stays in the artifact and
+          # is deliberately not published.
           test -f release-assets/bundle.json
           test -f release-assets/install-probe.json
           test -f release-assets/image.oci.tar
           test -f release-assets/source.tar
-          gh release create "$RELEASE_TAG" --verify-tag --generate-notes dist/*.whl dist/*.tar.gz dist/SHA256SUMS \
-            release-assets/bundle.json release-assets/install-probe.json release-assets/image.oci.tar \
-            release-assets/source.tar
+          # One published SHA256SUMS covers every published file, with plain
+          # basenames. Core's deploy/setup.sh greps for " <wheel>$" and feeds that
+          # line to sha256sum -c from the download directory, so the wheel line has
+          # to survive here unchanged.
+          mkdir -p public
+          cp dist/*.whl dist/*.tar.gz release-assets/bundle.json release-assets/install-probe.json \
+            release-assets/image.oci.tar release-assets/source.tar public/
+          (cd public && sha256sum *.whl *.tar.gz bundle.json install-probe.json image.oci.tar source.tar \
+            > SHA256SUMS)
+          (cd public && sha256sum -c SHA256SUMS)
+          test "$(wc -l < public/SHA256SUMS)" -eq 6
+          wheel=$(cd public && ls *.whl)
+          test "$(grep -c "  $wheel\$" public/SHA256SUMS)" -eq 1
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes public/*

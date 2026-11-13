@@ -1,7 +1,7 @@
 """The only place that touches Core for `/review`.
 
 Everything `/review` needs from Core goes through `ReviewBackend`. The live
-implementation calls Core 0.8.4 (`semantic_review_async`, segmentation-v1,
+implementation calls Core 0.8.5 (`semantic_review_async`, segmentation-v1,
 `review_pair`); tests drive the same flow with a fake backend.
 
 Semantic review is experimental and off by default in Core
