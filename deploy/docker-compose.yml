@@ -1,5 +1,7 @@
+name: wuwaterm-telegram
 services:
   wuwaterm-telegram:
+    container_name: wuwaterm-telegram
     build:
       context: ../artifacts/docker-context
       dockerfile: ../../deploy/Dockerfile
