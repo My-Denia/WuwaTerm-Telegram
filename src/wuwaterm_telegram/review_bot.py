@@ -12,9 +12,10 @@ Handlers import `.bot` lazily; `bot.py` imports this module at load.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any
+from typing import Any, Iterator
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
@@ -80,8 +81,8 @@ NO_TRANSLATION_RECORD_NOTICE = (
     "source with the translation, or use a --- line."
 )
 NO_LAST_NOTICE = (
-    "没有可查看的审校结果（结果只保留 30 分钟，bot 重启后也会清空）。\n"
-    "No recent review result (kept 30 minutes, cleared on restart)."
+    "没有可查看的审校结果（结果只保留 30 分钟，bot 重启后也会清空），请重新提交 /review。\n"
+    "No recent review result (kept 30 minutes, cleared on restart); submit a new /review."
 )
 SAME_LANGUAGE_NOTICE = (
     "原文和译文看起来是同一种语言，已取消审校。\n"
@@ -321,9 +322,18 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def _show_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     b = _b()
     chat_id = b.chat_id_for(update)
-    job = _store(context).latest_done(chat_id) if chat_id is not None else None
+    done = _store(context).done_jobs(chat_id) if chat_id is not None else []
+    user_id = _user_id(update)
+    # The requester's own result first; another member's only once it is in the
+    # chat, because an unsent result belongs to whoever asked for it.
+    job = next((j for j in done if j.user_id == user_id), None) or next(
+        (j for j in done if j.delivered), None
+    )
     if job is None or job.report is None:
         await b.reply_to_user(update, NO_LAST_NOTICE)
+        return
+    if _in_progress(job):
+        await b.reply_to_user(update, RUNNING_NOTICE)
         return
     if not job.delivered:
         await _deliver(update, context, job)
@@ -395,20 +405,13 @@ async def _start_review(
     if duplicate is not None and _is_incomplete(duplicate):
         duplicate = None  # a stopped or partial review may be run again
     if duplicate is not None:
-        if duplicate.state == "running":
+        if _in_progress(duplicate):
             await b.reply_to_user(update, RUNNING_NOTICE)
-            return
-        if not duplicate.delivered:
-            # Computed but never reached the chat: send it again, no model call.
-            if not await _deliver(update, context, duplicate):
-                return
-        # Delivery can yield while another request creates this owner's job.
-        mine = store.find_owner_duplicate(chat_id, key, _user_id(update))
-        if mine is not None and not _is_incomplete(mine):
-            await _answer_own_duplicate(update, context, mine)
             return
         # The content was already reviewed for someone else in this chat: the
         # report is reused, but this requester gets her own buttons and state.
+        # Nothing awaits between the lookup above and the new job, so a repeat
+        # from this requester finds that job instead of creating a second one.
         await _share_result(update, context, duplicate)
         return
     if store.running(chat_id) is not None:
@@ -468,7 +471,7 @@ async def _answer_own_duplicate(
 ) -> None:
     """Answer a repeat submission with the requester's own earlier result."""
     b = _b()
-    if job.state == "running":
+    if _in_progress(job):
         await b.reply_to_user(update, RUNNING_NOTICE)
         return
     if not job.delivered:
@@ -488,8 +491,11 @@ async def _share_result(
 
     The content stays deduplicated chat-wide, so this costs no model call and
     no rate-limit slot; what is new is the job id, the message and the accepted
-    or skipped state. If the pointer cannot be sent, the job stays undelivered
-    and her next identical submission delivers the stored report instead.
+    or skipped state. If `source` never reached the chat there is nothing to
+    point at, and the first requester still has her own result to receive, so
+    the new job gets the full result instead. If the pointer cannot be sent, the
+    job stays undelivered and her next identical submission delivers the stored
+    report instead.
     """
     b = _b()
     chat_id = b.chat_id_for(update)
@@ -502,6 +508,19 @@ async def _share_result(
     except StoreFullError:
         await b.reply_to_user(update, BUSY_NOTICE)
         return
+    if not source.delivered:
+        await _deliver(update, context, job)
+        return
+    with _delivering(job):
+        await _point_to_shared_result(update, context, source, job)
+
+
+async def _point_to_shared_result(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, source: ReviewJob, job: ReviewJob
+) -> None:
+    b = _b()
+    report = job.report
+    assert report is not None
     text = f"这组内容刚审校过：{summary_line(report)}\n\n{RESULT_HINT}"
     markup = summary_keyboard(job)
     sent_ids: list[int] = []
@@ -563,7 +582,28 @@ def _message_ids(messages: list) -> list[int]:
     ]
 
 
+@contextmanager
+def _delivering(job: ReviewJob) -> Iterator[None]:
+    job.delivering = True
+    try:
+        yield
+    finally:
+        job.delivering = False
+
+
+def _in_progress(job: ReviewJob) -> bool:
+    """Running, or finished with its result still being sent."""
+    return job.state == "running" or job.delivering
+
+
 async def _deliver(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, job: ReviewJob
+) -> bool:
+    with _delivering(job):
+        return await _send_result(update, context, job)
+
+
+async def _send_result(
     update: Update, context: ContextTypes.DEFAULT_TYPE, job: ReviewJob
 ) -> bool:
     """Send a finished job's stored result. It counts as reusable only once sent.

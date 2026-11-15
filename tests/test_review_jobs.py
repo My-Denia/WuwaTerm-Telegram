@@ -158,3 +158,19 @@ def test_create_reusing_never_evicts_the_job_whose_report_it_reuses():
     with pytest.raises(StoreFullError):
         store.create_reusing(1, 10, job)
     assert store.get(1, job.id) is job and store.get(1, running.id) is running
+
+
+def test_a_reuse_chain_never_outlives_the_ttl_of_the_computed_report():
+    store, clock = make(ttl=100.0)
+    first = store.create(1, 7, "a", "b", "en")
+    store.finish(first, report())
+    clock.now += 90
+    second = store.create_reusing(1, 8, first)
+    clock.now += 9
+    third = store.create_reusing(1, 9, second)  # a reuse of a reuse
+    assert store.get(1, third.id) is third
+    clock.now += 1  # the report is exactly one TTL old: every job holding it is gone
+    assert [store.get(1, j.id) for j in (first, second, third)] == [None, None, None]
+    assert store.find_duplicate(1, first.content_key) is None
+    assert store.find_owner_duplicate(1, first.content_key, 9) is None
+    assert store.stats() == {"jobs": 0, "translations": 0}
