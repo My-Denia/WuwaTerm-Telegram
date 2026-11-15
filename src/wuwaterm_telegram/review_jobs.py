@@ -2,7 +2,9 @@
 
 Nothing here touches disk or logs text. Entries expire `ttl_seconds` after
 creation (an entry exactly at the TTL is expired) and each chat keeps at most
-`max_per_chat` of each kind. Ids are short enough for Telegram callback_data.
+`max_per_chat` of each kind. A job that reuses a computed report keeps that
+report's creation time, so a chain of reuses never keeps a report past its own
+TTL. Ids are short enough for Telegram callback_data.
 """
 
 from __future__ import annotations
@@ -56,6 +58,9 @@ class ReviewJob:
     # True once the result reached the chat (message ids are known). A finished
     # job that is not delivered is sent again from the stored report.
     delivered: bool = False
+    # True while a send of this job's result is awaiting Telegram, so a repeat
+    # that arrives meanwhile waits instead of sending the result a second time.
+    delivering: bool = False
     finished_at: float | None = None
 
 
@@ -168,13 +173,16 @@ class ReviewJobStore:
         The report is never mutated after `finish`, so both jobs read the same
         object: reusing it costs no model call and no report copy. Acceptance,
         skipped issues and message ids stay per job. `source` is never the job
-        evicted for the new one, so the first requester keeps her buttons.
+        evicted for the new one, so the first requester keeps her buttons. The
+        new job takes `source.created_at`, not the current time: it expires with
+        the report, so reuse never extends how long a computed report is served.
         """
         if source.report is None:
             raise ValueError("only a computed review report can be reused")
         job = self.create(
             chat_id, user_id, source.source, source.target, source.direction, preserve=source
         )
+        job.created_at = source.created_at
         job.report = source.report
         job.state = STATE_DONE
         job.finished_at = self._clock()
@@ -193,10 +201,11 @@ class ReviewJobStore:
         return None
 
     def latest_done(self, chat_id: int) -> ReviewJob | None:
-        for job in reversed(self._live_jobs(chat_id)):
-            if job.state == STATE_DONE:
-                return job
-        return None
+        return next(iter(self.done_jobs(chat_id)), None)
+
+    def done_jobs(self, chat_id: int) -> list[ReviewJob]:
+        """The chat's finished jobs, newest first."""
+        return [j for j in reversed(self._live_jobs(chat_id)) if j.state == STATE_DONE]
 
     def finish(self, job: ReviewJob, report: ReviewReport) -> None:
         job.report = report
