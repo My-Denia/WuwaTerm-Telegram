@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from wuwaterm_telegram.review_jobs import ReviewJobStore, StoreFullError
+from wuwaterm_telegram.review_jobs import (
+    WAITER_ALREADY,
+    WAITER_FULL,
+    WAITER_QUEUED,
+    ReviewJob,
+    ReviewJobStore,
+    StoreFullError,
+)
 from wuwaterm_telegram.review_model import ReviewReport
 
 
@@ -57,35 +64,43 @@ def test_duplicate_detection_allows_retry_after_failure():
     assert store.find_duplicate(1, failed.content_key) is None
 
 
-def test_eviction_keeps_running_and_full_of_running_raises():
+def test_eviction_skips_running_and_delivering_jobs_and_full_of_them_raises():
     store, _ = make(max_per_chat=3)
     first = store.create(1, None, "1", "1", "en")
     second = store.create(1, None, "2", "2", "en")
     third = store.create(1, None, "3", "3", "en")
+    store.finish(first, report())
     store.finish(second, report())
-    store.create(1, None, "4", "4", "en")  # evicts the oldest non-running one
-    assert store.get(1, second.id) is None
-    assert store.get(1, first.id) is first and store.get(1, third.id) is third
-    with pytest.raises(StoreFullError):
+    store.finish(third, report())
+    first.delivering = True  # this result is on its way to Telegram
+    fourth = store.create(1, None, "4", "4", "en")
+    assert store.get(1, first.id) is first  # never the job being delivered
+    assert store.get(1, second.id) is None  # the oldest one that is free goes
+    assert store.get(1, fourth.id) is fourth
+    # Every remaining slot is running or delivering: nothing may be evicted.
+    third.delivering = True
+    with pytest.raises(StoreFullError) as full:
         store.create(1, None, "5", "5", "en")
+    assert "being delivered" in str(full.value)
+    assert store.get(1, third.id) is third and store.get(1, fourth.id) is fourth
     store.create(2, None, "5", "5", "en")  # another chat is unaffected
 
 
-def test_running_and_latest_done():
+def test_running_and_done_jobs():
     store, clock = make()
     a = store.create(1, None, "a", "a", "en")
-    assert store.running(1) is a and store.latest_done(1) is None
+    assert store.running(1) is a and store.done_jobs(1) == []
     store.finish(a, report())
     assert a.report is not None and a.finished_at == clock.now
     clock.now += 1
     b = store.create(1, None, "b", "b", "en")
     store.finish(b, report())
     assert store.running(1) is None
-    assert store.latest_done(1) is b
+    assert store.done_jobs(1) == [b, a]  # newest first
     clock.now += 99  # a expires, b still lives
-    assert store.latest_done(1) is b
+    assert store.done_jobs(1) == [b]
     clock.now += 1
-    assert store.latest_done(1) is None
+    assert store.done_jobs(1) == []
 
 
 def test_ids_fit_callback_data_and_are_unique():
@@ -128,13 +143,14 @@ def test_owner_scoped_duplicate_keeps_each_requester_separate():
 
 
 def test_create_reusing_shares_the_report_but_not_the_acceptance_state():
-    store, _ = make()
+    store, clock = make()
     first = store.create(1, 7, "a", "b", "en")
     store.finish(first, report())
     first.accepted["0.1"] = 0
     first.skipped.add("0.2")
     first.result_message_ids.append(40)
     first.delivered = True
+    clock.now += 5
     job = store.create_reusing(1, 8, first)
     assert job.id != first.id and job.content_key == first.content_key
     assert job.report is first.report  # one computed report, not a copy framework
@@ -143,6 +159,9 @@ def test_create_reusing_shares_the_report_but_not_the_acceptance_state():
     assert job.accepted == {} and job.skipped == set()
     assert job.accepted is not first.accepted and job.skipped is not first.skipped
     assert first.accepted == {"0.1": 0} and first.skipped == {"0.2"}
+    # The job is new, so its own window starts now; the report keeps its age.
+    assert job.created_at == clock.now and first.created_at == 1000.0
+    assert job.report_created_at == first.report_created_at == 1000.0
 
 
 def test_create_reusing_never_evicts_the_job_whose_report_it_reuses():
@@ -160,7 +179,7 @@ def test_create_reusing_never_evicts_the_job_whose_report_it_reuses():
     assert store.get(1, job.id) is job and store.get(1, running.id) is running
 
 
-def test_a_reuse_chain_never_outlives_the_ttl_of_the_computed_report():
+def test_a_reused_report_stops_matching_after_one_ttl_but_the_reusing_job_keeps_itself():
     store, clock = make(ttl=100.0)
     first = store.create(1, 7, "a", "b", "en")
     store.finish(first, report())
@@ -169,8 +188,58 @@ def test_a_reuse_chain_never_outlives_the_ttl_of_the_computed_report():
     clock.now += 9
     third = store.create_reusing(1, 9, second)  # a reuse of a reuse
     assert store.get(1, third.id) is third
-    clock.now += 1  # the report is exactly one TTL old: every job holding it is gone
-    assert [store.get(1, j.id) for j in (first, second, third)] == [None, None, None]
-    assert store.find_duplicate(1, first.content_key) is None
-    assert store.find_owner_duplicate(1, first.content_key, 9) is None
+    clock.now += 1  # the computed report is exactly one TTL old
+    assert store.find_duplicate(1, first.content_key) is None  # no further reuse
+    assert store.find_owner_duplicate(1, first.content_key, 9) is third  # her own window
+    assert store.get(1, first.id) is None  # the first job expired on its own clock
+    assert store.get(1, second.id) is second and store.get(1, third.id) is third
+    assert third.report_created_at == first.report_created_at
+    clock.now += 90  # 190 s in: the second job's own 100 s are over
+    assert store.get(1, second.id) is None
+    assert store.get(1, third.id) is third
+    clock.now += 9
+    assert store.get(1, third.id) is None
     assert store.stats() == {"jobs": 0, "translations": 0}
+
+
+def test_a_late_reuser_keeps_her_buttons_after_the_report_stops_matching():
+    store, clock = make(ttl=1800.0)
+    first = store.create(1, 7, "a", "b", "en")
+    store.finish(first, report())
+    clock.now += 29 * 60 + 55  # 29:55
+    late = store.create_reusing(1, 8, first)
+    assert late.created_at == clock.now
+    assert late.report_created_at == first.report_created_at
+    assert store.find_duplicate(1, first.content_key) is late  # inside the report's 30 min
+    clock.now += 5  # 30:00 from computation
+    assert store.find_duplicate(1, first.content_key) is None  # a new /review runs fresh
+    assert store.find_owner_duplicate(1, first.content_key, 8) is late
+    clock.now += 5 * 60  # 35:00: the late reuser still has her own window
+    assert store.get(1, late.id) is late
+    assert store.get(1, first.id) is None
+    assert store.find_owner_duplicate(1, first.content_key, 8) is late
+    clock.now += 25 * 60  # 60:00: both windows are over
+    assert store.get(1, late.id) is None
+
+
+def test_waiters_are_deduplicated_capped_and_drained():
+    store, _ = make(max_per_chat=5)
+    job = store.create(1, 1, "a", "b", "en")
+    assert store.waiter_limit == 4
+    marks = [object() for _ in range(6)]
+    assert [
+        store.join_waiters(job, user, mark) for user, mark in zip((2, 3, 4, 5), marks)
+    ] == [WAITER_QUEUED] * 4
+    assert store.join_waiters(job, 2, marks[4]) == WAITER_ALREADY  # once per requester
+    assert store.join_waiters(job, 6, marks[5]) == WAITER_FULL  # four is the cap
+    assert [w.user_id for w in store.drain_waiters(job)] == [2, 3, 4, 5]
+    assert job.waiters == [] and store.drain_waiters(job) == []
+    small, _ = make(max_per_chat=1)  # one slot leaves none for waiters
+    one = small.create(1, 1, "a", "b", "en")
+    assert small.waiter_limit == 0 and small.join_waiters(one, 2, None) == WAITER_FULL
+
+
+def test_the_job_and_the_store_keep_no_write_only_shortcut_state():
+    """MY-338 (4): the newest-result helper and the job's keyboard id are gone."""
+    assert not hasattr(ReviewJobStore, "latest_done")
+    assert "keyboard_message_id" not in ReviewJob.__dataclass_fields__

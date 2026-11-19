@@ -1,9 +1,21 @@
 name: Telegram CI
 
 on:
+  # One automatic run per push to main, plus one per pull request. Tags start
+  # release.yml only, which calls this file itself, so a tag no longer starts a
+  # second, standalone copy of these jobs.
   push:
+    branches: [main]
   pull_request:
   workflow_call:
+
+# A pull request's runs share the group of that pull request, so a new push to
+# it cancels the stale run and nothing else. Everything else (main pushes and
+# the reusable-workflow runs release.yml starts) takes its own run id, so no run
+# can cancel itself or another one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

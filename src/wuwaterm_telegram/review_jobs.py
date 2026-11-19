@@ -2,9 +2,14 @@
 
 Nothing here touches disk or logs text. Entries expire `ttl_seconds` after
 creation (an entry exactly at the TTL is expired) and each chat keeps at most
-`max_per_chat` of each kind. A job that reuses a computed report keeps that
-report's creation time, so a chain of reuses never keeps a report past its own
-TTL. Ids are short enough for Telegram callback_data.
+`max_per_chat` of each kind. Ids are short enough for Telegram callback_data.
+
+A job carries two clocks. `created_at` starts the job's own life: its delivery
+window and the inline buttons that belong to that one requester. The report it
+shows is dated by `report_created_at`. A job that reuses a computed report keeps
+the report's time there, so a chain of reuses never keeps a report past its own
+TTL, while the requester who was handed a reused report still gets a full
+window on her own buttons.
 """
 
 from __future__ import annotations
@@ -24,7 +29,13 @@ STATE_FAILED = "failed"
 
 
 class StoreFullError(RuntimeError):
-    """The chat already has the maximum number of jobs and all are running."""
+    """Every review slot in the chat is running or delivering a result."""
+
+
+# Results of `ReviewJobStore.join_waiters`.
+WAITER_QUEUED = "queued"
+WAITER_ALREADY = "already"
+WAITER_FULL = "full"
 
 
 @dataclass
@@ -39,6 +50,20 @@ class TranslationRecord:
     created_at: float
 
 
+@dataclass(frozen=True)
+class Waiter:
+    """A requester waiting for a report another job in the chat is computing.
+
+    `update` is that requester's own triggering update: the bot needs it to
+    answer into her chat and to re-check her authorization when the report is
+    ready. It is opaque here, so the store keeps no dependency on Telegram, and
+    it lives only until `drain_waiters` drops it.
+    """
+
+    user_id: int | None
+    update: object
+
+
 @dataclass
 class ReviewJob:
     id: str
@@ -49,18 +74,22 @@ class ReviewJob:
     direction: str
     content_key: str
     created_at: float
+    # When the report this job shows was computed. Equal to `created_at` for a
+    # job that ran the review; the source's value for one that reuses a report.
+    report_created_at: float
     state: str = STATE_RUNNING
     report: ReviewReport | None = None
     accepted: dict[str, int] = field(default_factory=dict)  # issue.key -> choice
     skipped: set[str] = field(default_factory=set)
     result_message_ids: list[int] = field(default_factory=list)
-    keyboard_message_id: int | None = None
     # True once the result reached the chat (message ids are known). A finished
     # job that is not delivered is sent again from the stored report.
     delivered: bool = False
     # True while a send of this job's result is awaiting Telegram, so a repeat
     # that arrives meanwhile waits instead of sending the result a second time.
     delivering: bool = False
+    # Other requesters of the same content, served when this job finishes.
+    waiters: list[Waiter] = field(default_factory=list)
     finished_at: float | None = None
 
 
@@ -110,8 +139,19 @@ class ReviewJobStore:
         return removed
 
     def find_duplicate(self, chat_id: int, content_key: str) -> ReviewJob | None:
+        """The chat's job for this content whose report may still be served.
+
+        The bound is the report's age, not the job's: `report_created_at`
+        reaches one TTL one TTL after the model answered, so however many times
+        a report is reused, the next `/review` of the same content after that
+        point runs a fresh one.
+        """
         for job in reversed(self._live_jobs(chat_id)):
-            if job.content_key == content_key and job.state != STATE_FAILED:
+            if (
+                job.content_key == content_key
+                and job.state != STATE_FAILED
+                and not self._expired(job.report_created_at)
+            ):
                 return job
         return None
 
@@ -123,6 +163,10 @@ class ReviewJobStore:
         The chat-wide lookup keeps the model work deduplicated; this narrower
         one answers a repeat submission with the buttons and acceptance state
         that belong to the person who sent it, not to whoever asked first.
+
+        It deliberately follows the job's own `created_at`, not the report's,
+        because those buttons are the job's: a requester who received a reused
+        report late still keeps the full window on her own result.
         """
         for job in reversed(self._live_jobs(chat_id)):
             if (
@@ -132,6 +176,37 @@ class ReviewJobStore:
             ):
                 return job
         return None
+
+    @property
+    def waiter_limit(self) -> int:
+        """How many other requesters may wait on one job.
+
+        One slot stays free for the waiters' own jobs: `create` evicts the
+        oldest job that is neither running nor delivering, so their results must
+        fit without pushing each other out.
+        """
+        return max(0, self._max - 1)
+
+    def join_waiters(
+        self, job: ReviewJob, user_id: int | None, update: object
+    ) -> str:
+        """Queue a requester who submitted this content while it was running.
+
+        Returns `WAITER_QUEUED`, `WAITER_ALREADY` (this requester is queued) or
+        `WAITER_FULL`. `update` is her own submission; it is dropped by
+        `drain_waiters` as soon as the job finishes.
+        """
+        if any(waiter.user_id == user_id for waiter in job.waiters):
+            return WAITER_ALREADY
+        if len(job.waiters) >= self.waiter_limit:
+            return WAITER_FULL
+        job.waiters.append(Waiter(user_id=user_id, update=update))
+        return WAITER_QUEUED
+
+    def drain_waiters(self, job: ReviewJob) -> list[Waiter]:
+        """Take the waiting requesters off the job in one step."""
+        waiters, job.waiters = list(job.waiters), []
+        return waiters
 
     def create(
         self,
@@ -146,12 +221,23 @@ class ReviewJobStore:
         self.purge()
         jobs = self._jobs.setdefault(chat_id, [])
         while len(jobs) >= self._max:
+            # A job whose result is on its way to Telegram is not a victim: its
+            # message ids are still being collected, and dropping it mid-send
+            # would lose the result the requester is already watching for.
             victim = next(
-                (j for j in jobs if j.state != STATE_RUNNING and j is not preserve), None
+                (
+                    j
+                    for j in jobs
+                    if j.state != STATE_RUNNING and not j.delivering and j is not preserve
+                ),
+                None,
             )
             if victim is None:
-                raise StoreFullError("every review slot in this chat is running")
+                raise StoreFullError(
+                    "every review slot in this chat is running or being delivered"
+                )
             jobs.remove(victim)
+        now = self._clock()
         job = ReviewJob(
             id=self._new_id(),
             chat_id=chat_id,
@@ -160,7 +246,8 @@ class ReviewJobStore:
             target=target,
             direction=direction,
             content_key=self.content_key(source, target, direction),
-            created_at=self._clock(),
+            created_at=now,
+            report_created_at=now,
         )
         jobs.append(job)
         return job
@@ -173,16 +260,29 @@ class ReviewJobStore:
         The report is never mutated after `finish`, so both jobs read the same
         object: reusing it costs no model call and no report copy. Acceptance,
         skipped issues and message ids stay per job. `source` is never the job
-        evicted for the new one, so the first requester keeps her buttons. The
-        new job takes `source.created_at`, not the current time: it expires with
-        the report, so reuse never extends how long a computed report is served.
+        evicted for the new one, so the first requester keeps her buttons.
+
+        Two clocks, on purpose. `created_at` is now, so this requester gets her
+        own full `ttl_seconds` window on her own result and buttons.
+        `report_created_at` keeps the source's time, so reuse never extends how
+        long the computed report is served to the chat: `find_duplicate` stops
+        matching it at one TTL after it was computed, and the next `/review` of
+        the same content runs a fresh one.
+
+        This reverses the trade-off PR #38 (`92b3ef2`) chose, where a reusing job
+        simply inherited `source.created_at`: then a member handed a reused
+        report near the end of its life got buttons that expired seconds later.
+        The price is that a reused result's buttons can stay interactive for up
+        to about two TTLs after the report was computed. PR #38's actual bound is
+        kept: the report itself is deduplicated for at most one TTL.
         """
         if source.report is None:
             raise ValueError("only a computed review report can be reused")
         job = self.create(
             chat_id, user_id, source.source, source.target, source.direction, preserve=source
         )
-        job.created_at = source.created_at
+        job.created_at = self._clock()
+        job.report_created_at = source.report_created_at
         job.report = source.report
         job.state = STATE_DONE
         job.finished_at = self._clock()
@@ -200,8 +300,12 @@ class ReviewJobStore:
                 return job
         return None
 
-    def latest_done(self, chat_id: int) -> ReviewJob | None:
-        return next(iter(self.done_jobs(chat_id)), None)
+    def has_slot(self, chat_id: int) -> bool:
+        """Whether `create` would find or free a slot in this chat right now."""
+        live = self._live_jobs(chat_id)
+        return len(live) < self._max or any(
+            j.state != STATE_RUNNING and not j.delivering for j in live
+        )
 
     def done_jobs(self, chat_id: int) -> list[ReviewJob]:
         """The chat's finished jobs, newest first."""

@@ -4,7 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from review_fakes import FakeBackend, wire_response
-from telegram.error import NetworkError
+from telegram.error import NetworkError, TimedOut
 
 from wuwaterm_telegram import review_bot
 from wuwaterm_telegram.bot import (
@@ -34,15 +34,21 @@ class Msg:
         self.from_user, self.sender_chat = from_user, None
         self.sent = []  # (text, kwargs)
         self._next = message_id * 100
+        self.attempts = 0  # every send tried, including the ones that fail
         self.fail_times = 0  # the next N sends raise a Telegram network error
 
     async def reply_text(self, text, **kwargs):
+        self.attempts += 1
+        self.maybe_fail(self.attempts)
         if self.fail_times > 0:
             self.fail_times -= 1
             raise NetworkError("timed out")
         self.sent.append((text, kwargs))
         self._next += 1
         return SimpleNamespace(message_id=self._next)
+
+    def maybe_fail(self, attempt):
+        """Extension point: raise here to fail the `attempt`-th send (1-based)."""
 
 
 class Query:
@@ -109,6 +115,12 @@ def texts(message):
     return [t for t, _ in message.sent]
 
 
+def newest_done(store, chat_id=CHAT):
+    """The chat's newest finished job, or None."""
+    done = store.done_jobs(chat_id)
+    return done[0] if done else None
+
+
 def test_inline_form_replies_with_two_sections_and_a_keyboard_on_the_last_message(tmp_path):
     backend = FakeBackend()
     context, store, _ = make_context(tmp_path, backend)
@@ -120,7 +132,7 @@ def test_inline_form_replies_with_two_sections_and_a_keyboard_on_the_last_messag
     markup = message.sent[-1][1]["reply_markup"]
     assert markup.inline_keyboard[0][0].callback_data.startswith("rv:")
     assert all(len(b.callback_data.encode()) <= 64 for row in markup.inline_keyboard for b in row)
-    assert store.latest_done(CHAT) is not None
+    assert newest_done(store) is not None
 
 
 def test_reply_form_uses_the_replied_message_as_source(tmp_path):
@@ -154,7 +166,7 @@ def test_same_content_twice_points_to_the_first_result_without_a_second_call(tmp
     first = command(context, "/review 甲\n---\na")
     second = command(context, "/review 甲\n---\na", message_id=11)
     assert len(backend.calls) == 1
-    first_result_id = store.latest_done(CHAT).result_message_ids[0]
+    first_result_id = newest_done(store).result_message_ids[0]
     (_, kwargs), = second.sent
     assert kwargs["reply_to_message_id"] == first_result_id
     assert first.sent
@@ -166,7 +178,7 @@ def test_review_last_points_to_the_previous_result_or_says_there_is_none(tmp_pat
     command(context, "/review 甲\n---\na")
     pointer = command(context, "/review last", message_id=12)
     (text, kwargs), = pointer.sent
-    assert kwargs["reply_to_message_id"] == store.latest_done(CHAT).result_message_ids[0]
+    assert kwargs["reply_to_message_id"] == newest_done(store).result_message_ids[0]
     assert "上一条审校结果" in text
 
 
@@ -213,15 +225,15 @@ def test_authorization_lost_while_running_sends_nothing(tmp_path):
     context, store, holder["settings"] = make_context(tmp_path, backend)
     message = command(context, "/review 甲\n---\na", chat_type="supergroup")
     assert len(backend.calls) == 1
-    assert message.sent == [] and store.latest_done(CHAT) is None
+    assert message.sent == [] and newest_done(store) is None
 
 
 def card_flow(tmp_path):
     backend = FakeBackend(answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right"))
     context, store, _ = make_context(tmp_path, backend)
     command(context, "/review 甲乙\n---\nthis is wrong now")
-    job = store.latest_done(CHAT)
-    keyboard_message = Msg(job.keyboard_message_id, "summary")
+    job = newest_done(store)
+    keyboard_message = Msg(job.result_message_ids[-1], "summary")
     return context, store, job, keyboard_message
 
 
@@ -250,8 +262,8 @@ def test_only_the_requester_or_an_admin_may_press(tmp_path):
     settings.set_public(CHAT, True)
     group = dict(chat_type="supergroup")
     command(context, "/review 甲\n---\nthis is wrong", user_id=77, **group)
-    job = store.latest_done(CHAT)
-    kb = Msg(job.keyboard_message_id, "summary")
+    job = newest_done(store)
+    kb = Msg(job.result_message_ids[-1], "summary")
     other = press(context, f"rv:{job.id}:a:1", kb, user_id=78, **group)
     assert other.answers == [(review_bot.NOT_OWNER_TOAST, True)] and not job.accepted
     mine = press(context, f"rv:{job.id}:a:1", kb, user_id=77, **group)
@@ -270,8 +282,8 @@ def test_buttons_stop_working_when_the_chat_is_revoked(tmp_path):
     backend = FakeBackend(answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right"))
     context, store, settings = make_context(tmp_path, backend)
     command(context, "/review 甲\n---\nthis is wrong", chat_type="supergroup")
-    job = store.latest_done(CHAT)
-    kb = Msg(job.keyboard_message_id, "summary")
+    job = newest_done(store)
+    kb = Msg(job.result_message_ids[-1], "summary")
     settings.disallow(CHAT)
     query = press(context, f"rv:{job.id}:c:1", kb, chat_type="supergroup")
     assert query.answers == [(review_bot.DENIED_TOAST, True)] and query.edits == []
@@ -423,7 +435,7 @@ def test_a_demoted_admin_loses_the_buttons_at_once(tmp_path):
     context, store, settings = make_context(tmp_path, backend)
     settings.set_public(CHAT, True)
     command(context, "/review 甲乙\n---\nthis is wrong", user_id=77, chat_type="supergroup")
-    job = store.latest_done(CHAT)
+    job = newest_done(store)
     context.application.bot_data[ADMIN_CACHE_KEY].put(CHAT, 78, True)  # stale "admin" verdict
     checks = []
 
@@ -432,7 +444,7 @@ def test_a_demoted_admin_loses_the_buttons_at_once(tmp_path):
         return SimpleNamespace(status="member")
 
     context.bot.get_chat_member = now_a_member
-    kb = Msg(job.keyboard_message_id, "summary")
+    kb = Msg(job.result_message_ids[-1], "summary")
     query = press(context, f"rv:{job.id}:a:1", kb, user_id=78, chat_type="supergroup")
     assert checks == [78]  # asked Telegram, did not trust the cache
     assert query.answers == [(review_bot.NOT_OWNER_TOAST, True)] and not job.accepted and query.edits == []
@@ -460,11 +472,11 @@ def test_a_recent_tr_result_can_be_reviewed_while_the_model_track_is_off(monkeyp
 def test_a_result_that_could_not_be_sent_is_resent_without_another_model_call(tmp_path):
     backend = FakeBackend()
     context, store, _ = make_context(tmp_path, backend)
-    failed = command(context, "/review 甲\n---\na", fail_times=1)
+    failed = command(context, "/review 甲\n---\na", fail_times=2)  # the send and its retry
     assert len(backend.calls) == 1
-    # the result send failed; one short notice went out instead of the result
+    # the result send failed twice; one short notice went out instead of the result
     assert texts(failed) == [review_bot.DELIVERY_FAILED_NOTICE]
-    job = store.latest_done(CHAT)
+    job = newest_done(store)
     assert job.delivered is False and job.result_message_ids == []
     again = command(context, "/review 甲\n---\na", message_id=11)
     assert len(backend.calls) == 1  # no new model call
@@ -479,9 +491,9 @@ def test_a_result_that_could_not_be_sent_is_resent_without_another_model_call(tm
 def test_when_even_the_failure_notice_cannot_be_sent_nothing_is_retried_or_raised(tmp_path):
     backend = FakeBackend()
     context, store, _ = make_context(tmp_path, backend)
-    silent = command(context, "/review 甲\n---\na", fail_times=2)
+    silent = command(context, "/review 甲\n---\na", fail_times=3)  # send, retry, notice
     assert silent.sent == [] and len(backend.calls) == 1
-    assert store.latest_done(CHAT).delivered is False
+    assert newest_done(store).delivered is False
     # /review last also delivers the stored result instead of pointing at nothing
     last = command(context, "/review last", message_id=11)
     assert "语义疑点（实验性" in "\n".join(texts(last)) and len(backend.calls) == 1
@@ -497,7 +509,7 @@ def shared_content(tmp_path):
     settings.set_public(CHAT, True)
     group = dict(chat_type="supergroup")
     command(context, "/review 甲乙\n---\nthis is wrong", user_id=77, **group)
-    first = store.latest_done(CHAT)
+    first = newest_done(store)
     second = command(context, "/review 甲乙\n---\nthis is wrong", user_id=88, message_id=21, **group)
     return context, store, backend, first, second, group
 
@@ -521,16 +533,16 @@ def test_a_second_member_gets_own_controls_for_reused_content_without_a_model_ca
     assert first.accepted == {} and first.delivered is True
     assert "刚审校过" in text and job.result_message_ids
     # The second member works their own copy; the first one is untouched.
-    own = press(context, f"rv:{job.id}:a:1", Msg(job.keyboard_message_id, "summary"), user_id=88, **group)
+    own = press(context, f"rv:{job.id}:a:1", Msg(job.result_message_ids[-1], "summary"), user_id=88, **group)
     assert own.edits and job.accepted and first.accepted == {}
-    mine = press(context, f"rv:{first.id}:a:1", Msg(first.keyboard_message_id), user_id=77, **group)
+    mine = press(context, f"rv:{first.id}:a:1", Msg(first.result_message_ids[-1]), user_id=77, **group)
     assert mine.edits and first.accepted and job.accepted == {first.report.issues[0].key: 0}
 
 
 def test_a_second_member_still_cannot_press_the_first_members_buttons(tmp_path):
     context, store, backend, first, second, group = shared_content(tmp_path)
     assert store.get(CHAT, first.id) is not None
-    denied = press(context, f"rv:{first.id}:a:1", Msg(first.keyboard_message_id), user_id=88, **group)
+    denied = press(context, f"rv:{first.id}:a:1", Msg(first.result_message_ids[-1]), user_id=88, **group)
     assert denied.answers == [(review_bot.NOT_OWNER_TOAST, True)] and not first.accepted
     assert denied.edits == []
     _, job = job_from_markup(store, second)
@@ -540,7 +552,7 @@ def test_a_second_member_still_cannot_press_the_first_members_buttons(tmp_path):
 def test_repeating_the_same_content_points_at_the_requesters_own_result(tmp_path):
     context, store, backend, first, second, group = shared_content(tmp_path)
     _, job = job_from_markup(store, second)
-    press(context, f"rv:{job.id}:a:1", Msg(job.keyboard_message_id), user_id=88, **group)
+    press(context, f"rv:{job.id}:a:1", Msg(job.result_message_ids[-1]), user_id=88, **group)
     again = command(context, "/review 甲乙\n---\nthis is wrong", user_id=88, message_id=22, **group)
     assert len(backend.calls) == 1 and store.stats()["jobs"] == 2  # no clone, no new call
     (_, kwargs), = again.sent
@@ -560,13 +572,450 @@ def test_a_second_member_does_not_inherit_the_first_members_accepted_issues(tmp_
     settings.set_public(CHAT, True)
     group = dict(chat_type="supergroup")
     command(context, "/review 甲乙\n---\nthis is wrong", user_id=77, **group)
-    first = store.latest_done(CHAT)
-    press(context, f"rv:{first.id}:a:1", Msg(first.keyboard_message_id), user_id=77, **group)
+    first = newest_done(store)
+    press(context, f"rv:{first.id}:a:1", Msg(first.result_message_ids[-1]), user_id=77, **group)
     assert first.accepted and first.delivered
-    first_result_ids, first_keyboard = list(first.result_message_ids), first.keyboard_message_id
+    first_result_ids, first_keyboard = list(first.result_message_ids), first.result_message_ids[-1]
     second = command(context, "/review 甲乙\n---\nthis is wrong", user_id=88, message_id=21, **group)
     _, job = job_from_markup(store, second)
     assert job.accepted == {} and job.skipped == set()  # nothing was copied from the first member
     assert first.accepted and first.result_message_ids == first_result_ids
-    assert first.keyboard_message_id == first_keyboard
+    assert first.result_message_ids[-1] == first_keyboard
     assert len(backend.calls) == 1
+
+
+# --- MY-338: delivery in flight, waiting requesters, resend and toasts -----------
+
+
+class GatedBackend(FakeBackend):
+    """Holds the model call until the test releases it.
+
+    A second submission then lands while the first review is genuinely running,
+    which is the state the waiter queue exists for; nothing here races.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def semantic_review(self, source, target, **kwargs):
+        self.started.set()
+        await self.release.wait()
+        return await super().semantic_review(source, target, **kwargs)
+
+
+SHARED = "/review 甲乙\n---\nthis is wrong"
+
+
+def waiting_setup(tmp_path, *, backend=None, limit=2):
+    backend = backend or GatedBackend(
+        answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right")
+    )
+    context, store, settings = make_context(tmp_path, backend, limit=limit)
+    settings.set_public(CHAT, True)
+    return backend, context, store
+
+
+async def queue_waiter(context, store, *, user_id, message_id, group):
+    """Drive a second member's identical submission into the running job."""
+    source = store.find_duplicate(CHAT, store.content_key("甲乙", "this is wrong", "en"))
+    message = Msg(message_id, SHARED)
+    await review_bot.review_command(update_for(message, user_id=user_id, **group), context)
+    return source, message
+
+
+def test_new_content_is_refused_when_every_slot_is_running_or_delivering(tmp_path):
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    for number in range(5):
+        job = store.create(CHAT, 90 + number, f"s{number}", f"t{number}", "en")
+        job.state = "done"  # finished, but every result is on its way to Telegram
+        job.delivering = True
+    message = command(context, "/review 甲\n---\na", message_id=11)
+    assert texts(message) == [review_bot.BUSY_NOTICE] and backend.calls == []
+    assert store.stats()["jobs"] == 5  # nothing was evicted mid-delivery
+
+
+def test_content_submitted_while_the_review_runs_gets_its_own_result_and_buttons(tmp_path):
+    backend, context, store = waiting_setup(tmp_path)
+    group = dict(chat_type="supergroup")
+
+    async def scenario():
+        first = Msg(20, SHARED)
+        task = asyncio.create_task(
+            review_bot.review_command(update_for(first, user_id=77, **group), context)
+        )
+        await asyncio.wait_for(backend.started.wait(), 5)
+        source, waiting = await queue_waiter(
+            context, store, user_id=88, message_id=21, group=group
+        )
+        assert source is not None and source.state == "running"
+        assert texts(waiting) == [review_bot.WAITER_NOTICE]  # queued, nothing submitted
+        assert waiting.attempts == 1  # the notice only: no model call, no slot
+        assert [w.user_id for w in source.waiters] == [88]
+        backend.release.set()
+        await task
+        return source, waiting
+
+    source, waiting = asyncio.run(scenario())
+    assert len(backend.calls) == 1  # one model call for two requesters
+    assert source.delivered and source.waiters == []  # her update is not kept
+    own = store.find_owner_duplicate(CHAT, source.content_key, 88)
+    assert own is not None and own is not source and own.delivered
+    body = "\n".join(texts(waiting))
+    # The one computed report is pointed at, not posted again: only her own
+    # job, buttons and message are new.
+    assert "刚审校过" in body and review_bot.RESULT_HINT in body
+    assert waiting.sent[-1][1]["reply_to_message_id"] == source.result_message_ids[0]
+    buttons = [
+        button
+        for _, kwargs in waiting.sent
+        if kwargs.get("reply_markup")
+        for row in kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert buttons and {b.callback_data.split(":")[1] for b in buttons} == {own.id}
+    # Each requester works her own copy, and the chat spent one rate-limit slot.
+    pressed = press(context, f"rv:{own.id}:a:1", Msg(own.result_message_ids[-1]), user_id=88, **group)
+    assert pressed.edits and own.accepted and source.accepted == {}
+    limiter = context.application.bot_data[RATE_LIMITER_KEY]
+    assert [limiter.allow(CHAT), limiter.allow(CHAT)] == [True, False]
+
+
+def test_a_fifth_waiter_is_told_to_submit_again_shortly(tmp_path):
+    backend, context, store = waiting_setup(tmp_path)
+    group = dict(chat_type="supergroup")
+
+    async def scenario():
+        first = Msg(20, SHARED)
+        task = asyncio.create_task(
+            review_bot.review_command(update_for(first, user_id=77, **group), context)
+        )
+        await asyncio.wait_for(backend.started.wait(), 5)
+        queued, refused = [], None
+        for number, user_id in enumerate((88, 89, 90, 91)):
+            source, message = await queue_waiter(
+                context, store, user_id=user_id, message_id=30 + number, group=group
+            )
+            queued.append(message)
+        source, refused = await queue_waiter(
+            context, store, user_id=92, message_id=40, group=group
+        )
+        backend.release.set()
+        await task
+        return source, queued, refused
+
+    source, queued, refused = asyncio.run(scenario())
+    # Each of the four was queued and then served her own result, in place.
+    assert [texts(message)[0] for message in queued] == [review_bot.WAITER_NOTICE] * 4
+    assert all("刚审校过" in "\n".join(texts(m)) for m in queued)
+    assert texts(refused) == [review_bot.WAITER_FULL_NOTICE]
+    assert source.waiters == [] and source.delivered
+    # Four waiters plus the source fit the chat's five slots: none is evicted.
+    assert store.stats()["jobs"] == 5
+    assert len([job for job in store.done_jobs(CHAT) if job.delivered]) == 5
+
+
+def test_waiters_are_told_when_the_shared_review_crashes(tmp_path):
+    class CrashingBackend(GatedBackend):
+        async def semantic_review(self, source, target, **kwargs):
+            self.started.set()
+            await self.release.wait()
+            raise RuntimeError("boom")  # unlike a ReviewBackendError, nothing absorbs it
+
+    backend = CrashingBackend()
+    backend, context, store = waiting_setup(tmp_path, backend=backend)
+    group = dict(chat_type="supergroup")
+
+    async def scenario():
+        first = Msg(20, SHARED)
+        task = asyncio.create_task(
+            review_bot.review_command(update_for(first, user_id=77, **group), context)
+        )
+        await asyncio.wait_for(backend.started.wait(), 5)
+        source, waiting = await queue_waiter(
+            context, store, user_id=88, message_id=21, group=group
+        )
+        backend.release.set()
+        await task
+        return first, source, waiting
+
+    first, source, waiting = asyncio.run(scenario())
+    assert texts(first) == [review_bot.FAILED_NOTICE]
+    assert waiting.sent[-1][0] == review_bot.WAITERS_FAILED_NOTICE
+    assert source.state == "failed" and source.waiters == []
+    assert store.find_owner_duplicate(CHAT, source.content_key, 88) is None
+
+
+def test_waiters_are_dropped_silently_when_the_chat_is_revoked_mid_review(tmp_path):
+    backend, context, store = waiting_setup(tmp_path)
+    settings = context.application.bot_data[CHAT_SETTINGS_KEY]
+    group = dict(chat_type="supergroup")
+
+    async def scenario():
+        first = Msg(20, SHARED)
+        task = asyncio.create_task(
+            review_bot.review_command(update_for(first, user_id=77, **group), context)
+        )
+        await asyncio.wait_for(backend.started.wait(), 5)
+        source, waiting = await queue_waiter(
+            context, store, user_id=88, message_id=21, group=group
+        )
+        settings.set_public(CHAT, False)
+        settings.disallow(CHAT)  # /revoke lands while the model works
+        backend.release.set()
+        await task
+        return first, source, waiting
+
+    first, source, waiting = asyncio.run(scenario())
+    assert first.sent == []  # the requester is told nothing, as before
+    assert texts(waiting) == [review_bot.WAITER_NOTICE]  # the waiter gets no result either
+    assert source.state == "failed" and source.waiters == []
+
+
+def test_a_definitely_unsent_result_is_retried_once_and_arrives(tmp_path):
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    message = command(context, "/review 甲\n---\na", fail_times=1)
+    job = newest_done(store)
+    assert len(backend.calls) == 1 and message.attempts == 2  # the failure and the retry
+    assert job.delivered is True and job.result_message_ids
+    body = "\n".join(texts(message))
+    assert "语义疑点（实验性" in body and review_bot.DELIVERY_FAILED_NOTICE not in body
+
+
+def test_a_timeout_is_not_retried_because_it_may_already_have_arrived(tmp_path):
+    class TimeoutMessage(Msg):
+        def maybe_fail(self, attempt):
+            if attempt == 1:
+                raise TimedOut()
+
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    message = TimeoutMessage(10, "/review 甲\n---\na")
+    asyncio.run(review_bot.review_command(update_for(message), context))
+    job = newest_done(store)
+    assert message.attempts == 2  # the timed-out send and the notice, no retry
+    assert texts(message) == [review_bot.DELIVERY_FAILED_NOTICE]
+    assert job.state == "done" and job.delivered is False and len(backend.calls) == 1
+    button = message.sent[0][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == f"rv:{job.id}:d"
+    assert len(button.callback_data.encode()) <= 64  # Telegram's callback_data limit
+
+
+def test_no_retry_once_a_part_of_the_result_is_already_in_the_chat(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        review_bot, "format_report", lambda report, footer="": ["part one", "part two"]
+    )
+
+    class PartlyFailingMessage(Msg):
+        def maybe_fail(self, attempt):
+            if attempt == 2:  # the second part
+                raise NetworkError("uncertain delivery")
+
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    message = PartlyFailingMessage(10, "/review 甲\n---\na")
+    asyncio.run(review_bot.review_command(update_for(message), context))
+    job = newest_done(store)
+    assert texts(message) == ["part one", review_bot.DELIVERY_FAILED_NOTICE]  # no repeat
+    assert message.attempts == 3 and job.delivered is False
+    assert len(backend.calls) == 1
+
+
+def resend_setup(tmp_path):
+    backend = FakeBackend()
+    context, store, settings = make_context(tmp_path, backend)
+    settings.set_public(CHAT, True)
+    group = dict(chat_type="supergroup")
+    notice = command(context, SHARED, user_id=77, fail_times=2, **group)
+    job = newest_done(store)
+    assert job is not None and not job.delivered and len(backend.calls) == 1
+    return context, store, backend, job, notice, group
+
+
+def test_the_resend_button_sends_the_stored_result_without_another_model_call(tmp_path):
+    context, store, backend, job, notice, group = resend_setup(tmp_path)
+    (text, kwargs), = notice.sent
+    assert text == review_bot.DELIVERY_FAILED_NOTICE
+    button = kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == f"rv:{job.id}:d" and "重新发送" in button.text
+
+    query = press(context, button.callback_data, notice, user_id=77, **group)
+    assert query.answers == [(None, False)]
+    assert job.delivered is True and job.result_message_ids
+    assert review_bot.RESULT_HINT in texts(notice)[-1]
+    assert len(backend.calls) == 1  # the stored report, no second review
+    sent_before = len(notice.sent)
+    again = press(context, button.callback_data, notice, user_id=77, **group)
+    assert again.answers == [(None, False)] and len(notice.sent) == sent_before
+
+
+def test_only_the_requester_or_an_admin_may_press_resend(tmp_path):
+    context, store, backend, job, notice, group = resend_setup(tmp_path)
+    data = f"rv:{job.id}:d"
+    denied = press(context, data, notice, user_id=88, **group)
+    assert denied.answers == [(review_bot.NOT_OWNER_TOAST, True)]
+    assert job.delivered is False and len(backend.calls) == 1
+    admin = press(context, data, notice, user_id=OWNER, **group)
+    assert admin.answers == [(None, False)] and job.delivered is True
+
+
+def test_the_expiry_and_issue_toasts_are_bilingual_and_fit_telegram():
+    for toast in (review_bot.EXPIRED_TOAST, review_bot.TR_EXPIRED_TOAST):
+        assert len(toast) <= 200 and "\n" in toast  # one line per language
+    for toast in (review_bot.DENIED_TOAST, review_bot.NOT_OWNER_TOAST):
+        assert len(toast) <= 200 and "/" in toast  # both languages on one line
+    assert review_bot.TR_EXPIRED_TOAST != review_bot.EXPIRED_TOAST
+    assert "/tr" in review_bot.TR_EXPIRED_TOAST  # what actually brings the record back
+    assert "/review" not in review_bot.TR_EXPIRED_TOAST
+    assert "/review" in review_bot.EXPIRED_TOAST
+
+
+def test_an_issue_number_outside_the_report_answers_unknown_issue(tmp_path):
+    context, _, job, kb = card_flow(tmp_path)
+    for data in (f"rv:{job.id}:c:0", f"rv:{job.id}:c:9"):
+        assert press(context, data, kb).answers == [
+            (review_bot.ACCEPT_REASONS["unknown_issue"], True)
+        ]
+
+
+def test_waiter_joining_during_resend_or_shared_delivery_is_released(tmp_path):
+    context, store, backend, job, _, group = resend_setup(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SlowMsg(Msg):
+        async def reply_text(self, text, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                await asyncio.wait_for(release.wait(), 5)
+            return await super().reply_text(text, **kwargs)
+
+    async def scenario():
+        slow = SlowMsg(50)
+        q = Query(f"rv:{job.id}:d", slow)
+        resend = asyncio.create_task(
+            review_bot.review_callback(update_for(slow, user_id=77, query=q, **group), context)
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        late = Msg(51, SHARED)
+        await review_bot.review_command(update_for(late, user_id=88, **group), context)
+        assert texts(late) == [review_bot.WAITER_NOTICE]
+        release.set()
+        await asyncio.wait_for(resend, 5)
+        # Variant: user 90 arrives while user 89's shared pointer is mid-send.
+        entered2, release2 = asyncio.Event(), asyncio.Event()
+
+        class SlowShareMsg(Msg):
+            async def reply_text(self, text, **kwargs):
+                if not entered2.is_set():
+                    entered2.set()
+                    await asyncio.wait_for(release2.wait(), 5)
+                return await super().reply_text(text, **kwargs)
+
+        share_msg = SlowShareMsg(52, SHARED)
+        share_task = asyncio.create_task(
+            review_bot.review_command(update_for(share_msg, user_id=89, **group), context)
+        )
+        await asyncio.wait_for(entered2.wait(), 5)
+        late2 = Msg(53, SHARED)
+        await review_bot.review_command(update_for(late2, user_id=90, **group), context)
+        assert texts(late2) == [review_bot.WAITER_NOTICE]
+        release2.set()
+        await asyncio.wait_for(share_task, 5)
+        return late, late2
+
+    late, late2 = asyncio.run(scenario())
+    assert any("刚审校过" in t for t in texts(late)) and job.waiters == []
+    assert any("刚审校过" in t for t in texts(late2))
+    assert all(j.waiters == [] for j in store.done_jobs(CHAT))
+    assert len(backend.calls) == 1
+
+
+def test_release_waiters_isolates_full_notice_errors_and_skips_resubmitted_waiter(tmp_path):
+    backend, context, store = waiting_setup(tmp_path)
+    group = dict(chat_type="supergroup")
+    entered1, release1 = asyncio.Event(), asyncio.Event()
+
+    class FailingNoticeMsg(Msg):
+        async def reply_text(self, text, **kwargs):
+            if text == review_bot.WAITER_SLOTS_FULL_NOTICE:
+                raise TimedOut()
+            return await super().reply_text(text, **kwargs)
+
+    class SlowWaiterMsg(Msg):
+        async def reply_text(self, text, **kwargs):
+            if text != review_bot.WAITER_NOTICE and not entered1.is_set():
+                entered1.set()
+                await asyncio.wait_for(release1.wait(), 5)
+            return await super().reply_text(text, **kwargs)
+
+    async def scenario():
+        first = Msg(20, SHARED)
+        task = asyncio.create_task(
+            review_bot.review_command(update_for(first, user_id=77, **group), context)
+        )
+        await asyncio.wait_for(backend.started.wait(), 5)
+        w1 = SlowWaiterMsg(21, SHARED)
+        await review_bot.review_command(update_for(w1, user_id=88, **group), context)
+        w2 = Msg(22, SHARED)
+        await review_bot.review_command(update_for(w2, user_id=89, **group), context)
+        backend.release.set()
+        await asyncio.wait_for(entered1.wait(), 5)
+        # Waiter 89 resubmits while waiter 88 is being answered; she must only get one job.
+        w2_repeat = Msg(23, SHARED)
+        await review_bot.review_command(update_for(w2_repeat, user_id=89, **group), context)
+        release1.set()
+        await asyncio.wait_for(task, 5)
+        # Also verify a throwing slots_full_notice on waiter #1 does not abort waiter #2.
+        source = newest_done(store)
+        for uid in (91, 92, 93, 94):
+            j = store.create(CHAT, uid, f"甲{uid}", f"a{uid}", "en")
+            j.delivering = True
+        f1, f2 = FailingNoticeMsg(24), Msg(25)
+        store.join_waiters(source, 95, update_for(f1, user_id=95, **group))
+        store.join_waiters(source, 96, update_for(f2, user_id=96, **group))
+        await review_bot._release_waiters(context, source)
+        return w2, w2_repeat, f2
+
+    w2, w2_repeat, f2 = asyncio.run(scenario())
+    user89_jobs = [j for j in store.done_jobs(CHAT) if j.user_id == 89]
+    assert len(user89_jobs) == 1
+    assert any("刚审校过" in t for t in texts(w2_repeat))
+    assert texts(w2) == [review_bot.WAITER_NOTICE]
+    assert texts(f2) == [review_bot.WAITER_SLOTS_FULL_NOTICE]
+
+
+def test_double_tapping_resend_sends_the_report_only_once(tmp_path):
+    context, store, backend, job, _, group = resend_setup(tmp_path)
+    answer_entered, release_answer = asyncio.Event(), asyncio.Event()
+
+    class SlowQuery(Query):
+        async def answer(self, text=None, show_alert=False):
+            await super().answer(text, show_alert)
+            answer_entered.set()
+            await asyncio.wait_for(release_answer.wait(), 5)
+
+    async def scenario():
+        msg = Msg(60)
+        q1, q2 = SlowQuery(f"rv:{job.id}:d", msg), Query(f"rv:{job.id}:d", msg)
+        t1 = asyncio.create_task(
+            review_bot.review_callback(update_for(msg, user_id=77, query=q1, **group), context)
+        )
+        await asyncio.wait_for(answer_entered.wait(), 5)
+        assert job.delivering is True
+        t2 = asyncio.create_task(
+            review_bot.review_callback(update_for(msg, user_id=77, query=q2, **group), context)
+        )
+        await asyncio.wait_for(t2, 5)  # second tap finishes immediately while first awaits answer()
+        assert job.delivering is True  # not cleared by the second tap
+        release_answer.set()
+        await asyncio.wait_for(t1, 5)
+        return msg, q1, q2
+
+    msg, q1, q2 = asyncio.run(scenario())
+    assert len(msg.sent) == 1 and job.delivered is True and job.delivering is False
+    assert q1.answers == [(None, False)] and q2.answers == [(None, False)]
+    assert len(backend.calls) == 1
+
