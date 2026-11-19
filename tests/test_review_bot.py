@@ -879,3 +879,143 @@ def test_an_issue_number_outside_the_report_answers_unknown_issue(tmp_path):
         assert press(context, data, kb).answers == [
             (review_bot.ACCEPT_REASONS["unknown_issue"], True)
         ]
+
+
+def test_waiter_joining_during_resend_or_shared_delivery_is_released(tmp_path):
+    context, store, backend, job, _, group = resend_setup(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SlowMsg(Msg):
+        async def reply_text(self, text, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                await asyncio.wait_for(release.wait(), 5)
+            return await super().reply_text(text, **kwargs)
+
+    async def scenario():
+        slow = SlowMsg(50)
+        q = Query(f"rv:{job.id}:d", slow)
+        resend = asyncio.create_task(
+            review_bot.review_callback(update_for(slow, user_id=77, query=q, **group), context)
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        late = Msg(51, SHARED)
+        await review_bot.review_command(update_for(late, user_id=88, **group), context)
+        assert texts(late) == [review_bot.WAITER_NOTICE]
+        release.set()
+        await asyncio.wait_for(resend, 5)
+        # Variant: user 90 arrives while user 89's shared pointer is mid-send.
+        entered2, release2 = asyncio.Event(), asyncio.Event()
+
+        class SlowShareMsg(Msg):
+            async def reply_text(self, text, **kwargs):
+                if not entered2.is_set():
+                    entered2.set()
+                    await asyncio.wait_for(release2.wait(), 5)
+                return await super().reply_text(text, **kwargs)
+
+        share_msg = SlowShareMsg(52, SHARED)
+        share_task = asyncio.create_task(
+            review_bot.review_command(update_for(share_msg, user_id=89, **group), context)
+        )
+        await asyncio.wait_for(entered2.wait(), 5)
+        late2 = Msg(53, SHARED)
+        await review_bot.review_command(update_for(late2, user_id=90, **group), context)
+        assert texts(late2) == [review_bot.WAITER_NOTICE]
+        release2.set()
+        await asyncio.wait_for(share_task, 5)
+        return late, late2
+
+    late, late2 = asyncio.run(scenario())
+    assert any("刚审校过" in t for t in texts(late)) and job.waiters == []
+    assert any("刚审校过" in t for t in texts(late2))
+    assert all(j.waiters == [] for j in store.done_jobs(CHAT))
+    assert len(backend.calls) == 1
+
+
+def test_release_waiters_isolates_full_notice_errors_and_skips_resubmitted_waiter(tmp_path):
+    backend, context, store = waiting_setup(tmp_path)
+    group = dict(chat_type="supergroup")
+    entered1, release1 = asyncio.Event(), asyncio.Event()
+
+    class FailingNoticeMsg(Msg):
+        async def reply_text(self, text, **kwargs):
+            if text == review_bot.WAITER_SLOTS_FULL_NOTICE:
+                raise TimedOut()
+            return await super().reply_text(text, **kwargs)
+
+    class SlowWaiterMsg(Msg):
+        async def reply_text(self, text, **kwargs):
+            if text != review_bot.WAITER_NOTICE and not entered1.is_set():
+                entered1.set()
+                await asyncio.wait_for(release1.wait(), 5)
+            return await super().reply_text(text, **kwargs)
+
+    async def scenario():
+        first = Msg(20, SHARED)
+        task = asyncio.create_task(
+            review_bot.review_command(update_for(first, user_id=77, **group), context)
+        )
+        await asyncio.wait_for(backend.started.wait(), 5)
+        w1 = SlowWaiterMsg(21, SHARED)
+        await review_bot.review_command(update_for(w1, user_id=88, **group), context)
+        w2 = Msg(22, SHARED)
+        await review_bot.review_command(update_for(w2, user_id=89, **group), context)
+        backend.release.set()
+        await asyncio.wait_for(entered1.wait(), 5)
+        # Waiter 89 resubmits while waiter 88 is being answered; she must only get one job.
+        w2_repeat = Msg(23, SHARED)
+        await review_bot.review_command(update_for(w2_repeat, user_id=89, **group), context)
+        release1.set()
+        await asyncio.wait_for(task, 5)
+        # Also verify a throwing slots_full_notice on waiter #1 does not abort waiter #2.
+        source = newest_done(store)
+        for uid in (91, 92, 93, 94):
+            j = store.create(CHAT, uid, f"甲{uid}", f"a{uid}", "en")
+            j.delivering = True
+        f1, f2 = FailingNoticeMsg(24), Msg(25)
+        store.join_waiters(source, 95, update_for(f1, user_id=95, **group))
+        store.join_waiters(source, 96, update_for(f2, user_id=96, **group))
+        await review_bot._release_waiters(context, source)
+        return w2, w2_repeat, f2
+
+    w2, w2_repeat, f2 = asyncio.run(scenario())
+    user89_jobs = [j for j in store.done_jobs(CHAT) if j.user_id == 89]
+    assert len(user89_jobs) == 1
+    assert any("刚审校过" in t for t in texts(w2_repeat))
+    assert texts(w2) == [review_bot.WAITER_NOTICE]
+    assert texts(f2) == [review_bot.WAITER_SLOTS_FULL_NOTICE]
+
+
+def test_double_tapping_resend_sends_the_report_only_once(tmp_path):
+    context, store, backend, job, _, group = resend_setup(tmp_path)
+    answer_entered, release_answer = asyncio.Event(), asyncio.Event()
+
+    class SlowQuery(Query):
+        async def answer(self, text=None, show_alert=False):
+            await super().answer(text, show_alert)
+            answer_entered.set()
+            await asyncio.wait_for(release_answer.wait(), 5)
+
+    async def scenario():
+        msg = Msg(60)
+        q1, q2 = SlowQuery(f"rv:{job.id}:d", msg), Query(f"rv:{job.id}:d", msg)
+        t1 = asyncio.create_task(
+            review_bot.review_callback(update_for(msg, user_id=77, query=q1, **group), context)
+        )
+        await asyncio.wait_for(answer_entered.wait(), 5)
+        assert job.delivering is True
+        t2 = asyncio.create_task(
+            review_bot.review_callback(update_for(msg, user_id=77, query=q2, **group), context)
+        )
+        await asyncio.wait_for(t2, 5)  # second tap finishes immediately while first awaits answer()
+        assert job.delivering is True  # not cleared by the second tap
+        release_answer.set()
+        await asyncio.wait_for(t1, 5)
+        return msg, q1, q2
+
+    msg, q1, q2 = asyncio.run(scenario())
+    assert len(msg.sent) == 1 and job.delivered is True and job.delivering is False
+    assert q1.answers == [(None, False)] and q2.answers == [(None, False)]
+    assert len(backend.calls) == 1
+

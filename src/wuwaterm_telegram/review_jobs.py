@@ -300,6 +300,13 @@ class ReviewJobStore:
                 return job
         return None
 
+    def has_slot(self, chat_id: int) -> bool:
+        """Whether `create` would find or free a slot in this chat right now."""
+        live = self._live_jobs(chat_id)
+        return len(live) < self._max or any(
+            j.state != STATE_RUNNING and not j.delivering for j in live
+        )
+
     def done_jobs(self, chat_id: int) -> list[ReviewJob]:
         """The chat's finished jobs, newest first."""
         return [j for j in reversed(self._live_jobs(chat_id)) if j.state == STATE_DONE]

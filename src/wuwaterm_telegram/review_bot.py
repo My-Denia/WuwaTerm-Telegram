@@ -458,7 +458,7 @@ async def _start_review(
         # from this requester finds that job instead of creating a second one.
         await _share_result(update, context, duplicate)
         return
-    if store.running(chat_id) is not None:
+    if store.running(chat_id) is not None or not store.has_slot(chat_id):
         await b.reply_to_user(update, BUSY_NOTICE)
         return
     if actor.rate_limited and not b._consume_rate_limit(update, context):
@@ -512,8 +512,10 @@ async def _run_and_deliver(
         await _release_waiters(context, job)
         return
     store.finish(job, report)
-    await _deliver(update, context, job)
-    await _release_waiters(context, job)
+    try:
+        await _deliver(update, context, job)
+    finally:
+        await _release_waiters(context, job)
 
 
 async def _wait_for_shared_result(
@@ -552,6 +554,13 @@ async def _release_waiters(
                 continue  # the chat's policy changed while she waited
             if not finished:
                 await _best_effort(waiter.update, WAITERS_FAILED_NOTICE)
+                continue
+            existing = store.find_owner_duplicate(
+                job.chat_id, job.content_key, waiter.user_id
+            )
+            if existing is not None and not _is_incomplete(existing):
+                if not _in_progress(existing) and not existing.delivered:
+                    await _deliver(waiter.update, context, existing)
                 continue
             # The same reuse a late duplicate gets: her own job over the one
             # computed report, answered under her own submission.
@@ -618,13 +627,17 @@ async def _share_result(
     try:
         job = store.create_reusing(chat_id, _user_id(update), source)
     except StoreFullError:
-        await b.reply_to_user(update, slots_full_notice)
+        await _best_effort(update, slots_full_notice)
         return
     if not source.delivered:
         await _deliver(update, context, job)
         return
-    with _delivering(job):
-        await _point_to_shared_result(update, context, source, job)
+    try:
+        with _delivering(job):
+            await _point_to_shared_result(update, context, source, job)
+    finally:
+        if job.waiters:
+            await _release_waiters(context, job)
 
 
 async def _point_to_shared_result(
@@ -705,12 +718,12 @@ def _missing_reply_target(exc: TelegramError) -> bool:
 
 
 def _retryable_send_error(exc: TelegramError) -> bool:
-    """Whether one more send could work and definitely cannot duplicate a message.
+    """Whether a send failed on a transient `NetworkError` worth one retry.
 
-    `TimedOut` is a `NetworkError` in python-telegram-bot 22.8, but a timed-out
-    request may already have reached Telegram, so it is never retried here; the
-    same goes for `BadRequest` (the request is wrong, not the transport) and
-    `Forbidden` (the bot is out of that chat).
+    `TimedOut` is a `NetworkError` subclass in python-telegram-bot 22.8, and a
+    timed-out request has a high chance of having already been processed by
+    Telegram, so it is excluded here alongside `BadRequest` (malformed request)
+    and `Forbidden` (bot removed from chat).
     """
     return isinstance(exc, NetworkError) and not isinstance(
         exc, (BadRequest, Forbidden, TimedOut)
@@ -718,13 +731,13 @@ def _retryable_send_error(exc: TelegramError) -> bool:
 
 
 async def _send_with_one_retry(send, gate, *, allow_retry: bool = True):
-    """Run one send, retrying a definite transport failure once.
+    """Run one send, retrying a non-timeout `NetworkError` once.
 
     The retry re-checks `gate` after the wait, because authorization can change
-    while it waits. Returns `None` when the gate refused, which means nothing
-    was sent. Every other failure re-raises: the caller keeps its own handling.
+    while it waits. Returns `None` when the gate refused, which means the retry
+    was skipped. Every other failure re-raises: the caller keeps its own handling.
     `allow_retry=False` is used once a chunk of the same result has already
-    reached the chat, where a retry could post that chunk twice.
+    reached the chat, where a retry would post an earlier chunk twice.
     """
     try:
         return await send()
@@ -754,8 +767,12 @@ def _in_progress(job: ReviewJob) -> bool:
 async def _deliver(
     update: Update, context: ContextTypes.DEFAULT_TYPE, job: ReviewJob
 ) -> bool:
-    with _delivering(job):
-        return await _send_result(update, context, job)
+    try:
+        with _delivering(job):
+            return await _send_result(update, context, job)
+    finally:
+        if job.waiters:
+            await _release_waiters(context, job)
 
 
 async def _send_result(
@@ -763,12 +780,12 @@ async def _send_result(
 ) -> bool:
     """Send a finished job's stored result. It counts as reusable only once sent.
 
-    A send that definitely did not reach Telegram is retried once, but only
-    while no chunk of this result has been sent: a later chunk may already be in
-    the chat, and resending the first one would duplicate it. On any other
-    failure the job stays finished but undelivered, and the short notice carries
-    one button that sends this stored result again — so neither a resubmission
-    nor that button costs a model call.
+    A non-timeout `NetworkError` is retried once, but only while no chunk of
+    this result has been sent: once a chunk is in the chat, retrying a later
+    step is left to a clean resend. On any remaining failure the job stays
+    finished but undelivered, and the short notice carries one button that sends
+    this stored result again — so neither a resubmission nor that button costs a
+    model call.
     """
     b = _b()
     report = job.report
@@ -928,13 +945,18 @@ async def _resend_result(
         if query is not None:
             await query.answer()
         return
-    if not await b._passes_delivery_gate(update, context):
-        if query is not None:
-            await query.answer(DENIED_TOAST, show_alert=True)
-        return
-    if query is not None:
-        await query.answer()
-    await _deliver(update, context, job)
+    try:
+        with _delivering(job):
+            if not await b._passes_delivery_gate(update, context):
+                if query is not None:
+                    await query.answer(DENIED_TOAST, show_alert=True)
+                return
+            if query is not None:
+                await query.answer()
+            await _send_result(update, context, job)
+    finally:
+        if job.waiters:
+            await _release_waiters(context, job)
 
 
 def _is_incomplete(job: ReviewJob) -> bool:
