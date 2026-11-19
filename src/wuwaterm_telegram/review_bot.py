@@ -11,6 +11,7 @@ Handlers import `.bot` lazily; `bot.py` imports this module at load.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from importlib import import_module
 from typing import Any, Iterator
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -41,7 +42,14 @@ from .review_input import (
     command_body,
     parse_review_input,
 )
-from .review_jobs import ReviewJob, ReviewJobStore, StoreFullError, TranslationRecord
+from .review_jobs import (
+    STATE_DONE,
+    WAITER_FULL,
+    ReviewJob,
+    ReviewJobStore,
+    StoreFullError,
+    TranslationRecord,
+)
 from .review_model import (
     PAIR_NEEDS_MANUAL_SPLIT,
     PAIR_READY,
@@ -89,21 +97,50 @@ SAME_LANGUAGE_NOTICE = (
     "Source and translation look like the same language; review cancelled."
 )
 BUSY_NOTICE = (
-    "本聊天已有一个审校在进行，请等它完成。\n"
-    "A review is already running in this chat; please wait for it."
+    "本聊天已有一个审校在进行，或结果正在发送，请等它完成。\n"
+    "A review is already running in this chat, or a result is still being sent; wait for it."
 )
 DELIVERY_FAILED_NOTICE = (
-    "审校结果发送失败，请稍后再次提交同样的内容，会直接重发结果，不会重新审校。\n"
-    "The result could not be sent. Submit the same content again to get it without a new review."
+    "审校结果发送失败，点下面的按钮重发，或再次提交同样的内容。\n"
+    "The result could not be sent. Press the button to send it again, or submit the same content."
 )
 FAILED_NOTICE = (
     "审校失败，请稍后再试。\n"
     "The review failed; please try again later."
 )
-EXPIRED_TOAST = "结果已过期，请重新提交 /review"
+EXPIRED_TOAST = (
+    "审校结果已过期（保留 30 分钟），请重新运行 /review。\n"
+    "Review expired (kept 30m); run /review again."
+)
+TR_EXPIRED_TOAST = (
+    "这条译文的审校记录已过期（保留 30 分钟），请重新运行 /tr。\n"
+    "This translation's review record expired (kept 30m); run /tr again."
+)
 DENIED_TOAST = "无权操作 / Not allowed"
 NOT_OWNER_TOAST = "仅发起人或管理员可操作 / Only the requester or an admin can use this"
 RUNNING_NOTICE = "同一内容正在审校中，请等待结果。\nThis exact review is already running."
+WAITER_NOTICE = (
+    "同一内容正在审校，完成后会把结果和你的按钮自动发到本聊天，不用重新提交。\n"
+    "That content is being reviewed; your own result and buttons will arrive here when it "
+    "finishes."
+)
+WAITER_FULL_NOTICE = (
+    "同一内容正在审校，等待的人已满，请稍后重新提交。\n"
+    "That content is being reviewed and the list of waiting requests is full; submit it again "
+    "shortly."
+)
+WAITERS_FAILED_NOTICE = (
+    "你等的这份审校没有完成，请稍后重新提交。\n"
+    "The shared review you were waiting for did not complete; submit it again later."
+)
+WAITER_SLOTS_FULL_NOTICE = (
+    "同一内容审校完了，但本聊天的审校结果已满，请重新提交同样的内容来取回结果。\n"
+    "The shared review finished but this chat's result slots are full; submit the same content "
+    "again to get the result."
+)
+RESEND_BUTTON_TEXT = "🔄 重新发送结果 / Resend"
+# One retry of a send that definitely did not reach Telegram.
+TRANSIENT_RETRY_DELAY = 1.5
 
 RESULT_HINT = (
     "用下方按钮逐条处理；/review last 回到上一条结果。\n"
@@ -147,6 +184,13 @@ def _data(job_id: str, action: str, number: int | None = None) -> str:
     if number is not None:
         parts.append(str(number))
     return ":".join(parts)
+
+
+def resend_keyboard(job: ReviewJob) -> InlineKeyboardMarkup:
+    """One button that sends this job's stored result again."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(RESEND_BUTTON_TEXT, callback_data=_data(job.id, "d"))]]
+    )
 
 
 def has_revisable_suggestion(report: ReviewReport) -> bool:
@@ -406,7 +450,7 @@ async def _start_review(
         duplicate = None  # a stopped or partial review may be run again
     if duplicate is not None:
         if _in_progress(duplicate):
-            await b.reply_to_user(update, RUNNING_NOTICE)
+            await _wait_for_shared_result(update, context, duplicate)
             return
         # The content was already reviewed for someone else in this chat: the
         # report is reused, but this requester gets her own buttons and state.
@@ -450,20 +494,83 @@ async def _run_and_deliver(
     except ReviewAborted:
         store.fail(job)
         LOGGER.info("review stopped: authorization changed chat=%s", redact_id(job.chat_id))
+        await _release_waiters(context, job)
         return
     except Exception as exc:  # noqa: BLE001 - one command must not take the bot down
         store.fail(job)
         LOGGER.warning(
             "review failed chat=%s error_type=%s", redact_id(job.chat_id), type(exc).__name__
         )
-        await b.reply_to_user(update, FAILED_NOTICE)
+        try:
+            await b.reply_to_user(update, FAILED_NOTICE)
+        finally:
+            await _release_waiters(context, job)
         return
     if not await gate():
         store.fail(job)
         LOGGER.info("review result skipped: authorization changed chat=%s", redact_id(job.chat_id))
+        await _release_waiters(context, job)
         return
     store.finish(job, report)
     await _deliver(update, context, job)
+    await _release_waiters(context, job)
+
+
+async def _wait_for_shared_result(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, job: ReviewJob
+) -> None:
+    """Queue this requester behind another member's identical running review.
+
+    The report is computed once; when it finishes every waiter gets her own job,
+    message and buttons, so nobody resubmits and no extra model call happens.
+    """
+    b = _b()
+    status = _store(context).join_waiters(job, _user_id(update), update)
+    await b.reply_to_user(
+        update, WAITER_FULL_NOTICE if status == WAITER_FULL else WAITER_NOTICE
+    )
+
+
+async def _release_waiters(
+    context: ContextTypes.DEFAULT_TYPE, job: ReviewJob
+) -> None:
+    """Answer everyone who waited on this job while it ran, then forget them.
+
+    A waiter gets her own reusing job over the finished report (its own buttons,
+    its own message ids, no model call and no rate-limit slot). If the review
+    did not finish, she is told so instead. The waiters are taken off the job
+    first and their updates are dropped on every path, so no `Update` from a
+    finished submission is kept in memory.
+    """
+    b = _b()
+    store = _store(context)
+    waiters = store.drain_waiters(job)
+    try:
+        finished = job.state == STATE_DONE and job.report is not None
+        for waiter in waiters:
+            if not await b._passes_delivery_gate(waiter.update, context):
+                continue  # the chat's policy changed while she waited
+            if not finished:
+                await _best_effort(waiter.update, WAITERS_FAILED_NOTICE)
+                continue
+            # The same reuse a late duplicate gets: her own job over the one
+            # computed report, answered under her own submission.
+            await _share_result(
+                waiter.update, context, job, slots_full_notice=WAITER_SLOTS_FULL_NOTICE
+            )
+    finally:
+        job.waiters.clear()
+
+
+async def _best_effort(
+    update: Update, text: str, *, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    """Say something once; a failing notice is not itself retried."""
+    b = _b()
+    try:
+        await b.reply_to_user(update, text, reply_markup=reply_markup)
+    except TelegramError:
+        LOGGER.info("review notice not delivered")
 
 
 async def _answer_own_duplicate(
@@ -485,7 +592,11 @@ async def _answer_own_duplicate(
 
 
 async def _share_result(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, source: ReviewJob
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source: ReviewJob,
+    *,
+    slots_full_notice: str = BUSY_NOTICE,
 ) -> None:
     """Give a second requester her own job over the already computed report.
 
@@ -495,7 +606,8 @@ async def _share_result(
     point at, and the first requester still has her own result to receive, so
     the new job gets the full result instead. If the pointer cannot be sent, the
     job stays undelivered and her next identical submission delivers the stored
-    report instead.
+    report instead. `slots_full_notice` is the answer when the chat has no free
+    slot left; a waiter of an identical review can say something more precise.
     """
     b = _b()
     chat_id = b.chat_id_for(update)
@@ -506,7 +618,7 @@ async def _share_result(
     try:
         job = store.create_reusing(chat_id, _user_id(update), source)
     except StoreFullError:
-        await b.reply_to_user(update, BUSY_NOTICE)
+        await b.reply_to_user(update, slots_full_notice)
         return
     if not source.delivered:
         await _deliver(update, context, job)
@@ -526,43 +638,47 @@ async def _point_to_shared_result(
     sent_ids: list[int] = []
     message = update.effective_message
     target_id = source.result_message_ids[0] if source.result_message_ids else None
+
+    async def gate() -> bool:
+        return await b._passes_delivery_gate(update, context)
+
+    async def send_pointer():
+        return await send_with_flood_retry(
+            lambda: message.reply_text(
+                text,
+                reply_to_message_id=target_id,
+                allow_sending_without_reply=False,
+                reply_markup=markup,
+            ),
+            retry_gate=gate,
+        )
+
     if message is not None and target_id is not None:
         try:
-            sent = await send_with_flood_retry(
-                lambda: message.reply_text(
-                    text,
-                    reply_to_message_id=target_id,
-                    allow_sending_without_reply=False,
-                    reply_markup=markup,
-                ),
-                retry_gate=lambda: b._passes_delivery_gate(update, context),
-            )
-            sent_ids.extend(_message_ids([sent]))
+            sent = await _send_with_one_retry(send_pointer, gate)
         except TelegramError as exc:
-            if not (
-                isinstance(exc, BadRequest)
-                and "message to be replied not found" in str(exc).lower()
-            ):
+            if not _missing_reply_target(exc):
                 LOGGER.warning(
                     "review result not delivered chat=%s error_type=%s",
                     redact_id(job.chat_id),
                     type(exc).__name__,
                 )
                 return
-            # Only a definitely missing reply target may use a plain answer.
+            sent = None  # the old pointer is gone; a plain answer still works
+        if sent is not None:
+            sent_ids.extend(_message_ids([sent]))
     if not sent_ids:
-        if not await b._passes_delivery_gate(update, context):
+        if not await gate():
             return
         try:
-            sent_ids.extend(
-                _message_ids(
-                    await b.reply_to_user(
-                        update,
-                        text,
-                        retry_gate=lambda: b._passes_delivery_gate(update, context),
-                        reply_markup=markup,
-                    )
-                )
+            sent_messages = await _send_with_one_retry(
+                lambda: b.reply_to_user(
+                    update,
+                    text,
+                    retry_gate=lambda: b._passes_delivery_gate(update, context),
+                    reply_markup=markup,
+                ),
+                gate,
             )
         except TelegramError as exc:
             LOGGER.warning(
@@ -571,8 +687,9 @@ async def _point_to_shared_result(
                 type(exc).__name__,
             )
             return
+        if sent_messages is not None:
+            sent_ids.extend(_message_ids(sent_messages))
     job.result_message_ids = sent_ids
-    job.keyboard_message_id = sent_ids[-1] if markup is not None and sent_ids else None
     job.delivered = bool(sent_ids)
 
 
@@ -580,6 +697,44 @@ def _message_ids(messages: list) -> list[int]:
     return [
         int(m.message_id) for m in messages if getattr(m, "message_id", None) is not None
     ]
+
+
+def _missing_reply_target(exc: TelegramError) -> bool:
+    """Whether the only problem is that the message being replied to is gone."""
+    return isinstance(exc, BadRequest) and "message to be replied not found" in str(exc).lower()
+
+
+def _retryable_send_error(exc: TelegramError) -> bool:
+    """Whether one more send could work and definitely cannot duplicate a message.
+
+    `TimedOut` is a `NetworkError` in python-telegram-bot 22.8, but a timed-out
+    request may already have reached Telegram, so it is never retried here; the
+    same goes for `BadRequest` (the request is wrong, not the transport) and
+    `Forbidden` (the bot is out of that chat).
+    """
+    return isinstance(exc, NetworkError) and not isinstance(
+        exc, (BadRequest, Forbidden, TimedOut)
+    )
+
+
+async def _send_with_one_retry(send, gate, *, allow_retry: bool = True):
+    """Run one send, retrying a definite transport failure once.
+
+    The retry re-checks `gate` after the wait, because authorization can change
+    while it waits. Returns `None` when the gate refused, which means nothing
+    was sent. Every other failure re-raises: the caller keeps its own handling.
+    `allow_retry=False` is used once a chunk of the same result has already
+    reached the chat, where a retry could post that chunk twice.
+    """
+    try:
+        return await send()
+    except TelegramError as exc:
+        if not allow_retry or not _retryable_send_error(exc):
+            raise
+    await asyncio.sleep(TRANSIENT_RETRY_DELAY)
+    if not await gate():
+        return None
+    return await send()
 
 
 @contextmanager
@@ -608,9 +763,12 @@ async def _send_result(
 ) -> bool:
     """Send a finished job's stored result. It counts as reusable only once sent.
 
-    On a Telegram failure the job stays finished but undelivered: the next
-    submission of the same content sends this stored result again, without a
-    model call. One short notice is tried; if that fails too, nothing is retried.
+    A send that definitely did not reach Telegram is retried once, but only
+    while no chunk of this result has been sent: a later chunk may already be in
+    the chat, and resending the first one would duplicate it. On any other
+    failure the job stays finished but undelivered, and the short notice carries
+    one button that sends this stored result again — so neither a resubmission
+    nor that button costs a model call.
     """
     b = _b()
     report = job.report
@@ -622,33 +780,41 @@ async def _send_result(
     messages = format_report(report, footer=RESULT_HINT)
     markup = summary_keyboard(job)
     sent_ids: list[int] = []
+
+    async def send_chunk(text: str, last: bool, first: bool):
+        return await b.reply_to_user(
+            update,
+            text,
+            parse_mode="HTML",
+            retry_gate=gate,
+            reply_markup=markup if last else None,
+            quote=first,
+        )
+
     try:
         for index, text in enumerate(messages):
-            last = index == len(messages) - 1
-            sent = await b.reply_to_user(
-                update,
-                text,
-                parse_mode="HTML",
-                retry_gate=gate,
-                reply_markup=markup if last else None,
-                quote=index == 0,
+            sent = await _send_with_one_retry(
+                lambda: send_chunk(text, index == len(messages) - 1, index == 0),
+                gate,
+                allow_retry=not sent_ids,
             )
-            sent_ids.extend(
-                int(m.message_id) for m in sent if getattr(m, "message_id", None) is not None
-            )
+            if sent is None:  # the retry was refused: nothing was sent
+                LOGGER.info(
+                    "review result retry stopped: delivery gate closed chat=%s",
+                    redact_id(job.chat_id),
+                )
+                return False
+            sent_ids.extend(_message_ids(sent))
     except TelegramError as exc:
         LOGGER.warning(
             "review result not delivered chat=%s error_type=%s",
             redact_id(job.chat_id),
             type(exc).__name__,
         )
-        try:
-            await b.reply_to_user(update, DELIVERY_FAILED_NOTICE)
-        except TelegramError:
-            pass  # the notice is best effort
+        job.delivered = False
+        await _best_effort(update, DELIVERY_FAILED_NOTICE, reply_markup=resend_keyboard(job))
         return False
     job.result_message_ids = sent_ids
-    job.keyboard_message_id = sent_ids[-1] if markup is not None and sent_ids else None
     job.delivered = bool(sent_ids)
     return job.delivered
 
@@ -683,7 +849,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if action == "g":  # review button under a /tr result
         record = store.get_translation(chat_id, item_id)
         if record is None:
-            await query.answer(EXPIRED_TOAST, show_alert=True)
+            await query.answer(TR_EXPIRED_TOAST, show_alert=True)
             return
         if not (actor.trusted or user_id == record.user_id):
             await query.answer(NOT_OWNER_TOAST, show_alert=True)
@@ -707,6 +873,9 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if action == "n":
         await query.answer()
         return
+    if action == "d":  # send a stored result the chat never received
+        await _resend_result(update, context, job)
+        return
     if action == "s":
         await query.answer()
         await _edit(update, format_report(report)[-1], summary_keyboard(job))
@@ -715,7 +884,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _send_revision(update, context, job)
         return
     if number is None or not 1 <= number <= total:
-        await query.answer(EXPIRED_TOAST, show_alert=True)
+        await query.answer(ACCEPT_REASONS["unknown_issue"], show_alert=True)
         return
     issue = report.issues[number - 1]
     if action == "a" or action == "b":
@@ -747,6 +916,25 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         format_issue_card(report, number, accepted=set(job.accepted), skipped=job.skipped),
         card_keyboard(job, number),
     )
+
+
+async def _resend_result(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, job: ReviewJob
+) -> None:
+    """Send a finished job's stored result again, without another review."""
+    b = _b()
+    query = update.callback_query
+    if job.delivering or job.delivered:
+        if query is not None:
+            await query.answer()
+        return
+    if not await b._passes_delivery_gate(update, context):
+        if query is not None:
+            await query.answer(DENIED_TOAST, show_alert=True)
+        return
+    if query is not None:
+        await query.answer()
+    await _deliver(update, context, job)
 
 
 def _is_incomplete(job: ReviewJob) -> bool:

@@ -113,3 +113,14 @@ def sample_db(tmp_path: Path, sample_data_dir: Path) -> Path:
         ),
     )
     return db_path
+
+
+@pytest.fixture(autouse=True)
+def _no_transient_send_delay(monkeypatch):
+    """`/review` retries one definitely-unsent Telegram send after 1.5 s.
+
+    The wait is the production behaviour; the suite must not sit through it.
+    """
+    from wuwaterm_telegram import review_bot
+
+    monkeypatch.setattr(review_bot, "TRANSIENT_RETRY_DELAY", 0.0)
