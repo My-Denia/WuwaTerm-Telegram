@@ -1,11 +1,11 @@
 # `/review`: what it relies on in Core
 
-`/review` is built for Core 0.10.0 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
+`/review` is built for Core 0.10.1 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
 `contracts/semantic-review-v1/`). All Core access is in `review_backend.py`;
 `core_compat.REVIEW_CORE_SYMBOLS` is the symbol list that
 `verify_core_compatibility` requires at start-up.
 
-## What the adapter uses (checked against Core v0.10.0, commit 67e27da7)
+## What the adapter uses (checked against Core v0.10.1, commit dd238303)
 
 - `semantic_review_async(service, translator, SemanticReviewJob, *, request_id,
   before_llm_call, offload)` returns a `SemanticReviewOutcome` whose `body` is
@@ -28,9 +28,16 @@
   is no longer counted as its own hit.
 - Long-text `/tr`: Telegram no longer passes a `splitter` (Core ignores it).
   Core cuts by segmentation-v1, keeps the sender's separators and carries the
-  previous segment as context. An answer that regroups lines into the source
-  paragraphs is only accepted when its per-line length ratios agree with the
-  source (`MY-359`); otherwise the model's own blank lines are kept.
+  previous segment as context. Core 0.10.1's guard reads a per-line share ratio,
+  `(answer line / answer total) / (source line / source total)`, and looks for a
+  merge and a split over the whole segment at any distance and in either order;
+  an answer is regrouped into the source's paragraphs only when neither appears,
+  so a distant merge-and-split that shifts a line across a paragraph boundary is
+  refused, and the model's own blank lines are kept (`MY-359`).
+
+Telegram `0.4.1` changed no Core usage: the shared-pointer resend path and the
+pre-send-only send retry (`PR #43`) live in `review_bot.py`, and
+`review_backend.py` neither retries nor re-sends through Core.
 
 ## Not done
 
