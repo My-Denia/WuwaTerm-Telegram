@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import httpx
+import pytest
 from review_fakes import FakeBackend, wire_response
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 
 from wuwaterm_telegram import review_bot
 from wuwaterm_telegram.bot import (
@@ -28,6 +30,13 @@ OWNER = 11
 CHAT = 500
 
 
+def network_error(cause: Exception) -> NetworkError:
+    """A `NetworkError` shaped like python-telegram-bot's `raise ... from err`."""
+    error = NetworkError(f"httpx.{type(cause).__name__}: {cause}")
+    error.__cause__ = cause
+    return error
+
+
 class Msg:
     def __init__(self, message_id, text=None, *, reply_to=None, from_user=None):
         self.message_id, self.text, self.reply_to_message = message_id, text, reply_to
@@ -35,14 +44,15 @@ class Msg:
         self.sent = []  # (text, kwargs)
         self._next = message_id * 100
         self.attempts = 0  # every send tried, including the ones that fail
-        self.fail_times = 0  # the next N sends raise a Telegram network error
+        self.fail_times = 0  # the next N sends raise a provably pre-send network error
 
     async def reply_text(self, text, **kwargs):
         self.attempts += 1
         self.maybe_fail(self.attempts)
         if self.fail_times > 0:
             self.fail_times -= 1
-            raise NetworkError("timed out")
+            # A connection that never opened: provably pre-send, so retried.
+            raise network_error(httpx.ConnectError("connection refused"))
         self.sent.append((text, kwargs))
         self._next += 1
         return SimpleNamespace(message_id=self._next)
@@ -797,7 +807,7 @@ def test_a_timeout_is_not_retried_because_it_may_already_have_arrived(tmp_path):
     asyncio.run(review_bot.review_command(update_for(message), context))
     job = newest_done(store)
     assert message.attempts == 2  # the timed-out send and the notice, no retry
-    assert texts(message) == [review_bot.DELIVERY_FAILED_NOTICE]
+    assert texts(message) == [review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE]
     assert job.state == "done" and job.delivered is False and len(backend.calls) == 1
     button = message.sent[0][1]["reply_markup"].inline_keyboard[0][0]
     assert button.callback_data == f"rv:{job.id}:d"
@@ -819,9 +829,210 @@ def test_no_retry_once_a_part_of_the_result_is_already_in_the_chat(tmp_path, mon
     message = PartlyFailingMessage(10, "/review 甲\n---\na")
     asyncio.run(review_bot.review_command(update_for(message), context))
     job = newest_done(store)
-    assert texts(message) == ["part one", review_bot.DELIVERY_FAILED_NOTICE]  # no repeat
+    assert texts(message) == ["part one", review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE]
     assert message.attempts == 3 and job.delivered is False
     assert len(backend.calls) == 1
+
+
+def test_only_a_connection_that_never_opened_counts_as_provably_unsent():
+    classify = review_bot._is_presend_network_error
+    # The connection itself failed: no request byte reached Telegram.
+    assert classify(network_error(httpx.ConnectError("connection refused")))
+    assert classify(network_error(httpx.ConnectTimeout("connect timed out")))
+    assert classify(network_error(httpx.ProxyError("proxy refused")))
+    # The request may have been processed: retrying can post the report twice.
+    assert not classify(NetworkError("read failed"))  # no cause at all
+    assert not classify(network_error(httpx.ReadError("read failed")))
+    assert not classify(network_error(httpx.RemoteProtocolError("server disconnected")))
+    assert not classify(network_error(httpx.WriteError("write failed")))
+    request = httpx.Request("POST", "https://api.telegram.org/bot/sendMessage")
+    gateway_failure = httpx.HTTPStatusError(
+        "bad gateway", request=request, response=httpx.Response(502, request=request)
+    )
+    assert not classify(network_error(gateway_failure))
+    assert not classify(TimedOut())
+    assert not classify(BadRequest("can't parse entities"))  # a NetworkError subclass
+    assert not classify(Forbidden("bot was kicked"))
+    # PTB chains its own exception, so an extra link before the httpx one is walked.
+    nested = network_error(ValueError("transport"))
+    nested.__cause__.__cause__ = httpx.ConnectError("connection refused")
+    assert classify(nested)
+
+
+# Failures that provably happened before the request was written.
+PRE_SEND_FAILURES = {
+    "connect_error": lambda: network_error(httpx.ConnectError("connection refused")),
+    "connect_timeout": lambda: network_error(httpx.ConnectTimeout("connect timed out")),
+}
+# Failures whose outcome is unknown: Telegram may already have the message.
+UNCERTAIN_FAILURES = {
+    "read_error": lambda: network_error(httpx.ReadError("read failed")),
+    "remote_protocol_error": lambda: network_error(
+        httpx.RemoteProtocolError("server disconnected")
+    ),
+    "bare_network_error": lambda: NetworkError("read failed"),
+    "timed_out": TimedOut,
+}
+
+
+@pytest.mark.parametrize("failure", list(UNCERTAIN_FAILURES), ids=list(UNCERTAIN_FAILURES))
+def test_an_uncertain_network_failure_is_never_retried(tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(review_bot, "TRANSIENT_RETRY_DELAY", 0)
+    raise_failure = UNCERTAIN_FAILURES[failure]
+
+    class FailingMessage(Msg):
+        def maybe_fail(self, attempt):
+            if attempt == 1:
+                raise raise_failure()
+
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    message = FailingMessage(10, "/review 甲\n---\na")
+    asyncio.run(review_bot.review_command(update_for(message), context))
+    job = newest_done(store)
+    # One failed report send and the notice: never a second report send.
+    assert message.attempts == 2
+    assert texts(message) == [review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE]
+    assert job.delivered is False and job.result_message_ids == []
+    assert len(backend.calls) == 1
+    button = message.sent[0][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == f"rv:{job.id}:d"
+
+
+@pytest.mark.parametrize("failure", list(PRE_SEND_FAILURES), ids=list(PRE_SEND_FAILURES))
+def test_a_connection_that_never_opened_is_retried_once_and_arrives(tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(review_bot, "TRANSIENT_RETRY_DELAY", 0)
+    raise_failure = PRE_SEND_FAILURES[failure]
+
+    class FlakyMessage(Msg):
+        def maybe_fail(self, attempt):
+            if attempt == 1:
+                raise raise_failure()
+
+    backend = FakeBackend()
+    context, store, _ = make_context(tmp_path, backend)
+    message = FlakyMessage(10, "/review 甲\n---\na")
+    asyncio.run(review_bot.review_command(update_for(message), context))
+    job = newest_done(store)
+    assert message.attempts == 2 and len(backend.calls) == 1  # the send and its one retry
+    assert "语义疑点（实验性" in "\n".join(texts(message))
+    assert review_bot.DELIVERY_FAILED_NOTICE not in texts(message)
+    assert review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE not in texts(message)
+    assert job.delivered is True and job.result_message_ids
+
+
+PAIR_BODY = "/review 甲乙\n---\nthis is wrong"
+
+
+def shared_pointer_setup(tmp_path):
+    """A first member's result is in the chat; a second member submits the pair."""
+    backend = FakeBackend(
+        answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right")
+    )
+    context, store, settings = make_context(tmp_path, backend)
+    settings.set_public(CHAT, True)
+    group = dict(chat_type="supergroup")
+    command(context, PAIR_BODY, user_id=77, **group)
+    first = newest_done(store)
+    assert first is not None and first.delivered and len(backend.calls) == 1
+    return backend, context, store, first, group
+
+
+@pytest.mark.parametrize(
+    ("failure", "attempts", "notice"),
+    [
+        ("connect_twice", 3, review_bot.DELIVERY_FAILED_NOTICE),
+        ("read_error", 2, review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE),
+        ("timed_out", 2, review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE),
+    ],
+)
+def test_a_failed_shared_pointer_leaves_the_requester_a_resend_button(
+    tmp_path, monkeypatch, failure, attempts, notice
+):
+    monkeypatch.setattr(review_bot, "TRANSIENT_RETRY_DELAY", 0)
+    backend, context, store, first, group = shared_pointer_setup(tmp_path)
+
+    def raise_failure():
+        if failure == "timed_out":
+            raise TimedOut()
+        if failure == "read_error":
+            raise network_error(httpx.ReadError("read failed"))
+        raise network_error(httpx.ConnectError("connection refused"))
+
+    failing_attempts = (1, 2) if failure == "connect_twice" else (1,)
+
+    class FailingPointer(Msg):
+        def maybe_fail(self, attempt):
+            if attempt in failing_attempts:
+                raise_failure()
+
+    message = FailingPointer(21, PAIR_BODY)
+    asyncio.run(
+        review_bot.review_command(
+            update_for(message, user_id=88, chat_type="supergroup"), context
+        )
+    )
+    job = store.find_owner_duplicate(CHAT, first.content_key, 88)
+    assert job is not None and job is not first and job.user_id == 88
+    # The pointer (plus its one retry when pre-send) and then the notice.
+    assert message.attempts == attempts
+    assert texts(message) == [notice]
+    assert job.delivered is False and job.result_message_ids == []
+    assert len(backend.calls) == 1  # the report was reused, not reviewed again
+    button = message.sent[0][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == f"rv:{job.id}:d" and "重新发送" in button.text
+    # Her own button sends the stored report, with no second model call.
+    query = press(context, button.callback_data, message, user_id=88, **group)
+    assert query.answers == [(None, False)]
+    assert job.delivered is True and job.result_message_ids
+    assert "语义疑点（实验性" in texts(message)[-1]
+    assert len(backend.calls) == 1
+
+
+def test_a_waiters_failed_shared_pointer_leaves_her_own_resend_button(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bot, "TRANSIENT_RETRY_DELAY", 0)
+    backend, context, store = waiting_setup(tmp_path)
+    group = dict(chat_type="supergroup")
+
+    class FailingPointerMsg(Msg):
+        failed = False
+
+        async def reply_text(self, text, **kwargs):
+            if not self.failed and "刚审校过" in text:
+                self.failed = True
+                self.attempts += 1
+                raise network_error(httpx.ReadError("read failed"))
+            return await super().reply_text(text, **kwargs)
+
+    async def scenario():
+        first = Msg(20, SHARED)
+        task = asyncio.create_task(
+            review_bot.review_command(update_for(first, user_id=77, **group), context)
+        )
+        await asyncio.wait_for(backend.started.wait(), 5)
+        waiting = FailingPointerMsg(21, SHARED)
+        await review_bot.review_command(
+            update_for(waiting, user_id=88, **group), context
+        )
+        backend.release.set()
+        await task
+        return store.done_jobs(CHAT)[-1], waiting  # newest first: the source is oldest
+
+    source, waiting = asyncio.run(scenario())
+    assert source.delivered
+    own = store.find_owner_duplicate(CHAT, source.content_key, 88)
+    assert own is not None and own is not source
+    assert own.delivered is False and own.result_message_ids == []
+    assert texts(waiting) == [
+        review_bot.WAITER_NOTICE,
+        review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE,
+    ]
+    button = waiting.sent[-1][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == f"rv:{own.id}:d"
+    press(context, button.callback_data, waiting, user_id=88, **group)
+    assert own.delivered is True and own.result_message_ids
+    assert "语义疑点（实验性" in texts(waiting)[-1]
+    assert len(backend.calls) == 1  # one model call served both members
 
 
 def resend_setup(tmp_path):
