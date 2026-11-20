@@ -18,8 +18,17 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Iterator
 
+# python-telegram-bot and Core both require httpx; PTB wraps its errors as NetworkError.
+import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError, TimedOut
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -104,6 +113,13 @@ DELIVERY_FAILED_NOTICE = (
     "审校结果发送失败，点下面的按钮重发，或再次提交同样的内容。\n"
     "The result could not be sent. Press the button to send it again, or submit the same content."
 )
+DELIVERY_FAILED_UNCERTAIN_NOTICE = (
+    "审校结果发送时连接中断，无法确认 Telegram 是否已收到；如聊天中未见结果，可点下方按钮重发"
+    "（可能重复显示），或重新发送 /review。\n"
+    "The connection broke while the result was being sent, so it is unknown whether Telegram "
+    "received it. If the result is not in the chat, press the button to send it again (it may "
+    "appear twice), or send /review again."
+)
 FAILED_NOTICE = (
     "审校失败，请稍后再试。\n"
     "The review failed; please try again later."
@@ -139,7 +155,8 @@ WAITER_SLOTS_FULL_NOTICE = (
     "again to get the result."
 )
 RESEND_BUTTON_TEXT = "🔄 重新发送结果 / Resend"
-# One retry of a send that definitely did not reach Telegram.
+# One retry of a send that provably did not reach Telegram (a connection that
+# never opened). A send whose outcome is unknown is never retried.
 TRANSIENT_RETRY_DELAY = 1.5
 
 RESULT_HINT = (
@@ -613,7 +630,9 @@ async def _share_result(
     no rate-limit slot; what is new is the job id, the message and the accepted
     or skipped state. If `source` never reached the chat there is nothing to
     point at, and the first requester still has her own result to receive, so
-    the new job gets the full result instead. If the pointer cannot be sent, the
+    the new job gets the full result instead. If the pointer cannot be sent, she
+    gets the same failure notice the full result would carry — with the button
+    that sends her stored report — and if that notice cannot be sent either, the
     job stays undelivered and her next identical submission delivers the stored
     report instead. `slots_full_notice` is the answer when the chat has no free
     slot left; a waiter of an identical review can say something more precise.
@@ -643,6 +662,14 @@ async def _share_result(
 async def _point_to_shared_result(
     update: Update, context: ContextTypes.DEFAULT_TYPE, source: ReviewJob, job: ReviewJob
 ) -> None:
+    """Answer a reusing job by pointing at the chat's identical sent result.
+
+    A failed pointer is handled exactly like a failed full result: the job stays
+    undelivered and the requester gets the failure notice with the button that
+    sends her own stored report, so the promise made when she waited is kept
+    even when the pointer itself cannot be posted. A pointer that only misses
+    its reply target falls back to a plain answer first.
+    """
     b = _b()
     report = job.report
     assert report is not None
@@ -671,11 +698,7 @@ async def _point_to_shared_result(
             sent = await _send_with_one_retry(send_pointer, gate)
         except TelegramError as exc:
             if not _missing_reply_target(exc):
-                LOGGER.warning(
-                    "review result not delivered chat=%s error_type=%s",
-                    redact_id(job.chat_id),
-                    type(exc).__name__,
-                )
+                await _notice_failed_delivery(update, job, exc, gate)
                 return
             sent = None  # the old pointer is gone; a plain answer still works
         if sent is not None:
@@ -694,11 +717,7 @@ async def _point_to_shared_result(
                 gate,
             )
         except TelegramError as exc:
-            LOGGER.warning(
-                "review result not delivered chat=%s error_type=%s",
-                redact_id(job.chat_id),
-                type(exc).__name__,
-            )
+            await _notice_failed_delivery(update, job, exc, gate)
             return
         if sent_messages is not None:
             sent_ids.extend(_message_ids(sent_messages))
@@ -717,32 +736,105 @@ def _missing_reply_target(exc: TelegramError) -> bool:
     return isinstance(exc, BadRequest) and "message to be replied not found" in str(exc).lower()
 
 
-def _retryable_send_error(exc: TelegramError) -> bool:
-    """Whether a send failed on a transient `NetworkError` worth one retry.
+# httpx failures that happen before any HTTP request byte is transmitted: TCP,
+# TLS or the proxy never got a working connection. `httpx.ConnectTimeout` is a
+# sibling of `httpx.ConnectError` rather than its subclass, so it is named too.
+_PRESEND_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)
 
-    `TimedOut` is a `NetworkError` subclass in python-telegram-bot 22.8, and a
-    timed-out request has a high chance of having already been processed by
-    Telegram, so it is excluded here alongside `BadRequest` (malformed request)
-    and `Forbidden` (bot removed from chat).
+
+def _is_presend_network_error(exc: TelegramError) -> bool:
+    """Whether a failed send provably never reached Telegram.
+
+    `python-telegram-bot` 22.8 raises `NetworkError(...) from err` for every
+    `httpx` transport failure, and that covers both directions. Only
+    `httpx.ConnectError`, `httpx.ConnectTimeout` and `httpx.ProxyError` mean the
+    connection itself never opened, so the POST was never written and Telegram
+    cannot have processed it; only those are safe to retry automatically.
+    `httpx.ReadError`, `httpx.RemoteProtocolError`, `httpx.WriteError`, an HTTP
+    status the gateway turned into a transport error, and a bare
+    `NetworkError("...")` with no cause all leave the outcome unknown: Telegram
+    may already have posted the message, and a retry would post it twice.
+    `BadRequest` and `TimedOut` are `NetworkError` subclasses in 22.8 and are
+    excluded for the same reason. The cause chain is walked because PTB chains
+    the original error with `from`.
     """
-    return isinstance(exc, NetworkError) and not isinstance(
+    if not isinstance(exc, NetworkError) or isinstance(
         exc, (BadRequest, Forbidden, TimedOut)
+    ):
+        return False
+    current = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+    for _ in range(8):  # a real chain is one or two links; bound it anyway
+        if current is None:
+            return False
+        if isinstance(current, _PRESEND_TRANSPORT_ERRORS):
+            return True
+        if isinstance(current, httpx.HTTPError):
+            return False  # an httpx failure that may have reached Telegram
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    return False
+
+
+def _delivery_failure_notice(exc: TelegramError, *, partial: bool) -> str:
+    """Pick the notice that tells the truth about a failed result delivery.
+
+    `partial` means an earlier chunk of the same result is already in the chat,
+    which rules out describing the send as a plain failure. Otherwise a
+    provably pre-send transport failure, a rejected request, a removed bot or a
+    flood wait all mean Telegram posted nothing, and the ordinary notice is
+    accurate. Everything else is uncertain and says so.
+    """
+    if not partial and (
+        _is_presend_network_error(exc) or isinstance(exc, (BadRequest, Forbidden, RetryAfter))
+    ):
+        return DELIVERY_FAILED_NOTICE
+    return DELIVERY_FAILED_UNCERTAIN_NOTICE
+
+
+async def _notice_failed_delivery(
+    update: Update,
+    job: ReviewJob,
+    exc: TelegramError,
+    gate,
+    *,
+    partial: bool = False,
+) -> None:
+    """Tell the requester the result did not arrive, with a resend button.
+
+    Silent when `gate` no longer passes: a revoked or disallowed chat gets no
+    new message. The notice is best-effort and never retried, and the job stays
+    undelivered so the button and the next identical submission both send the
+    stored report without a model call.
+    """
+    LOGGER.warning(
+        "review result not delivered chat=%s error_type=%s",
+        redact_id(job.chat_id),
+        type(exc).__name__,
+    )
+    job.delivered = False
+    if not await gate():
+        return
+    await _best_effort(
+        update,
+        _delivery_failure_notice(exc, partial=partial),
+        reply_markup=resend_keyboard(job),
     )
 
 
 async def _send_with_one_retry(send, gate, *, allow_retry: bool = True):
-    """Run one send, retrying a non-timeout `NetworkError` once.
+    """Run one send, retrying a provably pre-send transport failure once.
 
+    Only a connection that never opened is retried: everything else may have
+    reached Telegram already, and retrying it would post the same result twice.
     The retry re-checks `gate` after the wait, because authorization can change
     while it waits. Returns `None` when the gate refused, which means the retry
-    was skipped. Every other failure re-raises: the caller keeps its own handling.
-    `allow_retry=False` is used once a chunk of the same result has already
-    reached the chat, where a retry would post an earlier chunk twice.
+    was skipped. Every other failure re-raises: the caller keeps its own
+    handling. `allow_retry=False` is used once a chunk of the same result has
+    already reached the chat, where the outcome is uncertain by definition.
     """
     try:
         return await send()
     except TelegramError as exc:
-        if not allow_retry or not _retryable_send_error(exc):
+        if not allow_retry or not _is_presend_network_error(exc):
             raise
     await asyncio.sleep(TRANSIENT_RETRY_DELAY)
     if not await gate():
@@ -780,12 +872,14 @@ async def _send_result(
 ) -> bool:
     """Send a finished job's stored result. It counts as reusable only once sent.
 
-    A non-timeout `NetworkError` is retried once, but only while no chunk of
-    this result has been sent: once a chunk is in the chat, retrying a later
-    step is left to a clean resend. On any remaining failure the job stays
-    finished but undelivered, and the short notice carries one button that sends
-    this stored result again — so neither a resubmission nor that button costs a
-    model call.
+    A send that provably never reached Telegram (the connection never opened)
+    is retried once, but only while no chunk of this result has been sent: once
+    a chunk is in the chat, the outcome of a later step is uncertain and a retry
+    could post part of the result twice. On any remaining failure the job stays
+    finished but undelivered, and the notice carries one button that sends this
+    stored result again — so neither a resubmission nor that button costs a
+    model call. The notice distinguishes a certain failure from an uncertain
+    one; see `_delivery_failure_notice`.
     """
     b = _b()
     report = job.report
@@ -823,13 +917,7 @@ async def _send_result(
                 return False
             sent_ids.extend(_message_ids(sent))
     except TelegramError as exc:
-        LOGGER.warning(
-            "review result not delivered chat=%s error_type=%s",
-            redact_id(job.chat_id),
-            type(exc).__name__,
-        )
-        job.delivered = False
-        await _best_effort(update, DELIVERY_FAILED_NOTICE, reply_markup=resend_keyboard(job))
+        await _notice_failed_delivery(update, job, exc, gate, partial=bool(sent_ids))
         return False
     job.result_message_ids = sent_ids
     job.delivered = bool(sent_ids)

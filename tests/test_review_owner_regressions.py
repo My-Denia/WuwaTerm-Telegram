@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 from review_fakes import FakeBackend, wire_response
-from telegram.error import BadRequest, NetworkError, RetryAfter
+from telegram.error import BadRequest, RetryAfter
 from test_review_bot import (
     CHAT,
     OWNER,
     Msg,
     command,
     make_context,
+    network_error,
     newest_done,
     press,
     texts,
@@ -30,10 +32,14 @@ BODY = f"/review {SOURCE}\n---\n{TARGET}"
 
 
 @pytest.mark.parametrize(
-    "failure",
-    ["retry_revoked", "bad_request", "missing_reply_revoked"],
+    ("failure", "notice"),
+    [
+        ("retry_revoked", None),
+        ("bad_request", review_bot.DELIVERY_FAILED_NOTICE),
+        ("missing_reply_revoked", None),
+    ],
 )
-def test_shared_result_does_not_fallback_after_unsafe_failure(tmp_path, failure):
+def test_shared_result_does_not_fallback_after_unsafe_failure(tmp_path, failure, notice):
     backend = FakeBackend(
         answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right")
     )
@@ -64,13 +70,21 @@ def test_shared_result_does_not_fallback_after_unsafe_failure(tmp_path, failure)
     job = store.find_owner_duplicate(
         CHAT, store.content_key(SOURCE, TARGET, "en"), 88
     )
-    assert message.attempts == 1 and message.sent == []
     assert job is not None and not job.delivered
     assert job.result_message_ids == []
     assert len(backend.calls) == 1
+    if notice is None:
+        # The chat was revoked while the send failed: stay silent.
+        assert message.attempts == 1 and message.sent == []
+        return
+    # A rejected request posted nothing, so the requester is told and gets the
+    # button that sends her own stored report.
+    assert message.attempts == 2 and texts(message) == [notice]
+    button = message.sent[0][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == f"rv:{job.id}:d"
 
 
-def test_an_uncertain_network_failure_of_the_shared_pointer_is_retried_once(tmp_path):
+def test_an_uncertain_network_failure_of_the_shared_pointer_is_not_retried(tmp_path):
     backend = FakeBackend(
         answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right")
     )
@@ -81,7 +95,45 @@ def test_an_uncertain_network_failure_of_the_shared_pointer_is_retried_once(tmp_
     class FlakyMessage(Msg):
         def maybe_fail(self, attempt):
             if attempt == 1:
-                raise NetworkError("uncertain delivery")
+                raise network_error(httpx.ReadError("read failed"))
+
+    message = FlakyMessage(21, BODY)
+    asyncio.run(
+        review_bot.review_command(
+            update_for(message, user_id=88, chat_type="supergroup"), context
+        )
+    )
+    job = store.find_owner_duplicate(
+        CHAT, store.content_key(SOURCE, TARGET, "en"), 88
+    )
+    assert job is not None and not job.delivered
+    # One pointer send that may have arrived, then the uncertain notice: no
+    # second pointer, which could post the same report twice.
+    assert message.attempts == 2 and texts(message) == [
+        review_bot.DELIVERY_FAILED_UNCERTAIN_NOTICE
+    ]
+    assert len(backend.calls) == 1
+    button = message.sent[0][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == f"rv:{job.id}:d"
+    press(context, button.callback_data, message, user_id=88, chat_type="supergroup")
+    assert job.delivered is True and "语义疑点（实验性" in texts(message)[-1]
+    assert len(backend.calls) == 1
+
+
+def test_a_shared_pointer_whose_connection_never_opened_is_retried_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bot, "TRANSIENT_RETRY_DELAY", 0)
+    backend = FakeBackend(
+        answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right")
+    )
+    context, store, settings = make_context(tmp_path, backend)
+    settings.set_public(CHAT, True)
+    source = command(context, BODY, user_id=77, chat_type="supergroup")
+    assert source.sent
+
+    class FlakyMessage(Msg):
+        def maybe_fail(self, attempt):
+            if attempt == 1:
+                raise network_error(httpx.ConnectError("connection refused"))
 
     message = FlakyMessage(21, BODY)
     asyncio.run(
@@ -94,6 +146,7 @@ def test_an_uncertain_network_failure_of_the_shared_pointer_is_retried_once(tmp_
     )
     assert message.attempts == 2 and len(message.sent) == 1  # one retry, one pointer
     assert job is not None and job.delivered and len(backend.calls) == 1
+    assert "刚审校过" in texts(message)[0]
 
 
 def test_shared_result_can_fallback_when_only_the_old_reply_is_missing(tmp_path):
