@@ -58,7 +58,7 @@ def _configure_llm(monkeypatch: pytest.MonkeyPatch, *, review_enabled: bool = Fa
     monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
     monkeypatch.setenv("WUWATERM_TRANSLATION_THINKING_EN_ZH", "auto")
-    monkeypatch.setenv("WUWATERM_TRANSLATION_THINKING_ZH_EN", "auto")
+    monkeypatch.setenv("WUWATERM_TRANSLATION_THINKING_ZH_EN", "disabled")
     if review_enabled:
         monkeypatch.setenv("WUWATERM_SEMANTIC_REVIEW_ENABLED", "1")
     else:
@@ -180,8 +180,12 @@ def test_tr_rich_html_auto_fallback_capped_at_two_calls(monkeypatch, sample_db) 
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(request.content))
-        # Omit __WUWA_HTML_*__ and __WUWA_TERM_*__ placeholders on every attempt.
-        return _mock_chat_completion("Broken markup output without placeholders.")
+        if len(seen) == 1:
+            # Call 1 (HTML) breaks placeholders -> triggers plain fallback via try_consume_html_fallback().
+            return _mock_chat_completion("Broken markup output without placeholders.")
+        # Call 2 (plain fallback under auto/low thinking) times out; the corrective budget is
+        # already spent on the HTML->plain fallback, so _retry_without_thinking must NOT make call 3.
+        raise httpx.ReadTimeout("timeout", request=request)
 
     translator = SentenceTranslator(
         sample_db,
@@ -202,6 +206,7 @@ def test_tr_rich_html_auto_fallback_capped_at_two_calls(monkeypatch, sample_db) 
     )
     assert len(seen) <= 2
     assert len(seen) == 2
+    assert seen[1].get("thinking") != {"type": "disabled"}
     assert reply.text == TRANSLATION_UNAVAILABLE_NOTICE
     assert reply.parse_mode is None
 
@@ -242,16 +247,19 @@ def test_channel_plain_single_segment_auto_never_blows_admission(monkeypatch, sa
     _configure_llm(monkeypatch)
     seen: list[dict] = []
 
-    def bad_placeholder_handler(request: httpx.Request) -> httpx.Response:
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(request.content))
-        # Drops __WUWA_TERM_*__ placeholders for Gorges of Spirits / Echo; Core must not make a 2nd call.
-        return _mock_chat_completion("Missing term placeholders.")
+        # Under auto/low thinking (<4 locks, <25 paragraphs), Core normally retries timeout
+        # with thinking=disabled; OperationExecutionBudget(max_total_calls=1, max_corrective=0)
+        # must suppress that retry so ChannelRuntime.reserve(1) is never blown.
+        raise httpx.ReadTimeout("timeout", request=request)
 
     update, message = _channel_update(text="Gorges of Spirits has strong Echo today.")
-    context = _channel_context(sample_db, bad_placeholder_handler, calls_per_minute=1)
+    context = _channel_context(sample_db, timeout_handler, calls_per_minute=1)
     asyncio.run(channel_post_handler(update, context))
 
     assert len(seen) == 1
+    assert seen[0].get("thinking") != {"type": "disabled"}
     assert message.replies == []
 
     # With a valid single response, calls_per_minute=1 translates cleanly.
@@ -260,8 +268,8 @@ def test_channel_plain_single_segment_auto_never_blows_admission(monkeypatch, sa
     def ok_handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         ok_seen.append(payload)
-        raw = json.dumps(payload, ensure_ascii=False)
-        term_tokens = re.findall(r"__WUWA_TERM_[0-9a-f]{16}_[0-9]{4}__", raw)
+        user_content = payload["messages"][-1]["content"]
+        term_tokens = re.findall(r"__WUWA_TERM_[0-9a-f]{16}_[0-9]{4}__", user_content)
         return _mock_chat_completion(f"{term_tokens[0]}今天有很强的{term_tokens[1]}。")
 
     ok_update, ok_message = _channel_update(
@@ -280,39 +288,61 @@ def test_channel_plain_single_segment_auto_never_blows_admission(monkeypatch, sa
 def test_channel_html_auto_fallback_capped_at_two_calls(monkeypatch, sample_db) -> None:
     _configure_llm(monkeypatch)
 
-    # Budget of 1: required_calls=1, allow_plain_fallback=False -> never makes a 2nd call.
-    seen_one: list[dict] = []
+    # Budget of 1: required_calls=1, allow_plain_fallback=False -> never makes a 2nd call,
+    # whether Call 1 breaks HTML integrity or times out under auto/low thinking.
+    seen_one_broken: list[dict] = []
 
     def broken_handler_one(request: httpx.Request) -> httpx.Response:
-        seen_one.append(json.loads(request.content))
+        seen_one_broken.append(json.loads(request.content))
         return _mock_chat_completion("broken without html or term placeholders")
 
-    update1, msg1 = _channel_update(
+    update1a, msg1a = _channel_update(
+        text="Gorges of Spirits has strong Echo today.",
+        text_html="<b>Gorges of Spirits</b> has strong Echo today.",
+        message_id=4100,
+    )
+    ctx1a = _channel_context(sample_db, broken_handler_one, calls_per_minute=1)
+    asyncio.run(channel_post_handler(update1a, ctx1a))
+    assert len(seen_one_broken) == 1
+    assert msg1a.replies == []
+
+    seen_one_timeout: list[dict] = []
+
+    def timeout_handler_one(request: httpx.Request) -> httpx.Response:
+        seen_one_timeout.append(json.loads(request.content))
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    update1b, msg1b = _channel_update(
         text="Gorges of Spirits has strong Echo today.",
         text_html="<b>Gorges of Spirits</b> has strong Echo today.",
         message_id=4101,
     )
-    ctx1 = _channel_context(sample_db, broken_handler_one, calls_per_minute=1)
-    asyncio.run(channel_post_handler(update1, ctx1))
-    assert len(seen_one) == 1
-    assert msg1.replies == []
+    ctx1b = _channel_context(sample_db, timeout_handler_one, calls_per_minute=1)
+    asyncio.run(channel_post_handler(update1b, ctx1b))
+    assert len(seen_one_timeout) == 1
+    assert seen_one_timeout[0].get("thinking") != {"type": "disabled"}
+    assert msg1b.replies == []
 
-    # Budget >= 2: required_calls=2, allow_plain_fallback=True -> capped at 2 total calls.
+    # Budget >= 2: required_calls=2, allow_plain_fallback=True -> HTML failure falls back to
+    # plain, whose timeout must NOT trigger a 3rd corrective call.
     seen_two: list[dict] = []
 
-    def broken_handler_two(request: httpx.Request) -> httpx.Response:
+    def html_then_timeout_handler(request: httpx.Request) -> httpx.Response:
         seen_two.append(json.loads(request.content))
-        return _mock_chat_completion("broken without html or term placeholders")
+        if len(seen_two) == 1:
+            return _mock_chat_completion("broken without html or term placeholders")
+        raise httpx.ReadTimeout("timeout", request=request)
 
     update2, msg2 = _channel_update(
         text="Gorges of Spirits has strong Echo today.",
         text_html="<b>Gorges of Spirits</b> has strong Echo today.",
         message_id=4102,
     )
-    ctx2 = _channel_context(sample_db, broken_handler_two, calls_per_minute=4)
+    ctx2 = _channel_context(sample_db, html_then_timeout_handler, calls_per_minute=4)
     asyncio.run(channel_post_handler(update2, ctx2))
     assert len(seen_two) <= 2
     assert len(seen_two) == 2
+    assert seen_two[1].get("thinking") != {"type": "disabled"}
     assert msg2.replies == []
 
 
@@ -329,20 +359,22 @@ def test_channel_long_split_post_with_html_disables_corrective_calls(
 
     seen_fail: list[dict] = []
 
-    def broken_first_chunk(request: httpx.Request) -> httpx.Response:
+    def timeout_first_chunk(request: httpx.Request) -> httpx.Response:
         seen_fail.append(json.loads(request.content))
-        # Drops __WUWA_TERM_*__ on chunk 1; corrective retry MUST be suppressed.
-        return _mock_chat_completion("Dropped lock placeholder on split chunk.")
+        # Split post with HTML still forces max_corrective_calls=0, so chunk 1 timeout under
+        # auto/low thinking must NOT trigger _retry_without_thinking.
+        raise httpx.ReadTimeout("timeout", request=request)
 
     update_fail, msg_fail = _channel_update(
         text=plain,
         text_html=f"<b>{first_line}</b>\n<i>{second_line}</i>",
         message_id=4201,
     )
-    ctx_fail = _channel_context(sample_db, broken_first_chunk, calls_per_minute=10)
+    ctx_fail = _channel_context(sample_db, timeout_first_chunk, calls_per_minute=10)
     asyncio.run(channel_post_handler(update_fail, ctx_fail))
 
     assert len(seen_fail) == 1
+    assert seen_fail[0].get("thinking") != {"type": "disabled"}
     assert msg_fail.replies == []
 
     # When chunks keep placeholders valid, split executes 1 call per chunk as plain text.
@@ -351,8 +383,8 @@ def test_channel_long_split_post_with_html_disables_corrective_calls(
     def ok_split_handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         seen_ok.append(payload)
-        raw = json.dumps(payload, ensure_ascii=False)
-        term_tokens = re.findall(r"__WUWA_TERM_[0-9a-f]{16}_[0-9]{4}__", raw)
+        user_content = payload["messages"][-1]["content"]
+        term_tokens = re.findall(r"__WUWA_TERM_[0-9a-f]{16}_[0-9]{4}__", user_content)
         return _mock_chat_completion(f"{term_tokens[0]}状态稳定。")
 
     update_ok, msg_ok = _channel_update(
