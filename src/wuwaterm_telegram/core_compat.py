@@ -9,7 +9,7 @@ from pathlib import Path
 import sqlite3
 
 
-CORE_VERSION = "0.10.1"
+CORE_VERSION = "0.12.0"
 DATABASE_SCHEMA_VERSION = "2"
 
 
@@ -17,7 +17,7 @@ class CoreCompatibilityError(RuntimeError):
     """The installed Core does not support this adapter."""
 
 
-# What `/review` needs from Core 0.10.1 (semantic-review-v1, segmentation-v1).
+# What `/review` needs from Core 0.12.0 (semantic-review-v1, segmentation-v1).
 # `verify_core_compatibility` requires all of them: the adapter is built for
 # exactly this Core. Whether the model track is *on* is a separate, run-time
 # matter (`semantic_review_enabled()` and a configured model).
@@ -61,6 +61,7 @@ def verify_core_compatibility() -> None:
         required = (
             "DEFAULT_LLM_MAX_CONCURRENCY", "DEFAULT_LLM_TIMEOUT_SECONDS",
             "LLM_INPUT_CHAR_LIMIT", "LLMTranslationError", "MarkupTranslation",
+            "OperationExecutionBudget",
             "ProtectedStructure", "ProtectedText", "SentenceTranslator",
             "SlidingWindowRateLimiter", "TermService", "TranslationJob",
             "TranslationOutcome", "TRANSLATION_UNAVAILABLE_NOTICE",
@@ -73,11 +74,21 @@ def verify_core_compatibility() -> None:
         protected_async = app.SentenceTranslator.translate_protected_async
         if "before_llm_call" not in signature(protected_async).parameters:
             raise AttributeError("protected translation guard")
+        if "execution_budget" not in signature(protected_async).parameters:
+            raise AttributeError("protected execution budget")
+        if "execution_budget" not in signature(app.SentenceTranslator.translate_async).parameters:
+            raise AttributeError("sentence execution budget")
         if "before_llm_call" not in signature(app.translate_request_async).parameters:
             raise AttributeError("application translation guard")
+        if "execution_budget" not in signature(app.translate_request_async).parameters:
+            raise AttributeError("application execution budget")
         missing = missing_review_symbols()
         if missing:
             raise AttributeError("review symbols: " + ", ".join(missing))
+        if "execution_budget" not in signature(app.semantic_review_async).parameters:
+            raise AttributeError("review execution budget")
+        llm_transport = import_module("wuwaterm.llm_transport")
+        getattr(llm_transport, "current_execution_budget")
     except (ImportError, AttributeError, TypeError, ValueError) as exc:
         raise CoreCompatibilityError(
             "installed WuwaTerm Core lacks the required Telegram adapter capabilities"

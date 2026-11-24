@@ -1,18 +1,21 @@
 # `/review`: what it relies on in Core
 
-`/review` is built for Core 0.10.1 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
+`/review` is built for Core 0.12.0 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
 `contracts/semantic-review-v1/`). All Core access is in `review_backend.py`;
 `core_compat.REVIEW_CORE_SYMBOLS` is the symbol list that
 `verify_core_compatibility` requires at start-up.
 
-## What the adapter uses (checked against Core v0.10.1, commit dd238303)
+## What the adapter uses (checked against Core v0.12.0, commit 6fb4d8a4)
 
 - `semantic_review_async(service, translator, SemanticReviewJob, *, request_id,
-  before_llm_call, offload)` returns a `SemanticReviewOutcome` whose `body` is
-  the published response and whose `error_code` is one of the translation error
-  codes. The adapter builds the job (no precedents; the previous segment as
-  `ContextBefore`), runs it off the event loop and turns `error_code` or an
-  `LLMTranslationError` into a `ReviewBackendError`.
+  before_llm_call, offload, execution_budget)` returns a
+  `SemanticReviewOutcome` whose `body` is the published response and whose
+  `error_code` is one of the translation error codes. The adapter creates one
+  run-scoped `OperationExecutionBudget(max_total_calls=len(ready),
+  max_corrective_calls=0, max_corrective_calls_per_segment=0)` in
+  `review_flow.py`, cancels it on authorization abort or task cancellation,
+  and maps `operation_budget` to `llm_budget_exhausted` and `cancelled` to
+  `ReviewAborted`.
 - `semantic_review_enabled()`: semantic review is experimental and **off by
   default** (`WUWATERM_SEMANTIC_REVIEW_ENABLED`). With the flag off, or no model
   configured, `/review` runs the dictionary track only and says semantic issues
@@ -23,26 +26,38 @@
   request.
 - `review_pair(..., review_version="review-v2")` for the dictionary track;
   `direction` is the language of the translation. The term findings come from
-  Core's `wuwaterm-cjk-matcher-v8` baseline (`MY-355`), so a surface match of a
-  shorter official form inside a longer official form the source does not claim
-  is no longer counted as its own hit.
+  Core's `wuwaterm-cjk-matcher-v9` baseline (`Core v0.11.0+`), so single-character
+  CJK names are admitted only at plausible right boundaries and translation
+  reference admission and `review-v2` share the same matcher helper.
+- `/tr` & rich HTML: `translate_request_async` activates Core's single-segment
+  `OperationExecutionBudget` (at most 2 upstream calls and 1 shared corrective
+  slot across HTML-to-plain fallback, timeout fallback, and paragraph repair),
+  so opt-in `WUWATERM_TRANSLATION_THINKING_EN_ZH=auto` cannot trigger a 3-call
+  blowup; defaults stay `omit` (`en->zh`) and `disabled` (`zh->en`).
+- Linked-channel posts (`channel.py`): `channel_post_handler` aligns an outer
+  `OperationExecutionBudget` with `ChannelRuntime.reserve(...)` (`allow_plain_fallback`
+  gated on `len(plain) <= LLM_INPUT_CHAR_LIMIT`), keeping plain single-segment,
+  HTML fallback, and long split chunks bounded to their reserved admission calls.
 - Long-text `/tr`: Telegram no longer passes a `splitter` (Core ignores it).
   Core cuts by segmentation-v1, keeps the sender's separators and carries the
-  previous segment as context. Core 0.10.1's guard reads a per-line share ratio,
+  previous segment as context. Core's guard reads a per-line share ratio,
   `(answer line / answer total) / (source line / source total)`, and looks for a
   merge and a split over the whole segment at any distance and in either order;
   an answer is regrouped into the source's paragraphs only when neither appears,
   so a distant merge-and-split that shifts a line across a paragraph boundary is
   refused, and the model's own blank lines are kept (`MY-359`).
 
-Telegram `0.4.1` changed no Core usage: the shared-pointer resend path and the
-pre-send-only send retry (`PR #43`) live in `review_bot.py`, and
-`review_backend.py` neither retries nor re-sends through Core.
+Telegram `0.5.0` aligns `/tr`, `channel.py`, and `/review` with Core `0.12.0`'s
+`OperationExecutionBudget`, cancellation boundaries, and failure taxonomy while
+preserving Telegram's shared-pointer delivery, resend, and pre-send-only retry
+behavior (`0.4.1`).
 
 ## Not done
 
-- `before_llm_call` is not passed: the budget guard of `/tr` is not applied to
-  `/review`. Authorization is re-checked between segments and before delivery.
+- `before_llm_call` is not passed on `/review`: per-segment concurrency/slot
+  accounting runs inside Core, while `review_flow.py` passes the run-scoped
+  `execution_budget` and re-checks authorization between segments and before
+  delivery.
 - No precedents are sent (there is no manuscript in Telegram).
 - A real model was never called from this repository's tests; the engine runs
   against a mock HTTP model.

@@ -1,8 +1,9 @@
 """The only place that touches Core for `/review`.
 
 Everything `/review` needs from Core goes through `ReviewBackend`. The live
-implementation calls Core 0.10.1 (`semantic_review_async`, segmentation-v1,
-`review_pair`); tests drive the same flow with a fake backend.
+implementation calls Core 0.12.0 (`semantic_review_async`, segmentation-v1,
+`review_pair`, `OperationExecutionBudget`); tests drive the same flow with a
+fake backend.
 
 Semantic review is experimental and off by default in Core
 (`WUWATERM_SEMANTIC_REVIEW_ENABLED`). While it is off, or no model is
@@ -21,6 +22,7 @@ from typing import Any, Mapping, Protocol, Sequence
 from wuwaterm.application import (
     ContextBefore,
     LLMTranslationError,
+    OperationExecutionBudget,
     SemanticReviewJob,
     TermService,
     count_cjk,
@@ -85,6 +87,7 @@ class ReviewBackend(Protocol):
         direction: str,
         explain_language: str,
         context_before: tuple[str, str] | None,
+        execution_budget: OperationExecutionBudget | None = None,
     ) -> Mapping[str, Any]: ...
 
 
@@ -117,13 +120,15 @@ def _code_for_failure(error_code: str, reason: str | None) -> str:
     """Keep what Core's diagnostic knows about a failure.
 
     Core reports a bare HTTP 429 as `llm_unavailable` and keeps the real cause
-    only in the diagnostic (`rate_limit`). A run must stop on a rate limit, so
-    that cause wins over the coarse code.
+    only in the diagnostic (`rate_limit`). Core's shared execution budget maps
+    budget exhaustion (`operation_budget`) and cancellation (`cancelled`) too.
     """
     if reason == "rate_limit":
         return "rate_limited"
-    if reason == "budget":
+    if reason in {"budget", "operation_budget"}:
         return "llm_budget_exhausted"
+    if reason == "cancelled":
+        return "aborted"
     return error_code
 
 
@@ -219,6 +224,7 @@ class LiveReviewBackend:
         direction: str,
         explain_language: str,
         context_before: tuple[str, str] | None,
+        execution_budget: OperationExecutionBudget | None = None,
     ) -> Mapping[str, Any]:
         job = SemanticReviewJob(
             source=source,
@@ -241,6 +247,7 @@ class LiveReviewBackend:
                 request_id=uuid.uuid4().hex,
                 before_llm_call=None,
                 offload=asyncio.to_thread,
+                execution_budget=execution_budget,
             )
         except LLMTranslationError as exc:
             raise ReviewBackendError(
