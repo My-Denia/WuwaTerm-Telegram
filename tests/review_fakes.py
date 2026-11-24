@@ -92,11 +92,26 @@ class FakeBackend:
         self.term_calls += 1
         return TermReview()
 
-    async def semantic_review(self, source, target, *, direction, explain_language, context_before) -> Mapping[str, Any]:
+    async def semantic_review(
+        self,
+        source,
+        target,
+        *,
+        direction,
+        explain_language,
+        context_before,
+        execution_budget=None,
+    ) -> Mapping[str, Any]:
         self._in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self._in_flight)
         try:
-            self.calls.append({"source": source, "target": target, "direction": direction, "context_before": context_before})
+            self.calls.append({
+                "source": source,
+                "target": target,
+                "direction": direction,
+                "context_before": context_before,
+                "execution_budget": execution_budget,
+            })
             if self.delay:
                 await asyncio.sleep(self.delay)
             code = self.errors.get(len(self.calls))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AbstractContextManager, nullcontext
 import inspect
 import logging
 import time
@@ -14,9 +15,11 @@ from telegram import Update
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import ContextTypes
 
+from wuwaterm import llm_transport
 from wuwaterm.application import (
     LLM_INPUT_CHAR_LIMIT,
     LLMTranslationError,
+    OperationExecutionBudget,
     SentenceTranslator,
     TermService,
     TRANSLATION_UNAVAILABLE_NOTICE,
@@ -625,7 +628,11 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             required_calls = len(
                 split_telegram_text(plain, limit=LLM_INPUT_CHAR_LIMIT)
             )
-        allow_plain_fallback = bool(html_text) and required_calls >= 2
+        allow_plain_fallback = (
+            len(plain) <= LLM_INPUT_CHAR_LIMIT
+            and bool(html_text)
+            and required_calls >= 2
+        )
         # New posts outrank edits near budget exhaustion. The check and the
         # reserve below are both synchronous on the single event loop, so the
         # headroom reading cannot race the reservation it gates. The gate is
@@ -742,19 +749,26 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     mode=f"call:{started_calls}/{required_calls}",
                 )
 
+            op_budget = OperationExecutionBudget(
+                max_total_calls=required_calls,
+                max_corrective_calls=1 if allow_plain_fallback else 0,
+                max_corrective_calls_per_segment=1 if allow_plain_fallback else 0,
+            )
             try:
-                (
-                    translated,
-                    translated_parse_mode,
-                    translated_mode,
-                ) = await _translate_channel_input(
-                    translator,
-                    plain,
-                    html_text,
-                    to_chinese=to_chinese,
-                    before_llm_call=mark_channel_llm_call_started,
-                    allow_plain_fallback=allow_plain_fallback,
-                )
+                with op_budget.activate():
+                    (
+                        translated,
+                        translated_parse_mode,
+                        translated_mode,
+                    ) = await _translate_channel_input(
+                        translator,
+                        plain,
+                        html_text,
+                        to_chinese=to_chinese,
+                        before_llm_call=mark_channel_llm_call_started,
+                        allow_plain_fallback=allow_plain_fallback,
+                        execution_budget=op_budget,
+                    )
             except LLMTranslationError as exc:
                 reason = getattr(exc, "reason", "translation_unavailable")
                 _channel_event(
@@ -984,62 +998,103 @@ async def _translate_channel_input(
     to_chinese: bool,
     before_llm_call,
     allow_plain_fallback: bool = True,
+    execution_budget: OperationExecutionBudget | None = None,
 ) -> tuple[str, str | None, str]:
     """Translate one post; LLMTranslationError carries a ``failure_stage``
     attribute (html-attempt / plain-fallback / plain-no-html /
     plain-input-split) so the caller's log event can say which call failed."""
-    if len(plain) <= LLM_INPUT_CHAR_LIMIT:
-        if not html_text:
-            translated = await _translate_plain_stage(
-                translator,
-                plain,
-                stage="plain-no-html",
-                to_chinese=to_chinese,
-                before_llm_call=before_llm_call,
-            )
-            return translated, None, "plain-no-html"
-        try:
-            return (
-                await translate_html_async(
-                    translator, html_text,
+    chunks = (
+        None
+        if len(plain) <= LLM_INPUT_CHAR_LIMIT
+        else split_telegram_text(plain, limit=LLM_INPUT_CHAR_LIMIT)
+    )
+    existing = llm_transport.current_execution_budget()
+    budget_cm: AbstractContextManager[OperationExecutionBudget]
+    if execution_budget is not None:
+        budget_cm = (
+            nullcontext(execution_budget)
+            if existing is execution_budget
+            else execution_budget.activate()
+        )
+    elif isinstance(existing, OperationExecutionBudget):
+        budget_cm = nullcontext(existing)
+    else:
+        if chunks is None:
+            if html_text and not allow_plain_fallback:
+                max_total, max_corr = 1, 0
+            else:
+                max_total, max_corr = 2, 1
+        else:
+            max_total, max_corr = len(chunks), 0
+        budget_cm = OperationExecutionBudget(
+            max_total_calls=max_total,
+            max_corrective_calls=max_corr,
+            max_corrective_calls_per_segment=max_corr,
+        ).activate()
+
+    with budget_cm as active_budget:
+        if chunks is None:
+            if not html_text:
+                translated = await _translate_plain_stage(
+                    translator,
+                    plain,
+                    stage="plain-no-html",
                     to_chinese=to_chinese,
                     before_llm_call=before_llm_call,
-                ),
-                "HTML",
-                "HTML",
-            )
-        except LLMTranslationError as exc:
-            if (
-                getattr(exc, "reason", "") not in HTML_CONTENT_FAILURE_REASONS
-                or not allow_plain_fallback
-            ):
-                # Either not a content failure, or no fallback token was
-                # reserved (per-minute budget of 1): running the fallback
-                # anyway would blow the call reservation with a RuntimeError.
-                exc.failure_stage = "html-attempt"
-                raise
-            # The model broke the placeholder structure (or returned nothing).
-            # Retrying as plain drops formatting but keeps the reply delivered;
-            # before_llm_call keeps the budget/staleness/authorization rechecks.
+                )
+                return translated, None, "plain-no-html"
+            try:
+                return (
+                    await translate_html_async(
+                        translator,
+                        html_text,
+                        to_chinese=to_chinese,
+                        before_llm_call=before_llm_call,
+                    ),
+                    "HTML",
+                    "HTML",
+                )
+            except LLMTranslationError as exc:
+                if (
+                    getattr(exc, "reason", "") not in HTML_CONTENT_FAILURE_REASONS
+                    or not allow_plain_fallback
+                ):
+                    # Either not a content failure, or no fallback token was
+                    # reserved (per-minute budget of 1): running the fallback
+                    # anyway would blow the call reservation with a RuntimeError.
+                    exc.failure_stage = "html-attempt"
+                    raise
+                if active_budget.is_cancelled or active_budget.deadline_expired():
+                    exc.failure_stage = "html-attempt"
+                    raise
+                if (
+                    active_budget.calls_used > 0
+                    and not active_budget.try_consume_html_fallback()
+                ):
+                    exc.failure_stage = "html-attempt"
+                    raise
+                # The model broke the placeholder structure (or returned nothing).
+                # Retrying as plain drops formatting but keeps the reply delivered;
+                # before_llm_call keeps the budget/staleness/authorization rechecks.
+                translated = await _translate_plain_stage(
+                    translator,
+                    plain,
+                    stage="plain-fallback",
+                    to_chinese=to_chinese,
+                    before_llm_call=before_llm_call,
+                )
+                return translated, None, "plain-after-html-failure"
+        translated_chunks: list[str] = []
+        for chunk in chunks:
             translated = await _translate_plain_stage(
                 translator,
-                plain,
-                stage="plain-fallback",
+                chunk,
+                stage="plain-input-split",
                 to_chinese=to_chinese,
                 before_llm_call=before_llm_call,
             )
-            return translated, None, "plain-after-html-failure"
-    translated_chunks: list[str] = []
-    for chunk in split_telegram_text(plain, limit=LLM_INPUT_CHAR_LIMIT):
-        translated = await _translate_plain_stage(
-            translator,
-            chunk,
-            stage="plain-input-split",
-            to_chinese=to_chinese,
-            before_llm_call=before_llm_call,
-        )
-        translated_chunks.append(translated)
-    return "\n".join(translated_chunks), None, "plain-input-split"
+            translated_chunks.append(translated)
+        return "\n".join(translated_chunks), None, "plain-input-split"
 
 
 async def _translate_plain_stage(

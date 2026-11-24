@@ -9,8 +9,12 @@ not reviewed; nothing in it is shown.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from typing import Awaitable, Callable
+
+from wuwaterm.application import OperationExecutionBudget
 
 from .review_backend import (
     STOP_CODES,
@@ -68,6 +72,16 @@ def _shift(span: Span | None, offset: int) -> Span | None:
 
 def _tail(text: str) -> str:
     return text[-CONTEXT_SCALARS:]
+
+
+def _accepts_execution_budget(func: object) -> bool:
+    try:
+        params = inspect.signature(func).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return "execution_budget" in params or any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
 
 
 async def run_review(
@@ -134,8 +148,15 @@ async def run_review(
     previous_texts: tuple[str, str] | None = None
     stopped: str | None = None
     failed_in_a_row = 0
+    run_budget = OperationExecutionBudget(
+        max_total_calls=len(ready),
+        max_corrective_calls=0,
+        max_corrective_calls_per_segment=0,
+    )
+    pass_budget = _accepts_execution_budget(backend.semantic_review)
     for pair in ready:
         if gate is not None and not await gate():
+            run_budget.cancel("aborted")
             raise ReviewAborted()
         src, tgt = _pair_texts(source, target, pair)
         context = (
@@ -144,14 +165,29 @@ async def run_review(
             else None
         )
         try:
-            body = await backend.semantic_review(
-                src,
-                tgt,
-                direction=direction,
-                explain_language=explain_language,
-                context_before=context,
-            )
+            if pass_budget:
+                body = await backend.semantic_review(
+                    src,
+                    tgt,
+                    direction=direction,
+                    explain_language=explain_language,
+                    context_before=context,
+                    execution_budget=run_budget,
+                )
+            else:
+                body = await backend.semantic_review(
+                    src,
+                    tgt,
+                    direction=direction,
+                    explain_language=explain_language,
+                    context_before=context,
+                )
+        except asyncio.CancelledError:
+            run_budget.cancel("cancelled")
+            raise
         except ReviewBackendError as exc:
+            if exc.code == "aborted":
+                raise ReviewAborted() from exc
             if exc.code in STOP_CODES:
                 stopped = exc.code
                 break

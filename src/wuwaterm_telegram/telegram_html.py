@@ -140,12 +140,20 @@ def translate_html(translator, html_text: str, *, to_chinese: bool = False) -> s
 
 
 async def translate_html_async(
-    translator, html_text: str, *, to_chinese: bool = False, before_llm_call=None
+    translator,
+    html_text: str,
+    *,
+    to_chinese: bool = False,
+    before_llm_call=None,
+    execution_budget=None,
 ) -> str:
     protected = protect_telegram_html(html_text)
     try:
+        kwargs = {"to_chinese": to_chinese, "before_llm_call": before_llm_call}
+        if execution_budget is not None:
+            kwargs["execution_budget"] = execution_budget
         translated = await translator.translate_protected_async(
-            protected, to_chinese=to_chinese, before_llm_call=before_llm_call
+            protected, **kwargs
         )
         return _validate_restored_html(translated, protected)
     except (LLMTranslationError, TelegramHTMLIntegrityError) as exc:
