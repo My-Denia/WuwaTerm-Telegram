@@ -31,6 +31,7 @@ from wuwaterm.logging_utils import redact_id, safe_error_type, safe_text_len
 
 from .channel_reply_index import ChannelReplyIndex, OriginalPostClaim
 from .channel_runtime import ChannelRuntime
+from .core_compat import strip_telegram_wrapper_noise
 from .runtime_keys import (
     CHANNEL_CAPACITY_NOTIFIER_KEY,
     CHANNEL_REPLY_INDEX_KEY,
@@ -512,13 +513,23 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 text_len=safe_text_len(plain),
             )
             html_text = None
+        # Screenshot furniture (version tag, spoiler label, quote bars) is not
+        # content: strip it before the dictionary lookup, the length limit and
+        # the plain route. Core >= 0.13.0 no longer removes these markers
+        # during generic preparation, so the adapter owns the cleanup. The
+        # HTML payload keeps its own markup.
+        stripped_plain = strip_telegram_wrapper_noise(plain, keep_paragraphs=True)
+        if html_text is None:
+            plain = stripped_plain
         # Direction by script: enough Chinese -> translate to English (default);
         # no Chinese but enough Latin letters -> translate to Chinese. Anything
         # else (emoji / links / numbers only) is not worth translating -> skip.
-        cjk = count_cjk(plain)
+        # Judge the stripped text so a version tag's Latin letters cannot flip
+        # a short Chinese post to the wrong direction.
+        cjk = count_cjk(stripped_plain)
         if cjk >= config.channel_min_cjk:
             to_chinese = False
-        elif cjk == 0 and count_latin(plain) >= config.channel_min_latin:
+        elif cjk == 0 and count_latin(stripped_plain) >= config.channel_min_latin:
             to_chinese = True
         else:
             # Free check: no LLM call and no throttle consumption.

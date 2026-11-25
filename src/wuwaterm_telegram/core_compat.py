@@ -6,15 +6,75 @@ from contextlib import closing
 from importlib import import_module, metadata
 from inspect import signature
 from pathlib import Path
+import re
 import sqlite3
 
 
 CORE_VERSION = "0.12.0"
 DATABASE_SCHEMA_VERSION = "2"
+# Core #318 moved Telegram wrapper cleanup out of generic text preparation into
+# `wuwaterm.normalize.strip_telegram_wrapper_noise` and stopped `prepare_text`
+# from deleting screenshot markers. Core 0.12.0 still folds that cleanup into
+# `normalize_user_text`, so the adapter resolves whichever symbol exists and
+# keeps working on both; the symbol becomes mandatory with the 0.13.0 pin.
+WRAPPER_STRIP_CORE_VERSION = "0.13.0"
+
+_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n+")
 
 
 class CoreCompatibilityError(RuntimeError):
     """The installed Core does not support this adapter."""
+
+
+def _version_at_least(version: str, minimum: str) -> bool:
+    def parts(value: str) -> tuple[int, ...]:
+        numbers: list[int] = []
+        for chunk in value.split("."):
+            digits = "".join(char for char in chunk if char.isdigit())
+            if not digits:
+                break
+            numbers.append(int(digits))
+        return tuple(numbers)
+
+    return parts(version) >= parts(minimum)
+
+
+def wrapper_strip_is_native() -> bool:
+    """True when Core ships `strip_telegram_wrapper_noise` (>= 0.13.0)."""
+    try:
+        normalize = import_module("wuwaterm.normalize")
+    except ImportError:
+        return False
+    return hasattr(normalize, "strip_telegram_wrapper_noise")
+
+
+def strip_telegram_wrapper_noise(value: str, *, keep_paragraphs: bool = False) -> str:
+    """Strip Telegram screenshot/wrapper markers with the installed Core.
+
+    Telegram-facing text only: version tags (`[Wuthering Waves 3.7]`), spoiler
+    labels (`[spoiler]`), and quote bars are screenshot furniture, not content.
+    Core >= 0.13.0 exposes the cleanup as its own function; Core 0.12.0 only
+    strips the same markers inside `normalize_user_text`, so that is the
+    fallback until the pin moves.
+    """
+    try:
+        normalize = import_module("wuwaterm.normalize")
+    except ImportError as exc:  # pragma: no cover - Core is a hard dependency
+        raise CoreCompatibilityError(
+            "installed WuwaTerm Core lacks Telegram wrapper cleanup"
+        ) from exc
+    strip = getattr(normalize, "strip_telegram_wrapper_noise", None)
+    if strip is not None:
+        return strip(value, keep_paragraphs=keep_paragraphs)
+    legacy = getattr(normalize, "normalize_user_text", None)
+    if legacy is None:  # pragma: no cover - every supported Core has one
+        raise CoreCompatibilityError(
+            "installed WuwaTerm Core lacks Telegram wrapper cleanup"
+        )
+    if not keep_paragraphs:
+        return legacy(value)
+    parts = (legacy(part) for part in _PARAGRAPH_BREAK_RE.split(value))
+    return "\n\n".join(part for part in parts if part)
 
 
 # What `/review` needs from Core 0.12.0 (semantic-review-v1, segmentation-v1).
@@ -85,6 +145,12 @@ def verify_core_compatibility() -> None:
         missing = missing_review_symbols()
         if missing:
             raise AttributeError("review symbols: " + ", ".join(missing))
+        if _version_at_least(CORE_VERSION, WRAPPER_STRIP_CORE_VERSION) and not (
+            wrapper_strip_is_native()
+        ):
+            raise AttributeError(
+                "wuwaterm.normalize.strip_telegram_wrapper_noise"
+            )
         if "execution_budget" not in signature(app.semantic_review_async).parameters:
             raise AttributeError("review execution budget")
         llm_transport = import_module("wuwaterm.llm_transport")

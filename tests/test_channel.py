@@ -543,6 +543,103 @@ def test_channel_no_html_falls_back_to_plain_pipeline(monkeypatch, sample_db, ca
     assert len(runtime._budget_tokens) == 1
 
 
+def _capture_llm(monkeypatch):
+    """Record the direction and input text of every mocked model call."""
+    seen: list[tuple[str, bool, bool]] = []
+
+    async def fake_call(
+        locked_text,
+        locks,
+        html_mode=False,
+        to_chinese=False,
+        timeout_seconds=30.0,
+        transport=None,
+        references=(),
+        **_kwargs,
+    ):
+        del locks, timeout_seconds, transport, references
+        seen.append((locked_text, html_mode, to_chinese))
+        return locked_text
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+    monkeypatch.setattr("wuwaterm.sentence._call_llm_async", fake_call)
+    return seen
+
+
+def test_channel_plain_post_strips_wrapper_markers_before_translation(
+    monkeypatch, sample_db
+):
+    seen = _capture_llm(monkeypatch)
+    update, message = channel_update(
+        text="[Wuthering Waves 3.7]\n[spoiler]\n> 今汐登场", text_html="", message_id=4030
+    )
+    context = make_context(sample_db)
+
+    asyncio.run(channel_post_handler(update, context))
+
+    assert [html_mode for _t, html_mode, _d in seen] == [False]
+    locked_text = seen[0][0]
+    assert "Wuthering Waves" not in locked_text
+    assert "spoiler" not in locked_text.casefold()
+    assert not locked_text.lstrip().startswith(">")
+    assert "Wuthering Waves" not in message.replies[0][0]
+
+
+def test_channel_version_tag_does_not_flip_short_chinese_to_to_zh(
+    monkeypatch, sample_db
+):
+    # 14 Latin letters in the version tag against 4 CJK characters: a ratio
+    # heuristic reading the raw post would translate Chinese into Chinese.
+    seen = _capture_llm(monkeypatch)
+    update, message = channel_update(
+        text="[Wuthering Waves 3.7]\n\n今汐登场", text_html="", message_id=4031
+    )
+    context = make_context(sample_db)
+
+    asyncio.run(channel_post_handler(update, context))
+
+    assert [(html_mode, to_chinese) for _t, html_mode, to_chinese in seen] == [
+        (False, False)
+    ]
+
+
+def test_channel_html_post_keeps_wrapper_markup_but_translates_to_english(
+    monkeypatch, sample_db
+):
+    seen = _capture_llm(monkeypatch)
+    update, message = channel_update(
+        text="[Wuthering Waves 3.7]\n\n今汐登场",
+        text_html="<b>[Wuthering Waves 3.7]</b>\n\n今汐登场",
+        message_id=4032,
+    )
+    context = make_context(sample_db)
+
+    asyncio.run(channel_post_handler(update, context))
+
+    # The HTML payload is translated as written; only the direction check and
+    # the plain route work from the stripped text.
+    assert [(html_mode, to_chinese) for _t, html_mode, to_chinese in seen] == [
+        (True, False)
+    ]
+    assert "Wuthering Waves 3.7" in message.replies[0][0]
+
+
+def test_channel_dictionary_hit_ignores_a_wrapper_prefix(monkeypatch, sample_db):
+    disable_llm(monkeypatch)
+    llm_calls = forbid_llm_call(monkeypatch)
+    update, message = channel_update(
+        text="[spoiler]\n声骸", text_html="", message_id=4033
+    )
+    context = make_context(sample_db)
+
+    asyncio.run(channel_post_handler(update, context))
+
+    assert message.replies == [("Echo", None, 4033)]
+    assert llm_calls == []
+
+
 def test_channel_no_html_dictionary_hit_still_exact(monkeypatch, sample_db):
     disable_llm(monkeypatch)
     llm_calls = forbid_llm_call(monkeypatch)

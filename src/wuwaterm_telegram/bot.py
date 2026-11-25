@@ -55,7 +55,11 @@ from .channel import channel_post_handler, send_with_flood_retry
 from .channel_reply_index import ChannelReplyIndex
 from .channel_reply_schema import ChannelReplyPayloadError, parse_channel_reply_payload
 from .channel_runtime import ChannelRuntime
-from .core_compat import verify_core_compatibility, verify_dictionary
+from .core_compat import (
+    strip_telegram_wrapper_noise,
+    verify_core_compatibility,
+    verify_dictionary,
+)
 from . import poll_health
 from . import review_bot
 from .runtime_keys import (
@@ -1882,7 +1886,10 @@ def translate_query(
     outcome = translate_request(
         service,
         translator,
-        TranslationJob(text=query, forced_to_chinese=forced_to_chinese),
+        TranslationJob(
+            text=strip_telegram_wrapper_noise(query, keep_paragraphs=True),
+            forced_to_chinese=forced_to_chinese,
+        ),
     )
     return _telegram_text(outcome)
 
@@ -1898,7 +1905,10 @@ async def translate_query_async(
     outcome = await translate_request_async(
         service,
         translator,
-        TranslationJob(text=query, forced_to_chinese=forced_to_chinese),
+        TranslationJob(
+            text=strip_telegram_wrapper_noise(query, keep_paragraphs=True),
+            forced_to_chinese=forced_to_chinese,
+        ),
         # The dictionary stage (exact + full-table fuzzy over sqlite) is
         # synchronous; keep it off the event loop like the API does.
         offload=asyncio.to_thread,
@@ -1914,11 +1924,18 @@ async def telegram_translation_reply(
     input_limit: int = LLM_INPUT_CHAR_LIMIT,
 ) -> TranslationReply:
     """Run the shared pipeline with the Telegram markup hook."""
+    # HTML-mode requests keep their markup verbatim: the wrapper strip would
+    # delete structural brackets the HTML pipeline relies on.
+    text = (
+        strip_telegram_wrapper_noise(request.text, keep_paragraphs=True)
+        if request.html is None
+        else request.text
+    )
     outcome = await translate_request_async(
         service,
         translator,
         TranslationJob(
-            text=request.text,
+            text=text,
             markup=request.html,
             forced_to_chinese=request.forced_to_chinese,
         ),
