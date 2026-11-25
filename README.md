@@ -24,7 +24,7 @@ Telegram `0.6.0` builds against the published WuwaTerm Core `0.13.0` release. `c
 
 Translation in a private chat is owner-only.
 
-Without `--to`, `/tr`, `/term` and `/sentence` pick the direction themselves: text with no CJK character goes to Chinese, and text with CJK characters goes to Chinese only when its Latin letters outnumber the CJK characters more than four to one (an English paragraph with one Chinese term is translated into Chinese). Screenshot wrapper markers (`[spoiler]`, `(WW 3.4)`, `[Wuthering Waves 3.7]`, quote bars) are removed before translating, while prose that only looks like a marker, such as `>50% Energy Regen` or `#spoilersafe ...`, is kept.
+Without `--to`, `/tr`, `/term` and `/sentence` pick the direction themselves: text with no CJK character goes to Chinese, and text with CJK characters goes to Chinese only when its Latin letters outnumber the CJK characters more than four to one (an English paragraph with one Chinese term is translated into Chinese). Screenshot wrapper markers (`[spoiler]`, `(WW 3.4)`, `[Wuthering Waves 3.7]`, quote bars) are removed from the plain text the bot reads for direction, dictionary lookup and the plain fallback; a formatted message's HTML is translated as written, markers included. Prose that only looks like a marker, such as `>50% Energy Regen` or `#spoilersafe ...`, is kept.
 
 ## Requirements
 
