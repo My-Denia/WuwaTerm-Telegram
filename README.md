@@ -4,7 +4,7 @@
 
 A standalone Telegram bot for WuwaTerm's Chinese–English game terminology. It uses the WuwaTerm Core dictionary and translation library directly; no HTTP API process is required. It supports `/tr` and `/term`, `/sentence` and `/sent`, group access settings, and linked-channel translation.
 
-Telegram `0.5.0` builds against the published WuwaTerm Core `0.12.0` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
+Telegram `0.6.0` builds against the published WuwaTerm Core `0.13.0` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
 
 ## Commands
 
@@ -24,6 +24,8 @@ Telegram `0.5.0` builds against the published WuwaTerm Core `0.12.0` release. `c
 
 Translation in a private chat is owner-only.
 
+Without `--to`, `/tr`, `/term` and `/sentence` pick the direction themselves: text with no CJK character goes to Chinese, and text with CJK characters goes to Chinese only when its Latin letters outnumber the CJK characters more than four to one (an English paragraph with one Chinese term is translated into Chinese). Screenshot wrapper markers (`[spoiler]`, `(WW 3.4)`, `[Wuthering Waves 3.7]`, quote bars) are removed before translating, while prose that only looks like a marker, such as `>50% Energy Regen` or `#spoilersafe ...`, is kept.
+
 ## Requirements
 
 - Python 3.11 or later.
@@ -32,7 +34,7 @@ Translation in a private chat is owner-only.
 
 ## Installation from verified artifacts
 
-Download the pinned Core wheel through the lock and the Telegram `v0.5.0` wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
+Download the pinned Core wheel through the lock and the Telegram `v0.6.0` wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
 
 ```sh
 python3 -m venv .venv

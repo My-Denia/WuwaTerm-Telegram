@@ -242,6 +242,7 @@ def enable_mock_llm(monkeypatch, calls, response_factory):
         timeout_seconds=30.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append((locked_text, locks, html_mode))
         if len(inspect.signature(response_factory).parameters) >= 3:
@@ -377,6 +378,7 @@ def test_channel_autotranslate_uses_default_llm_timeout(monkeypatch, sample_db):
         to_chinese=False,
         timeout_seconds=30.0,
         transport=None,
+        **_kwargs,
     ):
         seen.append(timeout_seconds)
         return html_with_segments(
@@ -591,9 +593,9 @@ def _answer_llm(monkeypatch, *answers):
 def _spy_translate_async(monkeypatch):
     """Record what the plain stages hand to the translator, changing nothing.
 
-    Patching ``_call_llm_async`` alone cannot prove this: on the Core 0.12.0
-    pin the same markers are stripped again inside ``prepare_text``, so a
-    chunk that still carries them looks clean by the time the model sees it.
+    Patching ``_call_llm_async`` alone cannot prove this: it only sees the
+    text after Core's own preparation. The spy sees what the plain stages hand
+    to ``translate_async``, before Core touches it.
     """
     from wuwaterm.sentence import SentenceTranslator
 
@@ -1103,6 +1105,7 @@ def test_channel_reply_is_skipped_if_chat_revoked_during_llm(monkeypatch, sample
             to_chinese=False,
             timeout_seconds=30.0,
             transport=None,
+            **_kwargs,
         ):
             nonlocal calls
             calls += 1
@@ -1141,6 +1144,7 @@ def test_budget_exhaustion_is_silent_with_one_clean_warning(
         to_chinese=False,
         timeout_seconds=30.0,
         transport=None,
+        **_kwargs,
     ):
         raise _llm_error_from_response(
             httpx.Response(429, text='{"error":"max_budget exceeded"}')
@@ -2205,6 +2209,7 @@ def test_edit_waits_for_original_inflight_reply(monkeypatch, sample_db):
             to_chinese=False,
             timeout_seconds=30.0,
             transport=None,
+            **_kwargs,
         ):
             nonlocal calls
             calls += 1
@@ -2256,6 +2261,7 @@ def test_concurrent_edits_do_not_overwrite_newer_translation(monkeypatch, sample
             to_chinese=False,
             timeout_seconds=30.0,
             transport=None,
+            **_kwargs,
         ):
             nonlocal calls
             calls += 1
@@ -2320,6 +2326,7 @@ def test_yielded_edit_does_not_supersede_admitted_edit(monkeypatch, sample_db):
             to_chinese=False,
             timeout_seconds=30.0,
             transport=None,
+            **_kwargs,
         ):
             nonlocal calls
             calls += 1
@@ -2394,6 +2401,7 @@ def test_queue_rejected_edit_does_not_supersede_admitted_edit(monkeypatch, sampl
             to_chinese=False,
             timeout_seconds=30.0,
             transport=None,
+            **_kwargs,
         ):
             nonlocal calls
             calls += 1
@@ -2820,6 +2828,7 @@ def test_channel_edit_reloads_tracked_chunks_after_waiting_for_delivery_lock(
             to_chinese=False,
             timeout_seconds=30.0,
             transport=None,
+            **_kwargs,
         ):
             return next(responses)
 
@@ -3314,6 +3323,7 @@ def test_edit_waits_for_long_original_delivery_after_first_chunk_remembered(
             to_chinese=False,
             timeout_seconds=30.0,
             transport=None,
+            **_kwargs,
         ):
             calls.append(len(calls) + 1)
             if len(calls) == 1:

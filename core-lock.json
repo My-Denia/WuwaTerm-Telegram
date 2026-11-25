@@ -2,10 +2,10 @@
   "schema": 2,
   "kind": "github-release",
   "repository": "My-Denia/WuwaTerm",
-  "version": "0.12.0",
-  "filename": "wuwaterm-0.12.0-py3-none-any.whl",
-  "sha256": "b243fa064bc1090ecdabb70130775449c73fa53f85b6800cad72f889d43803ad",
-  "source_commit": "6fb4d8a44b26f170a7b1c8e23f00f75b2bbfd2b8",
-  "tag": "v0.12.0",
-  "url": "https://github.com/My-Denia/WuwaTerm/releases/download/v0.12.0/wuwaterm-0.12.0-py3-none-any.whl"
+  "version": "0.13.0",
+  "filename": "wuwaterm-0.13.0-py3-none-any.whl",
+  "sha256": "cdf7ee4444c115e21458cd70510c71a69403ea333cd0c123400f9b2268b4ed6c",
+  "source_commit": "e5b7f1a84d04deb5795296b1a652e13c4e9fd1a8",
+  "tag": "v0.13.0",
+  "url": "https://github.com/My-Denia/WuwaTerm/releases/download/v0.13.0/wuwaterm-0.13.0-py3-none-any.whl"
 }

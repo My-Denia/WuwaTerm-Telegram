@@ -1,11 +1,12 @@
 # `/review`: what it relies on in Core
 
-`/review` is built for Core 0.12.0 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
-`contracts/semantic-review-v1/`). All Core access is in `review_backend.py`;
-`core_compat.REVIEW_CORE_SYMBOLS` is the symbol list that
+`/review` is built for Core 0.13.0 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
+`contracts/semantic-review-v1/`); the review contract is the one Core 0.12.0
+introduced, and Core 0.13.0 leaves it unchanged. All Core access is in
+`review_backend.py`; `core_compat.REVIEW_CORE_SYMBOLS` is the symbol list that
 `verify_core_compatibility` requires at start-up.
 
-## What the adapter uses (checked against Core v0.12.0, commit 6fb4d8a4)
+## What the adapter uses (checked against Core v0.13.0, commit e5b7f1a8)
 
 - `semantic_review_async(service, translator, SemanticReviewJob, *, request_id,
   before_llm_call, offload, execution_budget)` returns a
@@ -26,9 +27,11 @@
   request.
 - `review_pair(..., review_version="review-v2")` for the dictionary track;
   `direction` is the language of the translation. The term findings come from
-  Core's `wuwaterm-cjk-matcher-v9` baseline (`Core v0.11.0+`), so single-character
-  CJK names are admitted only at plausible right boundaries and translation
-  reference admission and `review-v2` share the same matcher helper.
+  Core's CJK matcher (`wuwaterm-cjk-matcher-v9` through Core 0.12.0,
+  `wuwaterm-cjk-matcher-v10` on 0.13.0; only the revision label moved, the
+  admission decisions are the same), so single-character CJK names are
+  admitted only at plausible right boundaries and translation reference
+  admission and `review-v2` share the same matcher helper.
 - `/tr` & rich HTML: `translate_request_async` activates Core's single-segment
   `OperationExecutionBudget` (at most 2 upstream calls and 1 shared corrective
   slot across HTML-to-plain fallback, timeout fallback, and paragraph repair),
@@ -49,24 +52,42 @@
 - Telegram wrapper cleanup: the adapter, not Core, removes screenshot markers
   (version tags, spoiler labels, quote bars). Core `0.13.0` provides
   `wuwaterm.normalize.strip_telegram_wrapper_noise(..., keep_paragraphs=True)`
-  and stops deleting these markers during generic preparation; on the `0.12.0`
-  pin `core_compat.strip_telegram_wrapper_noise` degrades to
-  `normalize_user_text`, and the compatibility check requires the new symbol as
-  soon as `CORE_VERSION` reaches `WRAPPER_STRIP_CORE_VERSION`. `/tr` strips
-  whenever the request has no rendered HTML to preserve. Linked-channel posts
+  and stops deleting these markers during generic preparation. The pin is
+  `0.13.0`, so `verify_core_compatibility` requires the symbol at start-up;
+  `core_compat.strip_telegram_wrapper_noise` still degrades to
+  `normalize_user_text` for a Core older than `WRAPPER_STRIP_CORE_VERSION`,
+  which the compatibility check no longer accepts. `/tr` strips the plain text
+  Core reads (dictionary stage, automatic direction, size gate and plain
+  fallback) on every path; a rendered-HTML payload stays as written, because
+  Core's markup translator works on it alone. Linked-channel posts
   keep a second text, `pipeline_plain`: it is what the dictionary lookup, the
   direction check, the call reservation, the over-2,000-character split and
   every plain stage (plain-only post, the retry after a failed HTML attempt)
   use, while the HTML attempt is translated exactly as written, because
   stripping there would desync the markup its placeholders must be restored
-  into. The marker patterns on `0.12.0` are wider (`#spoilersafe`, `>50%`,
-  `#剧透警告 今汐` are stripped there), so those assertions are skipped on that
-  pin.
+  into. The marker patterns on `0.13.0` are narrower than on `0.12.0`: a
+  line-leading comparator (`>50% Energy Regen`) and a hashtag that only starts
+  with a marker word (`#spoilersafe ...`, `#剧透警告 今汐`) are content and
+  survive; `0.12.0` stripped them. The tests for these cases run on the pin
+  with no skip.
+- Automatic direction (Core 0.13.0): with no `--to`, Core reads the direction
+  from the normalized user text, and text containing CJK characters goes to
+  Chinese only when its Latin letters outnumber the CJK characters more than
+  four to one (`0.12.0` translated to English whenever any CJK character was
+  present). Wrapper markers left in the text count as Latin letters, so the
+  adapter strips them from the text Core reads (including a formatted
+  message's plain text), and linked-channel posts pass their own direction to
+  Core.
 
 Telegram `0.5.0` aligns `/tr`, `channel.py`, and `/review` with Core `0.12.0`'s
 `OperationExecutionBudget`, cancellation boundaries, and failure taxonomy while
 preserving Telegram's shared-pointer delivery, resend, and pre-send-only retry
 behavior (`0.4.1`).
+
+Telegram `0.6.0` moves the pin to Core `0.13.0`: the adapter owns the wrapper
+cleanup and the marker patterns are the narrower 0.13.0 ones (above), and
+automatic direction follows Core's new rule. No environment variable the bot
+reads changed.
 
 ## Not done
 

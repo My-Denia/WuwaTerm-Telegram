@@ -1924,18 +1924,16 @@ async def telegram_translation_reply(
     input_limit: int = LLM_INPUT_CHAR_LIMIT,
 ) -> TranslationReply:
     """Run the shared pipeline with the Telegram markup hook."""
-    # HTML-mode requests keep their markup verbatim: the wrapper strip would
-    # delete structural brackets the HTML pipeline relies on.
-    text = (
-        strip_telegram_wrapper_noise(request.text, keep_paragraphs=True)
-        if request.html is None
-        else request.text
-    )
+    # The wrapper is stripped from the plain text Core reads for the dictionary
+    # stage, the direction, the size gate and the plain fallback; Core 0.13.0
+    # no longer does it, and marker letters would tip the automatic direction.
+    # The HTML payload stays as written: the markup translator works on it
+    # alone, and stripping there would delete brackets its placeholders need.
     outcome = await translate_request_async(
         service,
         translator,
         TranslationJob(
-            text=text,
+            text=strip_telegram_wrapper_noise(request.text, keep_paragraphs=True),
             markup=request.html,
             forced_to_chinese=request.forced_to_chinese,
         ),
