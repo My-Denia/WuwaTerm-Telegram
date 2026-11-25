@@ -78,6 +78,7 @@ from wuwaterm_telegram.bot import (
 )
 from wuwaterm.lookup import TermService
 from wuwaterm_telegram.channel_runtime import ChannelRuntime
+from wuwaterm_telegram.core_compat import wrapper_strip_is_native
 from wuwaterm.sentence import (
     BUDGET_EXHAUSTED_NOTICE,
     LLMTranslationError,
@@ -745,6 +746,104 @@ def test_spoiler_spelling_and_version_tag_are_stripped(monkeypatch, sample_db):
 
     assert message.replies == [("这是一个测试。", None)]
     assert calls == [("这是一个测试。", ())]
+
+
+def test_telegram_tr_keeps_comparators_and_spoilersafe_hashtag(monkeypatch, sample_db):
+    # Core >= 0.13.0 narrows the marker patterns: a line-leading comparator and
+    # a hashtag that merely starts with "spoiler" are content, not wrapper
+    # noise. Core 0.12.0 still strips them, so this becomes mandatory with the
+    # 0.13.0 pin.
+    if not wrapper_strip_is_native():
+        pytest.skip("Core 0.12.0 marker patterns still strip these")
+    calls = []
+
+    async def fake_call(locked_text, _locks, **_kwargs):
+        calls.append((locked_text, ()))
+        return locked_text
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+    monkeypatch.setattr("wuwaterm.sentence._call_llm_async", fake_call)
+    for text in (">50% Energy Regen", "#spoilersafe Please do not reveal the ending."):
+        update, message = fake_update()
+        context = fake_context(sample_db, [text])
+        asyncio.run(term_command(update, context))
+        assert message.replies == [(text, None)]
+    assert calls == [
+        (">50% Energy Regen", ()),
+        ("#spoilersafe Please do not reveal the ending.", ()),
+    ]
+
+
+def test_telegram_translation_reply_strips_wrappers_on_the_plain_route_only(
+    monkeypatch, sample_db
+):
+    from wuwaterm.bot import TranslationRequest, telegram_translation_reply
+    from wuwaterm.lookup import TermService
+    from wuwaterm.sentence import SentenceTranslator
+
+    captured: list[tuple[str, bool]] = []
+
+    async def fake_call(
+        locked_text,
+        locks,
+        html_mode=False,
+        to_chinese=False,
+        timeout_seconds=45.0,
+        transport=None,
+        references=(),
+        **_kwargs,
+    ):
+        del locks, to_chinese, timeout_seconds, transport, references
+        captured.append((locked_text, html_mode))
+        return locked_text
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+    monkeypatch.setattr("wuwaterm.sentence._call_llm_async", fake_call)
+    service = TermService(sample_db)
+    translator = SentenceTranslator(sample_db)
+
+    # 1. HTML-mode requests bypass the wrapper strip so structural brackets and
+    #    the author's own markup reach the model unchanged.
+    html_reply = asyncio.run(
+        telegram_translation_reply(
+            service,
+            translator,
+            TranslationRequest(
+                text="[Wuthering Waves 3.7]\n\n[spoiler] 今汐登场",
+                html="<b>[Wuthering Waves 3.7]</b>\n\n[spoiler] 今汐登场",
+            ),
+        )
+    )
+    assert [html_mode for _text, html_mode in captured] == [True]
+    assert "Wuthering Waves 3.7" in html_reply.text
+    assert "[spoiler]" in html_reply.text
+
+    # 2. The plain route strips the wrapper markers; both paragraphs survive
+    #    (Core's preparation collapses the blank line afterwards, which is the
+    #    shared pipeline's business, not the wrapper strip's).
+    captured.clear()
+    plain_reply = asyncio.run(
+        telegram_translation_reply(
+            service,
+            translator,
+            TranslationRequest(
+                text="[Wuthering Waves 3.7]\n[spoiler]\n> 今汐登场\n\n> 声骸很强",
+                html=None,
+            ),
+        )
+    )
+    assert [html_mode for _text, html_mode in captured] == [False]
+    plain = captured[0][0]
+    assert "Wuthering Waves" not in plain
+    assert "spoiler" not in plain.casefold()
+    assert not plain.lstrip().startswith(">")
+    assert "今汐登场" in plain
+    assert "声骸很强" in plain
+    assert "Wuthering Waves" not in plain_reply.text
 
 
 def test_stylized_unicode_cartethyia_matches_ascii(sample_db):

@@ -46,6 +46,22 @@
   an answer is regrouped into the source's paragraphs only when neither appears,
   so a distant merge-and-split that shifts a line across a paragraph boundary is
   refused, and the model's own blank lines are kept (`MY-359`).
+- Telegram wrapper cleanup: the adapter, not Core, removes screenshot markers
+  (version tags, spoiler labels, quote bars). Core `0.13.0` provides
+  `wuwaterm.normalize.strip_telegram_wrapper_noise(..., keep_paragraphs=True)`
+  and stops deleting these markers during generic preparation; on the `0.12.0`
+  pin `core_compat.strip_telegram_wrapper_noise` degrades to
+  `normalize_user_text`, and the compatibility check requires the new symbol as
+  soon as `CORE_VERSION` reaches `WRAPPER_STRIP_CORE_VERSION`. `/tr` strips
+  whenever the request has no rendered HTML to preserve. Linked-channel posts
+  keep a second text, `pipeline_plain`: it is what the dictionary lookup, the
+  direction check, the call reservation, the over-2,000-character split and
+  every plain stage (plain-only post, the retry after a failed HTML attempt)
+  use, while the HTML attempt is translated exactly as written, because
+  stripping there would desync the markup its placeholders must be restored
+  into. The marker patterns on `0.12.0` are wider (`#spoilersafe`, `>50%`,
+  `#剧透警告 今汐` are stripped there), so those assertions are skipped on that
+  pin.
 
 Telegram `0.5.0` aligns `/tr`, `channel.py`, and `/review` with Core `0.12.0`'s
 `OperationExecutionBudget`, cancellation boundaries, and failure taxonomy while
