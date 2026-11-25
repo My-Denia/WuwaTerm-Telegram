@@ -116,6 +116,7 @@ class TermFinding:
     source_span: Span
     target_span: Span | None
     candidates: tuple[tuple[str, str], ...] = ()  # (zh, en)
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,7 @@ class ReviewReport:
     segments_reviewed: int = 0
     segments_total: int = 0  # ready pairs
     stopped_code: str | None = None  # rate_limited | llm_budget_exhausted | ...
+    term_truncated: bool = False
 
     @property
     def manual_split_pairs(self) -> tuple[PairInfo, ...]:
@@ -187,6 +189,10 @@ class ReviewReport:
     @property
     def needs_review(self) -> tuple[TermFinding, ...]:
         return tuple(f for f in self.term_findings if f.verdict == VERDICT_NEEDS_REVIEW)
+
+    @property
+    def not_evaluated(self) -> tuple[TermFinding, ...]:
+        return tuple(f for f in self.term_findings if f.verdict == VERDICT_NOT_EVALUATED)
 
     @property
     def omitted_issues(self) -> int:

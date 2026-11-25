@@ -18,6 +18,7 @@ from wuwaterm_telegram.review_model import (
     PAIR_NEEDS_MANUAL_SPLIT,
     PAIR_READY,
     SEMANTIC_DONE,
+    VERDICT_NOT_EVALUATED,
     PairInfo,
 )
 
@@ -68,6 +69,17 @@ def test_the_dictionary_track_runs_on_the_real_core(sample_db):
     (finding,) = off.findings
     assert finding.verdict == "needs_review" and finding.candidates == (("今汐", "Jinhsi"),)
     assert (finding.source_span.start, finding.source_span.end) == (0, 2)
+
+
+def test_real_core_not_evaluated_ambiguous_repeat_is_preserved(sample_db):
+    backend = live(sample_db)
+    outcome = asyncio.run(backend.term_review("今汐和今汐都来了。", "Jinhsi arrived.", "en"))
+    assert outcome.verified == 0
+    assert len(outcome.findings) == 2
+    assert all(f.verdict == VERDICT_NOT_EVALUATED for f in outcome.findings)
+    assert all(f.reason == "ambiguous_repeat" for f in outcome.findings)
+    assert [f.source_span.text for f in outcome.findings] == ["今汐", "今汐"]
+    assert outcome.truncated is False
 
 
 def test_direction_is_the_language_of_the_translation():

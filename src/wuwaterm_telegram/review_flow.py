@@ -121,6 +121,8 @@ async def run_review(
             report.term_track_error = exc.code
             break
         verified += term.verified
+        if getattr(term, "truncated", False):
+            report.term_truncated = True
         for item in term.findings:
             findings.append(
                 TermFinding(
@@ -128,6 +130,7 @@ async def run_review(
                     source_span=_shift(item.source_span, pair.source_core_start),
                     target_span=_shift(item.target_span, pair.target_core_start),
                     candidates=item.candidates,
+                    reason=getattr(item, "reason", None),
                 )
             )
     report.term_findings = tuple(findings)
