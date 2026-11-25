@@ -405,7 +405,7 @@ def test_long_tr_keeps_the_senders_blank_lines_and_adds_none(monkeypatch, sample
     calls = []
 
     async def fake_call(locked_text, locks, html_mode=False, to_chinese=False, timeout_seconds=45.0,
-                        transport=None, references=()):
+                        transport=None, references=(), **_kwargs):
         calls.append(locked_text)
         return f"part-{len(calls)}"
 

@@ -10,13 +10,15 @@ import re
 import sqlite3
 
 
-CORE_VERSION = "0.12.0"
+CORE_VERSION = "0.13.0"
 DATABASE_SCHEMA_VERSION = "2"
 # Core #318 moved Telegram wrapper cleanup out of generic text preparation into
 # `wuwaterm.normalize.strip_telegram_wrapper_noise` and stopped `prepare_text`
-# from deleting screenshot markers. Core 0.12.0 still folds that cleanup into
-# `normalize_user_text`, so the adapter resolves whichever symbol exists and
-# keeps working on both; the symbol becomes mandatory with the 0.13.0 pin.
+# from deleting screenshot markers. Core 0.12.0 folded that cleanup into
+# `normalize_user_text`. The pin is now 0.13.0, so the symbol is mandatory:
+# `verify_core_compatibility` refuses a Core without it, and the
+# `normalize_user_text` branch in `strip_telegram_wrapper_noise` only serves a
+# Core older than this version.
 WRAPPER_STRIP_CORE_VERSION = "0.13.0"
 
 _PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n+")
@@ -55,7 +57,7 @@ def strip_telegram_wrapper_noise(value: str, *, keep_paragraphs: bool = False) -
     labels (`[spoiler]`), and quote bars are screenshot furniture, not content.
     Core >= 0.13.0 exposes the cleanup as its own function; Core 0.12.0 only
     strips the same markers inside `normalize_user_text`, so that is the
-    fallback until the pin moves.
+    fallback for a Core older than `WRAPPER_STRIP_CORE_VERSION`.
     """
     try:
         normalize = import_module("wuwaterm.normalize")
@@ -77,7 +79,8 @@ def strip_telegram_wrapper_noise(value: str, *, keep_paragraphs: bool = False) -
     return "\n\n".join(part for part in parts if part)
 
 
-# What `/review` needs from Core 0.12.0 (semantic-review-v1, segmentation-v1).
+# What `/review` needs from the pinned Core (semantic-review-v1, segmentation-v1,
+# present since Core 0.12.0).
 # `verify_core_compatibility` requires all of them: the adapter is built for
 # exactly this Core. Whether the model track is *on* is a separate, run-time
 # matter (`semantic_review_enabled()` and a configured model).

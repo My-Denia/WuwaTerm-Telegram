@@ -2,10 +2,10 @@
 
 Core #318 stopped deleting screenshot markers inside generic text preparation
 and exposes `wuwaterm.normalize.strip_telegram_wrapper_noise` instead, so the
-adapter has to own the cleanup. Core 0.12.0 still folds it into
-`normalize_user_text` with wider marker patterns; the assertions that depend on
-the narrower 0.13.0 patterns are skipped there and become mandatory with the
-0.13.0 pin.
+adapter has to own the cleanup. Core 0.12.0 folded it into
+`normalize_user_text` with wider marker patterns. The pin is Core 0.13.0, so
+every assertion here runs against the narrower 0.13.0 patterns and none is
+conditional on the installed Core.
 """
 from __future__ import annotations
 
@@ -19,15 +19,6 @@ from wuwaterm_telegram.core_compat import (
     strip_telegram_wrapper_noise,
     verify_core_compatibility,
     wrapper_strip_is_native,
-)
-
-
-requires_native_strip = pytest.mark.skipif(
-    not wrapper_strip_is_native(),
-    reason=(
-        "Core 0.12.0 strips markers through normalize_user_text with wider "
-        "patterns; prose preservation arrives with the 0.13.0 pin"
-    ),
 )
 
 
@@ -84,7 +75,6 @@ def test_legacy_core_fallback_also_keeps_paragraphs(monkeypatch):
     assert strip_telegram_wrapper_noise(wrapped) == "第一段\n第二段"
 
 
-@requires_native_strip
 def test_prose_that_only_looks_like_a_marker_is_preserved():
     cases = [
         ">50% Energy Regen",
@@ -104,19 +94,18 @@ def test_version_compare_gates_the_symbol_requirement():
     assert not core_compat._version_at_least("0.9.0", "0.13.0")
 
 
-def test_wrapper_strip_symbol_is_required_once_the_pin_reaches_core_013(monkeypatch):
-    monkeypatch.setattr(core_compat, "CORE_VERSION", "0.13.0")
-    monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "0.13.0")
-    if wrapper_strip_is_native():
-        # An installed 0.13.0 Core satisfies the requirement outright.
-        verify_core_compatibility()
-        return
-    with pytest.raises(CoreCompatibilityError):
-        verify_core_compatibility()
-
-
-def test_wrapper_strip_symbol_is_optional_on_the_core_012_pin():
-    assert core_compat.CORE_VERSION == "0.12.0"
-    if wrapper_strip_is_native():
-        pytest.skip("installed Core already ships the 0.13.0 symbol")
+def test_pinned_core_ships_the_native_wrapper_strip_symbol():
+    assert core_compat._version_at_least(
+        core_compat.CORE_VERSION, core_compat.WRAPPER_STRIP_CORE_VERSION
+    )
+    assert wrapper_strip_is_native()
     verify_core_compatibility()
+
+
+def test_missing_wrapper_strip_symbol_fails_compatibility(monkeypatch):
+    normalize = importlib.import_module("wuwaterm.normalize")
+    monkeypatch.delattr(normalize, "strip_telegram_wrapper_noise")
+    assert not wrapper_strip_is_native()
+    with pytest.raises(CoreCompatibilityError) as raised:
+        verify_core_compatibility()
+    assert "strip_telegram_wrapper_noise" in str(raised.value.__cause__)

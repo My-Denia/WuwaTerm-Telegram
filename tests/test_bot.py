@@ -78,7 +78,6 @@ from wuwaterm_telegram.bot import (
 )
 from wuwaterm.lookup import TermService
 from wuwaterm_telegram.channel_runtime import ChannelRuntime
-from wuwaterm_telegram.core_compat import wrapper_strip_is_native
 from wuwaterm.sentence import (
     BUDGET_EXHAUSTED_NOTICE,
     LLMTranslationError,
@@ -323,6 +322,7 @@ def enable_mock_llm(monkeypatch, calls, response_factory):
         timeout_seconds=30.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append((locked_text, locks))
         if len(inspect.signature(response_factory).parameters) >= 3:
@@ -475,6 +475,7 @@ def test_group_html_reply_missing_target_then_parse_error_falls_back_plain(
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         assert html_mode is True
         return html_with_segments(
@@ -683,6 +684,7 @@ def test_term_command_budget_exhaustion_returns_clean_bot_reply(monkeypatch, sam
         to_chinese=False,
         timeout_seconds=30.0,
         transport=None,
+        **_kwargs,
     ):
         raise _llm_error_from_response(
             httpx.Response(429, text='{"error":"max_budget exceeded"}')
@@ -751,10 +753,7 @@ def test_spoiler_spelling_and_version_tag_are_stripped(monkeypatch, sample_db):
 def test_telegram_tr_keeps_comparators_and_spoilersafe_hashtag(monkeypatch, sample_db):
     # Core >= 0.13.0 narrows the marker patterns: a line-leading comparator and
     # a hashtag that merely starts with "spoiler" are content, not wrapper
-    # noise. Core 0.12.0 still strips them, so this becomes mandatory with the
-    # 0.13.0 pin.
-    if not wrapper_strip_is_native():
-        pytest.skip("Core 0.12.0 marker patterns still strip these")
+    # noise.
     calls = []
 
     async def fake_call(locked_text, _locks, **_kwargs):
@@ -897,6 +896,7 @@ def test_tr_auto_chinese_sentence_defaults_to_english(monkeypatch, sample_db):
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return (
@@ -928,6 +928,7 @@ def test_tr_auto_english_sentence_defaults_to_chinese(monkeypatch, sample_db):
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return (
@@ -959,6 +960,7 @@ def test_tr_to_en_flag_forces_english(monkeypatch, sample_db):
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return (
@@ -990,6 +992,7 @@ def test_tr_short_to_zh_flag_forces_chinese(monkeypatch, sample_db):
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return (
@@ -1021,6 +1024,7 @@ def test_sentence_direction_flag_uses_same_parser(monkeypatch, sample_db):
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return (
@@ -1053,6 +1057,7 @@ def test_invalid_direction_returns_usage_without_llm_or_rate_hit(
         to_chinese=False,
         timeout_seconds=45.0,
         transport=None,
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return "should not be used"
@@ -1088,6 +1093,7 @@ def test_duplicate_direction_returns_usage_without_llm(monkeypatch, sample_db):
         to_chinese=False,
         timeout_seconds=45.0,
         transport=None,
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return "should not be used"
@@ -1149,6 +1155,7 @@ def test_forced_direction_reply_to_message(monkeypatch, sample_db):
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return (
@@ -1181,6 +1188,7 @@ def test_forced_direction_exact_hit_does_not_call_llm(monkeypatch, sample_db):
         to_chinese=False,
         timeout_seconds=45.0,
         transport=None,
+        **_kwargs,
     ):
         calls.append(to_chinese)
         return "should not be used"
@@ -1217,6 +1225,7 @@ def test_slow_llm_does_not_block_control_commands_or_other_chat(
             timeout_seconds=30.0,
             transport=None,
             references=(),
+            **_kwargs,
         ):
             started.set()
             await release.wait()
@@ -1295,6 +1304,7 @@ def test_public_mode_reply_is_skipped_if_public_closes_during_llm(
             timeout_seconds=30.0,
             transport=None,
             references=(),
+            **_kwargs,
         ):
             started.set()
             await release.wait()
@@ -1350,6 +1360,7 @@ def test_group_reply_is_skipped_if_chat_revoked_during_llm(monkeypatch, sample_d
             timeout_seconds=30.0,
             transport=None,
             references=(),
+            **_kwargs,
         ):
             started.set()
             await release.wait()
@@ -1400,6 +1411,7 @@ def test_llm_concurrency_limit_bounds_inflight_calls(monkeypatch, sample_db):
             timeout_seconds=30.0,
             transport=None,
             references=(),
+            **_kwargs,
         ):
             nonlocal in_flight, max_in_flight
             in_flight += 1
@@ -1475,6 +1487,7 @@ def test_group_owner_bypasses_member_status_rate_limit_and_2000_input(
         to_chinese=False,
         timeout_seconds=45.0,
         transport=None,
+        **_kwargs,
     ):
         calls.append(_locked_text)
         return f"owner-chunk-{len(calls)}"
@@ -1512,6 +1525,7 @@ def test_group_admin_bypasses_rate_limit_and_2000_input(monkeypatch, sample_db):
         to_chinese=False,
         timeout_seconds=45.0,
         transport=None,
+        **_kwargs,
     ):
         calls.append(_locked_text)
         return f"admin-chunk-{len(calls)}"
@@ -3054,6 +3068,7 @@ def test_tr_reply_to_formatted_message_preserves_html(monkeypatch, sample_db):
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         calls.append((html_mode, to_chinese))
         jinhsi = placeholder_for(locks, "Jinhsi", references, to_chinese=to_chinese)
@@ -3086,6 +3101,43 @@ def test_tr_reply_to_formatted_message_preserves_html(monkeypatch, sample_db):
     assert message.reply_kwargs == [{"do_quote": False, "parse_mode": "HTML"}]
 
 
+def test_tr_formatted_reply_reads_direction_without_wrapper_markers(
+    monkeypatch, sample_db
+):
+    # Core >= 0.13.0 reads the automatic direction from the request text, and
+    # Latin marker letters outweigh a short Chinese message: unstripped,
+    # "[Wuthering Waves 3.7] 你好吗" would resolve to Chinese. The wrapper is
+    # stripped from the text Core reads; the HTML payload stays as written.
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+    calls = []
+
+    async def fake_call(locked_text, locks, html_mode=False, to_chinese=False, **_kwargs):
+        calls.append((html_mode, to_chinese, locked_text))
+        placeholders = re.findall(r"__WUWA_HTML_[0-9a-f]{16}_[0-9]{4}__", locked_text)
+        return html_with_segments(
+            locked_text, "", "[Wuthering Waves 3.7]", " How are you", *[""] * (len(placeholders) - 2)
+        )
+
+    monkeypatch.setattr("wuwaterm.sentence._call_llm_async", fake_call)
+    replied = SimpleNamespace(
+        text="[Wuthering Waves 3.7] 你好吗",
+        caption=None,
+        text_html="<b>[Wuthering Waves 3.7]</b> 你好吗",
+        caption_html=None,
+        entities=[SimpleNamespace(type="bold")],
+    )
+    update, message = fake_update(reply_to=replied)
+    context = fake_context(sample_db, [])
+
+    asyncio.run(term_command(update, context))
+
+    assert [(html_mode, to_chinese) for html_mode, to_chinese, _ in calls] == [(True, False)]
+    assert "[Wuthering Waves 3.7]" in calls[0][2]
+    assert message.reply_kwargs == [{"do_quote": False, "parse_mode": "HTML"}]
+
+
 def test_sentence_reply_to_formatted_caption_preserves_html(monkeypatch, sample_db):
     monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
     monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
@@ -3099,6 +3151,7 @@ def test_sentence_reply_to_formatted_caption_preserves_html(monkeypatch, sample_
         timeout_seconds=45.0,
         transport=None,
         references=(),
+        **_kwargs,
     ):
         assert html_mode is True
         assert to_chinese is False
@@ -3181,6 +3234,7 @@ def test_formatted_reply_structural_drift_falls_back_to_plain(monkeypatch, sampl
         to_chinese=False,
         timeout_seconds=45.0,
         transport=None,
+        **_kwargs,
     ):
         modes.append(html_mode)
         if html_mode:

@@ -1,7 +1,7 @@
 """The only place that touches Core for `/review`.
 
 Everything `/review` needs from Core goes through `ReviewBackend`. The live
-implementation calls Core 0.12.0 (`semantic_review_async`, segmentation-v1,
+implementation calls the pinned Core (`semantic_review_async`, segmentation-v1,
 `review_pair`, `OperationExecutionBudget`); tests drive the same flow with a
 fake backend.
 

@@ -1,4 +1,4 @@
-"""Integration tests against real Core 0.12.0 execution budgets & compat."""
+"""Integration tests against the real pinned Core: execution budgets (since 0.12.0) & compat."""
 
 from __future__ import annotations
 
@@ -160,8 +160,8 @@ def _mock_chat_completion(content: str) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
 
-def test_core_compat_verifies_core_012_symbols() -> None:
-    assert CORE_VERSION == "0.12.0"
+def test_core_compat_verifies_pinned_core_symbols() -> None:
+    assert CORE_VERSION == "0.13.0"
     verify_core_compatibility()
     assert missing_review_symbols() == ()
     assert callable(llm_transport.current_execution_budget)
