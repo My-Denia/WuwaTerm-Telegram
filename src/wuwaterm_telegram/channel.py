@@ -513,23 +513,25 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 text_len=safe_text_len(plain),
             )
             html_text = None
-        # Screenshot furniture (version tag, spoiler label, quote bars) is not
-        # content: strip it before the dictionary lookup, the length limit and
-        # the plain route. Core >= 0.13.0 no longer removes these markers
-        # during generic preparation, so the adapter owns the cleanup. The
-        # HTML payload keeps its own markup.
-        stripped_plain = strip_telegram_wrapper_noise(plain, keep_paragraphs=True)
-        if html_text is None:
-            plain = stripped_plain
+        # Telegram wrapper markers (version tags, spoiler labels, quote bars)
+        # are screenshot furniture, not content. Core 0.13.0 keeps prose
+        # verbatim, so the adapter removes them here, once, for every plain
+        # stage: the dictionary lookup, the plain-only post, the plain retry
+        # after a failed HTML attempt, and the over-2,000-character split. The
+        # call reservation and the chunking below read this same text. The HTML
+        # attempt keeps ``html_text`` as written because stripping would desync
+        # the markup it has to restore placeholders into.
+        pipeline_plain = strip_telegram_wrapper_noise(plain, keep_paragraphs=True)
         # Direction by script: enough Chinese -> translate to English (default);
         # no Chinese but enough Latin letters -> translate to Chinese. Anything
         # else (emoji / links / numbers only) is not worth translating -> skip.
-        # Judge the stripped text so a version tag's Latin letters cannot flip
-        # a short Chinese post to the wrong direction.
-        cjk = count_cjk(stripped_plain)
+        # Markers are judged out too: "[Wuthering Waves 3.7]" alone carries
+        # enough Latin letters for the to_zh branch, and "剧透" in a label is
+        # enough to send English content to English.
+        cjk = count_cjk(pipeline_plain)
         if cjk >= config.channel_min_cjk:
             to_chinese = False
-        elif cjk == 0 and count_latin(stripped_plain) >= config.channel_min_latin:
+        elif cjk == 0 and count_latin(pipeline_plain) >= config.channel_min_latin:
             to_chinese = True
         else:
             # Free check: no LLM call and no throttle consumption.
@@ -557,7 +559,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
         service: TermService = context.application.bot_data[SERVICE_KEY]
-        lookup_result = service.lookup_exact(plain)
+        lookup_result = service.lookup_exact(pipeline_plain)
         official = None
         if lookup_result.exact and lookup_result.best:
             official = (
@@ -631,16 +633,16 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # fallback token is only reserved when the budget allows it and the
         # fallback only runs when its token was actually reserved. The plain
         # routes need exactly one call per chunk.
-        if len(plain) <= LLM_INPUT_CHAR_LIMIT:
+        if len(pipeline_plain) <= LLM_INPUT_CHAR_LIMIT:
             required_calls = (
                 min(2, runtime.llm_calls_per_minute) if html_text else 1
             )
         else:
             required_calls = len(
-                split_telegram_text(plain, limit=LLM_INPUT_CHAR_LIMIT)
+                split_telegram_text(pipeline_plain, limit=LLM_INPUT_CHAR_LIMIT)
             )
         allow_plain_fallback = (
-            len(plain) <= LLM_INPUT_CHAR_LIMIT
+            len(pipeline_plain) <= LLM_INPUT_CHAR_LIMIT
             and bool(html_text)
             and required_calls >= 2
         )
@@ -773,7 +775,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         translated_mode,
                     ) = await _translate_channel_input(
                         translator,
-                        plain,
+                        pipeline_plain,
                         html_text,
                         to_chinese=to_chinese,
                         before_llm_call=mark_channel_llm_call_started,
