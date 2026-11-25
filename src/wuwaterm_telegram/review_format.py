@@ -20,6 +20,7 @@ from wuwaterm_telegram.review_model import (
     SEMANTIC_UNAVAILABLE,
     VERDICT_CONFLICT,
     VERDICT_NEEDS_REVIEW,
+    VERDICT_NOT_EVALUATED,
     ReviewReport,
     SemanticIssue,
     Span,
@@ -50,6 +51,13 @@ _EFFECT_HINTS = {
 
 _NO_ISSUES = "未发现疑点。这只说明模型没有报告问题，不代表译文完全正确。"
 _UNAVAILABLE_DEFAULT = "语义疑点未开启，本次只做词典术语检查。"
+_NOT_EVALUATED_REASONS = {
+    "ambiguous_repeat": "原文多次出现，无法安全确定对应关系",
+    "no_target_region": "缺少可对应的译文范围",
+    "found_outside_region": "仅在对应范围外找到",
+    "ordinary_word": "词库标注为普通词，未按术语强制要求",
+    "not_a_term": "已标为不是术语",
+}
 
 _EXCERPT_UNITS = 200
 _SPAN_UNITS = 60
@@ -164,11 +172,15 @@ def _term_line(finding: TermFinding) -> str:
     target = ""
     if finding.target_span is not None and finding.target_span.text.strip():
         target = f" 译文为{_quote(_clip(finding.target_span.text, _SPAN_UNITS))}"
+    forms = "；".join(
+        f"{_clip(zh, _SPAN_UNITS)} / {_clip(en, _SPAN_UNITS)}"
+        for zh, en in finding.candidates[:2]
+    )
+    if finding.verdict == VERDICT_NOT_EVALUATED:
+        reason_label = _NOT_EVALUATED_REASONS.get(finding.reason or "", "未按术语自动判定")
+        ref = f"，参考：{forms}" if forms else ""
+        return f"· 原文{source}无法判断（{_clip(reason_label, _NOTE_UNITS)}{ref}）{target}"
     if finding.verdict == VERDICT_CONFLICT:
-        forms = "；".join(
-            f"{_clip(zh, _SPAN_UNITS)} / {_clip(en, _SPAN_UNITS)}"
-            for zh, en in finding.candidates[:2]
-        )
         official = f"，官方：{forms}" if forms else ""
         return f"· 原文{source}与官方译名不一致{official}{target}"
     return f"· 原文{source}需核对{target}"
@@ -203,7 +215,12 @@ def summary_line(report: ReviewReport) -> str:
     parts = [f"{_direction_text(report)}，共 {_segment_total(report)} 段"]
     if report.semantic_state in (SEMANTIC_STOPPED, SEMANTIC_PARTIAL):
         parts.append(f"已审 {report.segments_reviewed}/{report.segments_total} 段")
-    parts.append(f"术语发现 {_term_counts(report)} 处")
+    term_part = f"术语发现 {_term_counts(report)} 处"
+    if report.not_evaluated:
+        term_part += f"，无法判断 {len(report.not_evaluated)} 处"
+    if report.term_truncated:
+        term_part += "（结果已截断）"
+    parts.append(term_part)
     if report.semantic_state == SEMANTIC_UNAVAILABLE:
         parts.append("语义疑点未运行")
     else:
@@ -221,7 +238,12 @@ def _overview_block(report: ReviewReport) -> str:
     ]
     if report.semantic_state in (SEMANTIC_STOPPED, SEMANTIC_PARTIAL):
         lines.append(f"已审 {report.segments_reviewed}/{report.segments_total} 段")
-    lines.append(f"术语发现 {_term_counts(report)} 处")
+    term_line = f"术语发现 {_term_counts(report)} 处"
+    if report.not_evaluated:
+        term_line += f"；无法判断 {len(report.not_evaluated)} 处"
+    if report.term_truncated:
+        term_line += "（结果已截断）"
+    lines.append(term_line)
     if report.semantic_state == SEMANTIC_UNAVAILABLE:
         lines.append("语义疑点：未运行")
     else:
@@ -233,11 +255,17 @@ def _overview_block(report: ReviewReport) -> str:
 
 def _term_blocks(report: ReviewReport) -> list[str]:
     title = "<b>术语（词典，确定性）</b>"
-    shown = [
+    actionable = [
         f
         for f in report.term_findings
         if f.verdict in (VERDICT_CONFLICT, VERDICT_NEEDS_REVIEW)
     ]
+    unassessed = [
+        f
+        for f in report.term_findings
+        if f.verdict == VERDICT_NOT_EVALUATED
+    ]
+    shown = actionable + unassessed
     lines = [_term_line(f) for f in shown[:_MAX_TERM_LINES]]
     if len(shown) > _MAX_TERM_LINES:
         lines.append(f"· 另有 {len(shown) - _MAX_TERM_LINES} 处未显示")
@@ -246,8 +274,17 @@ def _term_blocks(report: ReviewReport) -> list[str]:
         tail.append(f"术语检查未完成（{_clip(report.term_track_error, _NOTE_UNITS)}）")
     elif report.segments_total == 0:
         tail.append("未检查：没有可审校的段落。")
-    elif not shown:
-        tail.append("词典没有发现需要处理的术语问题。")
+    elif not actionable and not unassessed:
+        if report.term_truncated:
+            tail.append("术语结果已截断，仅展示部分发现。")
+        else:
+            tail.append("词典没有发现需要处理的术语问题。")
+    elif not actionable and unassessed:
+        tail.append(
+            f"词典未发现明确冲突或缺失，但有 {len(unassessed)} 处无法自动判断，请人工核对。"
+        )
+    if report.term_truncated and shown:
+        tail.append("术语结果已截断，仅展示部分发现。")
     tail.append(
         f"词面匹配 {report.term_matches_verified} 处"
         "（仅表示出现了官方形式，不等于词义确认）"

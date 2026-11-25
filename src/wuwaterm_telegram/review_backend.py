@@ -41,7 +41,6 @@ from .review_model import (
     PairInfo,
     Span,
     TermFinding,
-    VERDICT_NOT_EVALUATED,
     VERDICT_VERIFIED,
 )
 
@@ -70,6 +69,7 @@ class TermReview:
 
     findings: tuple[TermFinding, ...] = ()
     verified: int = 0
+    truncated: bool = False
 
 
 class ReviewBackend(Protocol):
@@ -192,8 +192,6 @@ class LiveReviewBackend:
             if item.verdict == VERDICT_VERIFIED:
                 verified += 1
                 continue
-            if item.verdict == VERDICT_NOT_EVALUATED:
-                continue
             target_span = item.target_span
             findings.append(
                 TermFinding(
@@ -210,9 +208,14 @@ class LiveReviewBackend:
                         (candidate.zh, candidate.en)
                         for candidate in item.candidates[:_MAX_CANDIDATES_SHOWN]
                     ),
+                    reason=getattr(item, "reason", None),
                 )
             )
-        return TermReview(tuple(findings), verified)
+        return TermReview(
+            tuple(findings),
+            verified,
+            truncated=bool(getattr(report, "truncated", False)),
+        )
 
     # --- semantic track ---------------------------------------------------
 

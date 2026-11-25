@@ -10,6 +10,8 @@ from wuwaterm_telegram.review_format import (
 )
 from wuwaterm_telegram.review_model import (
     CATEGORIES,
+    SEMANTIC_UNAVAILABLE,
+    VERDICT_NOT_EVALUATED,
     Alternative,
     PairInfo,
     ReviewReport,
@@ -293,3 +295,39 @@ def test_a_run_stopped_before_any_segment_makes_no_statement_about_issues():
                           segments_total=1, segments_reviewed=0, semantic_note="模型请求被限流")
     text = "\n".join(format_report(report))
     assert "已完成 0/1 段" in text and "未发现疑点" not in text
+
+
+def test_not_evaluated_and_truncated_are_not_hidden_as_zero_findings(sample_db):
+    import asyncio
+    from wuwaterm.application import TermService
+    from wuwaterm_telegram.review_backend import LiveReviewBackend
+    from wuwaterm_telegram.review_flow import run_review
+
+    backend = LiveReviewBackend(TermService(sample_db), object())
+    real_report = asyncio.run(run_review(backend, "今汐和今汐都来了。", "Jinhsi arrived.", "en"))
+    assert real_report.semantic_state == SEMANTIC_UNAVAILABLE
+    rendered = strip_telegram_html("\n\n".join(format_report(real_report)))
+    assert "无法判断 2 处" in rendered
+    assert "原文多次出现，无法安全确定对应关系" in rendered
+    assert "今汐 / Jinhsi" in rendered
+    assert "词典没有发现需要处理的术语问题。" not in rendered
+    assert "无法判断 2 处" in summary_line(real_report)
+
+    trunc = report(
+        term_findings=(
+            TermFinding(
+                VERDICT_NOT_EVALUATED,
+                Span(0, 2, "今汐"),
+                None,
+                (("今汐", "Jinhsi"),),
+                reason="no_target_region",
+            ),
+        ),
+        term_truncated=True,
+    )
+    trunc_text = strip_telegram_html("\n\n".join(format_report(trunc)))
+    assert "无法判断 1 处" in trunc_text
+    assert "缺少可对应的译文范围" in trunc_text
+    assert "术语结果已截断" in trunc_text
+    assert "词典没有发现需要处理的术语问题。" not in trunc_text
+    assert "（结果已截断）" in summary_line(trunc)
