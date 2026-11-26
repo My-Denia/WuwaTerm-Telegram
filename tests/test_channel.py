@@ -3738,3 +3738,36 @@ def test_channel_reply_index_save_failure_does_not_block_memory(tmp_path, caplog
     assert index.last_save_succeeded() is False
     assert "channel reply index save failed" in caplog.text
     assert "-2001" not in caplog.text
+
+
+def test_channel_full_wrapper_post_returns_early_without_reserving_llm_budget(
+    monkeypatch, sample_db, caplog
+):
+    from wuwaterm_telegram.channel import _channel_runtime
+
+    llm_calls = forbid_llm_call(monkeypatch)
+    # Use a 1-call/min budget and verify the full-wrapper post does not touch it
+    # even when channel_min_cjk/channel_min_latin are zeroed in Python config.
+    config = BotConfig(
+        rate_limit_per_minute=10,
+        owner_user_id=11,
+        channel_llm_calls_per_minute=1,
+        channel_min_cjk=0,
+        channel_min_latin=0,
+    )
+    update, message = channel_update(
+        text="[Wuthering Waves 3.7]\n[spoiler]\n【剧透】\n> \n| ",
+        text_html="<b>[Wuthering Waves 3.7]</b>\n[spoiler]\n【剧透】\n&gt; \n| ",
+        message_id=4999,
+    )
+    context = make_context(sample_db, config=config)
+    runtime = _channel_runtime(context, config)
+    before_remaining = runtime.budget_remaining()
+
+    with caplog.at_level(logging.INFO, logger="wuwaterm_telegram.channel"):
+        asyncio.run(channel_post_handler(update, context))
+
+    assert llm_calls == []
+    assert message.replies == []
+    assert runtime.budget_remaining() == before_remaining
+    assert "reason=language_threshold" in caplog.text

@@ -243,3 +243,18 @@ def test_the_job_and_the_store_keep_no_write_only_shortcut_state():
     """MY-338 (4): the newest-result helper and the job's keyboard id are gone."""
     assert not hasattr(ReviewJobStore, "latest_done")
     assert "keyboard_message_id" not in ReviewJob.__dataclass_fields__
+
+
+def test_my242_limits_and_user_id_none_never_collides():
+    store = ReviewJobStore()
+    assert store._ttl == 1800.0
+    assert store._max == 5
+
+    first = store.create(1, None, "甲", "a", "en")
+    assert store.find_owner_duplicate(1, first.content_key, None) is None
+    assert store.join_waiters(first, None, "u1") == WAITER_QUEUED
+    assert store.join_waiters(first, None, "u2") == WAITER_QUEUED
+    assert len(first.waiters) == 2
+
+    store.finish(first, report())
+    assert store.find_owner_duplicate(1, first.content_key, None) is None

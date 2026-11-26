@@ -529,9 +529,13 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # enough Latin letters for the to_zh branch, and "剧透" in a label is
         # enough to send English content to English.
         cjk = count_cjk(pipeline_plain)
-        if cjk >= config.channel_min_cjk:
+        if pipeline_plain and cjk >= config.channel_min_cjk:
             to_chinese = False
-        elif cjk == 0 and count_latin(pipeline_plain) >= config.channel_min_latin:
+        elif (
+            pipeline_plain
+            and cjk == 0
+            and count_latin(pipeline_plain) >= config.channel_min_latin
+        ):
             to_chinese = True
         else:
             # Free check: no LLM call and no throttle consumption.

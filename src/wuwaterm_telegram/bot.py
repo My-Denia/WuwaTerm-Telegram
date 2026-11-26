@@ -943,8 +943,22 @@ def _bad_request_is_missing_reply_target(exc: BadRequest) -> bool:
 
 def _bad_request_is_html_parse_error(exc: BadRequest) -> bool:
     message = str(exc).casefold()
-    return "parse" in message and (
-        "entity" in message or "entities" in message or "html" in message
+    if "parse" in message and (
+        "entity" in message
+        or "entities" in message
+        or "html" in message
+        or "tag" in message
+    ):
+        return True
+    return any(
+        needle in message
+        for needle in (
+            "find end of the entity",
+            "entity starting at byte offset",
+            "unsupported start tag",
+            "unexpected end tag",
+            "unclosed start tag",
+        )
     )
 
 

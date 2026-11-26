@@ -100,9 +100,10 @@ async def _member(chat_id, user_id):
 
 def update_for(message, *, user_id=OWNER, chat_type="private", query=None):
     chat = SimpleNamespace(id=CHAT, type=chat_type)
+    user = SimpleNamespace(id=user_id) if user_id is not None else None
     return SimpleNamespace(
         effective_message=message, effective_chat=chat,
-        effective_user=SimpleNamespace(id=user_id), callback_query=query,
+        effective_user=user, callback_query=query,
     )
 
 
@@ -1229,4 +1230,186 @@ def test_double_tapping_resend_sends_the_report_only_once(tmp_path):
     assert len(msg.sent) == 1 and job.delivered is True and job.delivering is False
     assert q1.answers == [(None, False)] and q2.answers == [(None, False)]
     assert len(backend.calls) == 1
+
+
+def test_back_to_summary_keeps_result_hint_footer(tmp_path):
+    context, _, job, kb = card_flow(tmp_path)
+    initial_text = review_bot.format_report(job.report, footer=review_bot.RESULT_HINT)[-1]
+    assert review_bot.RESULT_HINT in initial_text
+
+    press(context, f"rv:{job.id}:c:1", kb)
+    back = press(context, f"rv:{job.id}:s", kb)
+    assert back.answers == [(None, False)]
+    assert len(back.edits) == 1
+    edited_text, edited_kwargs = back.edits[0]
+    assert edited_text == initial_text
+    assert review_bot.RESULT_HINT in edited_text
+    assert edited_kwargs["parse_mode"] == "HTML"
+    assert edited_kwargs["reply_markup"] is not None
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Bad Request: can't find end of the entity starting at byte offset 5",
+        'Bad Request: unsupported start tag "div" at byte offset 0',
+        'Bad Request: unexpected end tag "b" at byte offset 4',
+    ],
+)
+def test_review_edit_falls_back_to_plain_on_html_parse_bad_request(error_message):
+    class ParseFailQuery(Query):
+        async def edit_message_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+            if kwargs.get("parse_mode") == "HTML":
+                raise BadRequest(error_message)
+
+    msg = Msg(10)
+    query = ParseFailQuery("rv:id:c:1", msg)
+    markup = review_bot.resend_keyboard(
+        review_bot.ReviewJob(
+            id="x", chat_id=CHAT, user_id=OWNER, source="a", target="b",
+            direction="en", content_key="k", created_at=0.0, report_created_at=0.0,
+        )
+    )
+    asyncio.run(review_bot._edit(update_for(msg, query=query), "<b>疑点</b> &amp; 说明", markup))
+
+    assert len(query.edits) == 2
+    assert query.edits[0][1]["parse_mode"] == "HTML"
+    assert query.edits[1] == ("疑点 & 说明", {"reply_markup": markup})
+
+
+def test_review_edit_ignores_not_modified_and_reraises_other_bad_request():
+    class NotModifiedQuery(Query):
+        async def edit_message_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+            raise BadRequest("Message is not modified")
+
+    class MissingQuery(Query):
+        async def edit_message_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+            raise BadRequest("Message to edit not found")
+
+    msg = Msg(10)
+    q_same = NotModifiedQuery("rv:id:c:1", msg)
+    asyncio.run(review_bot._edit(update_for(msg, query=q_same), "<b>ok</b>", None))
+    assert len(q_same.edits) == 1
+
+    q_missing = MissingQuery("rv:id:c:1", msg)
+    with pytest.raises(BadRequest, match="Message to edit not found"):
+        asyncio.run(review_bot._edit(update_for(msg, query=q_missing), "<b>ok</b>", None))
+    assert len(q_missing.edits) == 1
+
+
+def test_concurrent_callbacks_serialize_per_job_and_snapshot_revision(tmp_path):
+    context, _, job, _ = card_flow(tmp_path)
+    issue_key = job.report.issues[0].key
+    edit_entered = asyncio.Event()
+    release_edit = asyncio.Event()
+    recorded_edits: list[str] = []
+
+    class SlowEditQuery(Query):
+        async def edit_message_text(self, text, **kwargs):
+            if not edit_entered.is_set():
+                edit_entered.set()
+                await asyncio.wait_for(release_edit.wait(), 5)
+            recorded_edits.append(text)
+            await super().edit_message_text(text, **kwargs)
+
+    class RecordingQuery(Query):
+        async def edit_message_text(self, text, **kwargs):
+            recorded_edits.append(text)
+            await super().edit_message_text(text, **kwargs)
+
+    async def scenario():
+        msg = Msg(90)
+        q_accept = SlowEditQuery(f"rv:{job.id}:a:1", msg)
+        q_undo = RecordingQuery(f"rv:{job.id}:u:1", msg)
+        t_accept = asyncio.create_task(
+            review_bot.review_callback(update_for(msg, query=q_accept), context)
+        )
+        await asyncio.wait_for(edit_entered.wait(), 5)
+        t_undo = asyncio.create_task(
+            review_bot.review_callback(update_for(msg, query=q_undo), context)
+        )
+        await asyncio.sleep(0)
+        # While t_accept holds the lock inside _edit, t_undo has not mutated job.accepted yet.
+        assert issue_key in job.accepted
+        release_edit.set()
+        await asyncio.gather(t_accept, t_undo)
+        assert job.accepted == {}
+        assert "已采纳 ✅" in recorded_edits[0]
+        assert "待处理" in recorded_edits[1]
+
+        # Now verify _send_revision snapshots accepted_snapshot BEFORE any await:
+        # mutate job.accepted during query.answer() while _send_revision runs directly.
+        job.accepted[issue_key] = 0
+
+        class MutatingAnswerQuery(Query):
+            async def answer(self, text=None, show_alert=False):
+                await super().answer(text, show_alert)
+                job.accepted.pop(issue_key, None)
+
+        rev_msg = Msg(91)
+        q_rev = MutatingAnswerQuery(f"rv:{job.id}:f", rev_msg)
+        await review_bot._send_revision(update_for(rev_msg, query=q_rev), context, job)
+        return rev_msg
+
+    rev_msg = asyncio.run(scenario())
+    assert len(rev_msg.sent) == 1
+    body = rev_msg.sent[0][0]
+    assert "已采纳 1 条" in body
+    assert "this is right now" in body
+
+
+def test_user_id_none_never_collides_across_jobs_last_or_callbacks(tmp_path, monkeypatch):
+    from wuwaterm_telegram import bot as bot_mod
+    from wuwaterm_telegram.bot import TranslationActor
+
+    backend = FakeBackend(answer=lambda s, t: wire_response(s, t, find="wrong", replacement="right"))
+    context, store, settings = make_context(tmp_path, backend)
+    settings.set_public(CHAT, True)
+    group = dict(chat_type="supergroup")
+
+    def anon_msg(mid, text=None, *, fail_times=0):
+        m = Msg(mid, text)
+        m.sender_chat = SimpleNamespace(id=CHAT, type="supergroup")
+        m.fail_times = fail_times
+        return m
+
+    # Undelivered user_id=None job must not be handed to another user_id=None on /review last.
+    m1 = anon_msg(10, "/review 甲乙\n---\nthis is wrong", fail_times=2)
+    asyncio.run(review_bot.review_command(update_for(m1, user_id=None, **group), context))
+    first = newest_done(store)
+    assert first is not None and first.user_id is None and not first.delivered
+
+    m_last = anon_msg(20, "/review last")
+    asyncio.run(review_bot.review_command(update_for(m_last, user_id=None, **group), context))
+    assert texts(m_last) == [review_bot.NO_LAST_NOTICE]
+
+    # Deliver first job, then a second user_id=None submission gets its own job (not first's).
+    assert press(context, f"rv:{first.id}:d", Msg(21), user_id=OWNER, **group).answers == [(None, False)]
+    assert first.delivered
+    second_msg = anon_msg(22, "/review 甲乙\n---\nthis is wrong")
+    asyncio.run(review_bot.review_command(update_for(second_msg, user_id=None, **group), context))
+    _, second_job = job_from_markup(store, second_msg)
+    assert second_job is not None and second_job is not first
+    assert len(backend.calls) == 1
+
+    # Untrusted user_id=None callback cannot act on a user_id=None job or /tr record.
+    async def untrusted_actor(*_args, **_kwargs):
+        return TranslationActor("public_member", trusted=False, rate_limited=True)
+
+    monkeypatch.setattr(bot_mod, "_translation_actor", untrusted_actor)
+    denied_job = press(context, f"rv:{first.id}:a:1", Msg(23), user_id=None, **group)
+    assert denied_job.answers == [(review_bot.NOT_OWNER_TOAST, True)]
+    assert not first.accepted
+
+    tr_msg = Msg(24, "bot translation")
+    offer = review_bot.offer_translation_review(
+        update_for(tr_msg, user_id=None, **group),
+        context, source="甲乙", target="this is wrong", direction="en",
+    )
+    assert offer is not None
+    denied_tr = press(context, f"rv:{offer.record.id}:g", tr_msg, user_id=None, **group)
+    assert denied_tr.answers == [(review_bot.NOT_OWNER_TOAST, True)]
 

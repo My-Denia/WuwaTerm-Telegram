@@ -14,6 +14,7 @@ window on her own buttons.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
@@ -91,6 +92,9 @@ class ReviewJob:
     # Other requesters of the same content, served when this job finishes.
     waiters: list[Waiter] = field(default_factory=list)
     finished_at: float | None = None
+    lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False, compare=False
+    )
 
 
 class ReviewJobStore:
@@ -168,10 +172,13 @@ class ReviewJobStore:
         because those buttons are the job's: a requester who received a reused
         report late still keeps the full window on her own result.
         """
+        if user_id is None:
+            return None
         for job in reversed(self._live_jobs(chat_id)):
             if (
                 job.content_key == content_key
                 and job.state != STATE_FAILED
+                and job.user_id is not None
                 and job.user_id == user_id
             ):
                 return job
@@ -196,7 +203,10 @@ class ReviewJobStore:
         `WAITER_FULL`. `update` is her own submission; it is dropped by
         `drain_waiters` as soon as the job finishes.
         """
-        if any(waiter.user_id == user_id for waiter in job.waiters):
+        if user_id is not None and any(
+            waiter.user_id is not None and waiter.user_id == user_id
+            for waiter in job.waiters
+        ):
             return WAITER_ALREADY
         if len(job.waiters) >= self.waiter_limit:
             return WAITER_FULL

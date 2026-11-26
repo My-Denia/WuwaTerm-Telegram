@@ -4628,3 +4628,120 @@ def test_telegram_reply_renders_outcomes_at_the_adapter_seam():
     assert flagged_rich.parse_mode == "HTML"
     assert flagged_rich.text.endswith(DICT_MISS_FLAG)
     assert _telegram_text(TranslationOutcome(kind=KIND_LLM, text="x")) == "x"
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Bad Request: can't parse entities: Can't find end tag",
+        "Bad Request: can't find end of the entity starting at byte offset 12",
+        'Bad Request: unsupported start tag "foo" at byte offset 0',
+        'Bad Request: unexpected end tag "b" at byte offset 4',
+        'Bad Request: unclosed start tag "b" at byte offset 0',
+    ],
+)
+def test_bad_request_is_html_parse_error_matches_telegram_variants(
+    monkeypatch, sample_db, error_message
+):
+    from wuwaterm_telegram.bot import _bad_request_is_html_parse_error
+
+    assert _bad_request_is_html_parse_error(BadRequest(error_message)) is True
+
+    calls = []
+
+    def fail_html(_text, kwargs, _call_number):
+        calls.append(kwargs.get("parse_mode"))
+        if kwargs.get("parse_mode") == "HTML":
+            return BadRequest(error_message)
+        return None
+
+    update, message = fake_update(
+        chat_id=-2001,
+        chat_type="supergroup",
+        message_id=570,
+        reply_raises=fail_html,
+    )
+    asyncio.run(reply_to_user(update, "<b>今汐</b> &amp; 声骸", parse_mode="HTML"))
+
+    assert calls == ["HTML", None]
+    assert message.replies == [("今汐 & 声骸", 570)]
+    assert message.reply_kwargs == [
+        {"reply_to_message_id": 570, "parse_mode": "HTML"},
+        {"reply_to_message_id": 570},
+    ]
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Message to be replied not found",
+        "Message is too long",
+        "Message is not modified",
+        "Invalid reply markup",
+    ],
+)
+def test_bad_request_is_html_parse_error_ignores_non_parse_errors(error_message):
+    from wuwaterm_telegram.bot import _bad_request_is_html_parse_error
+
+    assert _bad_request_is_html_parse_error(BadRequest(error_message)) is False
+
+
+def test_tr_formatted_html_fallback_and_overlength_split_strip_wrapper_noise(
+    monkeypatch, sample_db
+):
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+    captured = []
+
+    async def fake_call(locked_text, _locks, html_mode=False, **_kwargs):
+        captured.append((locked_text, html_mode))
+        if html_mode:
+            return "<script>broken</script>"
+        return "Translated."
+
+    monkeypatch.setattr("wuwaterm.sentence._call_llm_async", fake_call)
+
+    # 1. HTML-mode failure falls back to plain text with wrapper markers stripped.
+    replied = SimpleNamespace(
+        text="[Wuthering Waves 3.7]\n[spoiler]\n> 这是一个需要翻译的句子。",
+        caption=None,
+        text_html="<b>[Wuthering Waves 3.7]</b>\n[spoiler]\n&gt; 这是一个需要翻译的句子。",
+        caption_html=None,
+        entities=[SimpleNamespace(type="bold")],
+    )
+    update, message = fake_update(reply_to=replied)
+    context = fake_context(sample_db, [])
+    asyncio.run(term_command(update, context))
+
+    assert [mode for _, mode in captured] == [True, False]
+    assert "Wuthering Waves" not in captured[1][0]
+    assert "spoiler" not in captured[1][0].casefold()
+    assert not captured[1][0].lstrip().startswith(">")
+    assert "这是一个需要翻译的句子。" in captured[1][0]
+    assert message.replies == [("Translated.", None)]
+
+    # 2. Over-length formatted message (> LLM_INPUT_CHAR_LIMIT) splits the
+    #    stripped text without sending wrapper markers to the LLM.
+    captured.clear()
+    body_a = "甲" * 1200
+    body_b = "乙" * 1200
+    long_replied = SimpleNamespace(
+        text=f"[Wuthering Waves 3.7]\n[spoiler]\n> {body_a}\n\n> {body_b}",
+        caption=None,
+        text_html=f"<b>[Wuthering Waves 3.7]</b>\n[spoiler]\n&gt; {body_a}\n\n&gt; {body_b}",
+        caption_html=None,
+        entities=[SimpleNamespace(type="bold")],
+    )
+    long_update, long_message = fake_update(
+        chat_id=-2001, chat_type="supergroup", message_id=810, user_id=42, reply_to=long_replied
+    )
+    long_context = fake_context(sample_db, [], member_status="administrator")
+    asyncio.run(term_command(long_update, long_context))
+
+    assert len(captured) == 2
+    assert all(not mode for _, mode in captured)
+    assert all("Wuthering Waves" not in text for text, _ in captured)
+    assert all("spoiler" not in text.casefold() for text, _ in captured)
+    assert all(not text.lstrip().startswith(">") for text, _ in captured)
+    assert long_message.replies == [("Translated.\n\nTranslated.", 810)]
