@@ -68,6 +68,7 @@ from .review_model import (
 )
 from .review_revise import RevisionError, check_accept, revise
 from .runtime_keys import REVIEW_BACKEND_KEY, REVIEW_STORE_KEY
+from .telegram_html import strip_telegram_html
 
 LOGGER = logging.getLogger(__name__)
 
@@ -387,9 +388,9 @@ async def _show_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_id = _user_id(update)
     # The requester's own result first; another member's only once it is in the
     # chat, because an unsent result belongs to whoever asked for it.
-    job = next((j for j in done if j.user_id == user_id), None) or next(
-        (j for j in done if j.delivered), None
-    )
+    job = next(
+        (j for j in done if user_id is not None and j.user_id == user_id), None
+    ) or next((j for j in done if j.delivered), None)
     if job is None or job.report is None:
         await b.reply_to_user(update, NO_LAST_NOTICE)
         return
@@ -956,7 +957,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if record is None:
             await query.answer(TR_EXPIRED_TOAST, show_alert=True)
             return
-        if not (actor.trusted or user_id == record.user_id):
+        if not (actor.trusted or (user_id is not None and user_id == record.user_id)):
             await query.answer(NOT_OWNER_TOAST, show_alert=True)
             return
         await query.answer()
@@ -969,7 +970,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if job is None or job.report is None:
         await query.answer(EXPIRED_TOAST, show_alert=True)
         return
-    if not (actor.trusted or user_id == job.user_id):
+    if not (actor.trusted or (user_id is not None and user_id == job.user_id)):
         await query.answer(NOT_OWNER_TOAST, show_alert=True)
         return
     report = job.report
@@ -981,46 +982,51 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if action == "d":  # send a stored result the chat never received
         await _resend_result(update, context, job)
         return
-    if action == "s":
-        await query.answer()
-        await _edit(update, format_report(report)[-1], summary_keyboard(job))
-        return
-    if action == "f":
-        await _send_revision(update, context, job)
-        return
-    if number is None or not 1 <= number <= total:
-        await query.answer(ACCEPT_REASONS["unknown_issue"], show_alert=True)
-        return
-    issue = report.issues[number - 1]
-    if action == "a" or action == "b":
-        choice = 0 if action == "a" else 1
-        reason = check_accept(report, job.accepted, issue.key, choice)
-        if reason is not None:
-            text = (
-                f"与第 {_issue_number(report, reason.split(':', 1)[1])} 条已采纳的修改范围重叠"
-                if reason.startswith("overlaps:")
-                else ACCEPT_REASONS.get(reason, STALE_TOAST)
+    async with job.lock:
+        if action == "s":
+            await query.answer()
+            await _edit(
+                update,
+                format_report(report, footer=RESULT_HINT)[-1],
+                summary_keyboard(job),
             )
-            await query.answer(text, show_alert=True)
             return
-        job.accepted[issue.key] = choice
-        job.skipped.discard(issue.key)
-    elif action == "u":
-        job.accepted.pop(issue.key, None)
-    elif action == "x":
-        if issue.key in job.skipped:
+        if action == "f":
+            await _send_revision(update, context, job)
+            return
+        if number is None or not 1 <= number <= total:
+            await query.answer(ACCEPT_REASONS["unknown_issue"], show_alert=True)
+            return
+        issue = report.issues[number - 1]
+        if action == "a" or action == "b":
+            choice = 0 if action == "a" else 1
+            reason = check_accept(report, job.accepted, issue.key, choice)
+            if reason is not None:
+                text = (
+                    f"与第 {_issue_number(report, reason.split(':', 1)[1])} 条已采纳的修改范围重叠"
+                    if reason.startswith("overlaps:")
+                    else ACCEPT_REASONS.get(reason, STALE_TOAST)
+                )
+                await query.answer(text, show_alert=True)
+                return
+            job.accepted[issue.key] = choice
             job.skipped.discard(issue.key)
-        else:
-            job.skipped.add(issue.key)
-    elif action != "c":
+        elif action == "u":
+            job.accepted.pop(issue.key, None)
+        elif action == "x":
+            if issue.key in job.skipped:
+                job.skipped.discard(issue.key)
+            else:
+                job.skipped.add(issue.key)
+        elif action != "c":
+            await query.answer()
+            return
         await query.answer()
-        return
-    await query.answer()
-    await _edit(
-        update,
-        format_issue_card(report, number, accepted=set(job.accepted), skipped=job.skipped),
-        card_keyboard(job, number),
-    )
+        await _edit(
+            update,
+            format_issue_card(report, number, accepted=set(job.accepted), skipped=job.skipped),
+            card_keyboard(job, number),
+        )
 
 
 async def _resend_result(
@@ -1065,11 +1071,24 @@ async def _edit(update: Update, text: str, markup: InlineKeyboardMarkup | None) 
     query = update.callback_query
     if query is None:
         return
+    b = _b()
     try:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     except BadRequest as exc:
-        if "not modified" not in str(exc).casefold():
+        if "not modified" in str(exc).casefold():
+            return
+        if not b._bad_request_is_html_parse_error(exc):
             raise
+        LOGGER.warning(
+            "review edit fallback: HTML parse failed error_type=%s",
+            type(exc).__name__,
+        )
+        plain = strip_telegram_html(text)
+        try:
+            await query.edit_message_text(plain, reply_markup=markup)
+        except BadRequest as plain_exc:
+            if "not modified" not in str(plain_exc).casefold():
+                raise
 
 
 async def _send_revision(
@@ -1079,18 +1098,19 @@ async def _send_revision(
     query = update.callback_query
     report = job.report
     assert report is not None and query is not None
-    if not job.accepted:
+    accepted_snapshot = dict(job.accepted)
+    count = len(accepted_snapshot)
+    if not accepted_snapshot:
         await query.answer(NOTHING_ACCEPTED_TOAST, show_alert=True)
         return
     try:
-        revised = revise(report, job.accepted)
+        revised = revise(report, accepted_snapshot)
     except RevisionError:
         await query.answer(STALE_TOAST, show_alert=True)
         return
     await query.answer()
     if not await b._passes_delivery_gate(update, context):
         return
-    count = len(job.accepted)
     # Plain text on purpose: the user copies it.
     await b.reply_to_user(
         update,
