@@ -69,21 +69,42 @@ def test_prose_that_only_looks_like_a_marker_is_preserved():
 
 
 def test_semver_range_accepts_newer_compatible_core_and_rejects_out_of_range(monkeypatch):
-    assert is_compatible_core_version("0.16.0")
-    assert is_compatible_core_version("0.16.1")
-    assert is_compatible_core_version("0.17.0")
-    assert is_compatible_core_version("0.99.9")
-    assert not is_compatible_core_version("0.15.9")
-    assert not is_compatible_core_version("0.13.0")
-    assert not is_compatible_core_version("1.0.0")
-    assert not is_compatible_core_version("not-a-version")
+    import sys
+    from pathlib import Path
+
+    scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import core_lock
+
+    for ok_ver in ("0.16.0", "0.16.0.post1", "0.16.1", "0.17.0", "0.99.9"):
+        assert is_compatible_core_version(ok_ver), ok_ver
+        assert core_lock.version_satisfies_spec(ok_ver, core_compat.CORE_VERSION_SPEC), ok_ver
+
+    for bad_ver in (
+        "0.15.9",
+        "0.13.0",
+        "0.16.0rc1",
+        "0.16.0.dev0",
+        "0.16.0a1",
+        "0.16.1a1",
+        "1.0.0rc1",
+        "1.0.0",
+        "not-a-version",
+    ):
+        assert not is_compatible_core_version(bad_ver), bad_ver
+        assert not core_lock.version_satisfies_spec(bad_ver, core_compat.CORE_VERSION_SPEC), bad_ver
 
     # A newer compatible 0.x Core passes runtime compatibility checks.
     monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "0.17.2")
     verify_core_compatibility()
 
-    # An older Core or breaking 1.0.0 Core is rejected.
+    # An older Core, pre-release, or breaking 1.0.0 Core is rejected.
     monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "0.15.0")
+    with pytest.raises(CoreCompatibilityError, match=">=0.16.0,<1.0"):
+        verify_core_compatibility()
+
+    monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "0.16.0rc1")
     with pytest.raises(CoreCompatibilityError, match=">=0.16.0,<1.0"):
         verify_core_compatibility()
 

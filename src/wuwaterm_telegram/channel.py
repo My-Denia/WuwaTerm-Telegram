@@ -8,12 +8,14 @@ import inspect
 import logging
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import escape as html_escape
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Literal
 
 from telegram import Update
-from telegram.error import BadRequest, RetryAfter, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
 
 from wuwaterm import llm_transport
@@ -41,6 +43,7 @@ from .channel_checks import check_channel_translation
 from .channel_queue import ChannelTask, ChannelTaskQueue, TaskExecutionOutcome
 from .channel_reply_index import ChannelReplyIndex, OriginalPostClaim
 from .channel_runtime import ChannelRuntime
+from .core_backend import CoreBackendError, HttpCoreBackend
 from .core_compat import strip_telegram_wrapper_noise
 from .runtime_keys import (
     CHANNEL_CAPACITY_NOTIFIER_KEY,
@@ -49,16 +52,20 @@ from .runtime_keys import (
     CHANNEL_RUNTIME_KEY,
     CHAT_SETTINGS_KEY,
     CONFIG_KEY,
+    CORE_BACKEND_KEY,
     SERVICE_KEY,
     TRANSLATOR_KEY,
 )
 from .settings import ChatSettings
 from .telegram_html import (
     HTML_CONTENT_FAILURE_REASONS,
+    normalize_telegram_html,
     split_telegram_html,
+    split_telegram_html_segments,
     strip_telegram_html,
     telegram_html_has_tags,
     translate_html_async,
+    translator_supports_protected_context,
     validate_telegram_html,
 )
 from .telegram_text import (
@@ -79,13 +86,17 @@ FLOOD_RETRY_MAX_SLEEP_SECONDS = 60.0
 # length, staleness, authorization) stay silent by design - they are policy,
 # not degradation.
 CAPACITY_SKIP_REASONS = frozenset({"queue_full", "llm_budget"})
-# Transient failure reasons eligible for bounded background queue recovery.
+# Transient failure reasons eligible for bounded background queue recovery,
+# aligned with Core 0.16.0's wuwaterm.llm_transport reason vocabulary.
 RECOVERABLE_CHANNEL_REASONS = frozenset(
     {
         "queue_full",
         "llm_budget",
         "timeout",
         "rate_limit",
+        "upstream",
+        "connect",
+        "request",
         "network",
         "upstream_error",
         "service_unavailable",
@@ -94,6 +105,24 @@ RECOVERABLE_CHANNEL_REASONS = frozenset(
         "output_check_blocked",
     }
 )
+
+
+ChannelOutcomeKind = Literal[
+    "delivered",
+    "already_handled",
+    "expired",
+    "retryable_failure",
+    "uncertain_delivery",
+    "permanent_skip",
+]
+
+
+@dataclass(frozen=True)
+class ChannelPostOutcome:
+    """Explicit per-post outcome for queue recovery and observability."""
+
+    kind: ChannelOutcomeKind
+    reason: str = ""
 # One DM per window no matter how large the burst; the message carries the
 # suppressed count instead.
 CAPACITY_NOTIFY_COOLDOWN_SECONDS = 600.0
@@ -294,12 +323,26 @@ def _channel_queue(
     queue = ChannelTaskQueue(
         max_size=getattr(config, "channel_queue_max_size", 128),
         ttl_seconds=float(
-            getattr(config, "channel_queue_ttl_seconds", config.channel_max_age_seconds)
+            getattr(config, "channel_queue_ttl_seconds", 3600)
         ),
+        post_max_age_seconds=float(config.channel_max_age_seconds),
         max_attempts=getattr(config, "channel_queue_max_attempts", 5),
     )
     context.application.bot_data[CHANNEL_QUEUE_KEY] = queue
     return queue
+
+
+def _http_core_backend(context: ContextTypes.DEFAULT_TYPE) -> HttpCoreBackend | None:
+    backend = context.application.bot_data.get(CORE_BACKEND_KEY)
+    return backend if isinstance(backend, HttpCoreBackend) else None
+
+
+def _queue_deadline_expired(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    deadline = getattr(context, "_queue_expires_at", None)
+    if deadline is None:
+        return False
+    clock = getattr(context, "_queue_clock", time.time)
+    return clock() >= deadline
 
 
 def _enqueue_for_recovery(
@@ -353,19 +396,22 @@ def _strip_segment_separators(text: str) -> str:
 
 def _plan_long_channel_segments(
     plain: str, html_text: str | None
-) -> tuple[list[str] | None, list[object] | None, int]:
+) -> tuple[list[tuple[str, str, str]] | None, list[object] | None, int]:
     """Plan segmented calls for posts longer than ``LLM_INPUT_CHAR_LIMIT``.
 
-    Returns ``(html_segments, plain_segments, required_calls)``. Exactly one of
-    ``html_segments`` and ``plain_segments`` is non-None.
+    Returns ``(html_segments, plain_segments, base_calls)``. Exactly one of
+    ``html_segments`` and ``plain_segments`` is non-None. Each HTML segment is
+    ``(leading_ws, core_html, trailing_ws)`` so inter-segment blank lines are
+    preserved verbatim across translation.
     """
     if telegram_html_has_tags(html_text):
         assert html_text is not None
-        html_segments = split_telegram_html(
-            html_text, limit=SEGMENT_LIMIT, unit_counter=len
+        html_segments = split_telegram_html_segments(
+            html_text, limit=SEGMENT_LIMIT
         )
         if html_segments:
-            return html_segments, None, len(html_segments)
+            non_empty = sum(1 for _l, core, _t in html_segments if core)
+            return html_segments, None, max(1, non_empty)
     plain_segments = segment_text(plain, limit=SEGMENT_LIMIT)
     non_empty = sum(1 for seg in plain_segments if seg.core_start < seg.core_end)
     return None, plain_segments, max(1, non_empty)
@@ -427,12 +473,19 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     handle it as the first translatable version of that post; Telegram can
     deliver media posts before their caption/text is available.
     """
+    await _handle_channel_post(update, context)
+
+
+async def _handle_channel_post(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> ChannelPostOutcome:
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
     runtime = _channel_runtime(context, config)
+    http_backend = _http_core_backend(context)
     message = update.effective_message
     if message is None:
         _channel_event(runtime, stage="skipped", reason="no_message")
-        return
+        return ChannelPostOutcome("permanent_skip", "no_message")
     chat = update.effective_chat
     chat_id = chat.id if chat else None
     chat_type = chat.type if chat else "unknown"
@@ -457,14 +510,11 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             is_edit=is_edit,
             text_len=safe_text_len(initial_text),
         )
-        return
-    # Freshness gate: Telegram replays updates (restart backlog, admin
-    # promotion, queue delivery). Linked-channel content is trusted, so the
-    # default window is deliberately broad and can accept a bounded restart or
-    # admin-promotion backlog; the gate only blocks posts outside the configured
-    # channel replay horizon.
+        return ChannelPostOutcome("permanent_skip", "disabled")
     message_date = getattr(message, "date", None)
-    if not _message_is_fresh(message, config.channel_max_age_seconds):
+    if _queue_deadline_expired(context) or not _message_is_fresh(
+        message, config.channel_max_age_seconds
+    ):
         _channel_event(
             runtime,
             stage="skipped",
@@ -474,13 +524,8 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             is_edit=is_edit,
             text_len=safe_text_len(initial_text),
         )
-        return
+        return ChannelPostOutcome("expired", "stale")
 
-    # Authorization gate (fail-closed): only translate for groups on the
-    # allowlist. Slash commands are gated in _is_authorized_group_sender; this
-    # mirrors it for the auto-forward path so an unauthorized or revoked group
-    # the bot has not yet left (e.g. a leave_chat that failed) cannot keep
-    # getting its linked-channel posts translated and burn LLM budget.
     settings: ChatSettings = context.application.bot_data[CHAT_SETTINGS_KEY]
     if chat_id is None or not settings.is_allowed(chat_id):
         _channel_event(
@@ -492,12 +537,8 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             is_edit=is_edit,
             text_len=safe_text_len(initial_text),
         )
-        return
+        return ChannelPostOutcome("expired", "not_authorized")
 
-    # Edit dedup: an edited post (edit_date set) updates the reply already
-    # sent for it. If this process already observed the post without replying,
-    # a fresh edit can be the first translatable version; this covers Telegram
-    # media forwards whose caption/text arrives only on the edited update.
     reply_index: ChannelReplyIndex = context.application.bot_data[
         CHANNEL_REPLY_INDEX_KEY
     ]
@@ -514,11 +555,6 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id, message.message_id
             )
             if not waited_for_original and existing_reply_id is None:
-                # With a non-blocking handler, PTB may schedule an edit task
-                # before the original post task has run far enough to mark
-                # itself in-flight. Yield once so that already-scheduled
-                # original task can register; true restart/no-entry edits still
-                # skip without reaching throttle or LLM work.
                 await asyncio.sleep(0)
                 waited_for_original = await reply_index.wait_in_flight(
                     chat_id, message.message_id
@@ -536,7 +572,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     is_edit=True,
                     text_len=safe_text_len(initial_text),
                 )
-                return
+                return ChannelPostOutcome("permanent_skip", "edit_untracked_no_date")
             if chat_id is None or not reply_index.was_observed_without_reply(
                 chat_id, message.message_id
             ):
@@ -549,11 +585,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     is_edit=True,
                     text_len=safe_text_len(initial_text),
                 )
-                return
-            # message.date is the original post date, not edit_date, so the
-            # freshness gate above still blocks old replayed posts. This accepts
-            # a fresh edit only when this process saw the post without replying;
-            # after a restart, the sentinel is gone and the edit stays skipped.
+                return ChannelPostOutcome("permanent_skip", "edit_untracked")
             LOGGER.info(
                 "channel autotranslate treating fresh edit as new post "
                 "incoming_message=%s",
@@ -561,11 +593,6 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             is_edit = False
             resume_observed = True
-    # Edit-token registration is deferred to the moment the edit is actually
-    # admitted to a delivery path (the dictionary fast path, or right after
-    # the budget-yield check on the LLM path). Registering here would let an
-    # edit that later yields or is content-gated supersede the token of an
-    # admitted in-flight edit, whose delivery would then be dropped as stale.
     edit_work_token: int | None = None
     original_claim: OriginalPostClaim | None = None
     if not is_edit and chat_id is not None:
@@ -585,7 +612,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=chat_id,
                 text_len=safe_text_len(initial_text),
             )
-            return
+            return ChannelPostOutcome("already_handled", "duplicate")
         if claim.role == "waiter":
             await reply_index.wait_for_original(claim)
             _channel_event(
@@ -596,7 +623,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=chat_id,
                 text_len=safe_text_len(initial_text),
             )
-            return
+            return ChannelPostOutcome("already_handled", "duplicate_in_flight")
         original_claim = claim
     try:
         if message.text:
@@ -616,11 +643,8 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=chat_id,
                 is_edit=is_edit,
             )
-            return
+            return ChannelPostOutcome("permanent_skip", "no_text")
         if not html_text:
-            # PTB renders non-empty HTML for any non-empty text; if that ever
-            # stops holding, degrade to the plain pipeline instead of dropping
-            # the post (the dictionary and LLM paths only need `plain`).
             _channel_event(
                 runtime,
                 stage="received",
@@ -631,21 +655,9 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 text_len=safe_text_len(plain),
             )
             html_text = None
-        # Telegram wrapper markers (version tags, spoiler labels, quote bars)
-        # are screenshot furniture, not content. Core 0.13.0 keeps prose
-        # verbatim, so the adapter removes them here, once, for every plain
-        # stage: the dictionary lookup, the plain-only post, the plain retry
-        # after a failed HTML attempt, and the over-2,000-character split. The
-        # call reservation and the chunking below read this same text. The HTML
-        # attempt keeps ``html_text`` as written because stripping would desync
-        # the markup it has to restore placeholders into.
+        else:
+            html_text = normalize_telegram_html(html_text)
         pipeline_plain = strip_telegram_wrapper_noise(plain, keep_paragraphs=True)
-        # Direction by script: enough Chinese -> translate to English (default);
-        # no Chinese but enough Latin letters -> translate to Chinese. Anything
-        # else (emoji / links / numbers only) is not worth translating -> skip.
-        # Markers are judged out too: "[Wuthering Waves 3.7]" alone carries
-        # enough Latin letters for the to_zh branch, and "剧透" in a label is
-        # enough to send English content to English.
         cjk = count_cjk(pipeline_plain)
         if pipeline_plain and cjk >= config.channel_min_cjk:
             to_chinese = False
@@ -656,7 +668,6 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         ):
             to_chinese = True
         else:
-            # Free check: no LLM call and no throttle consumption.
             _channel_event(
                 runtime,
                 stage="skipped",
@@ -666,7 +677,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 is_edit=is_edit,
                 text_len=safe_text_len(plain),
             )
-            return
+            return ChannelPostOutcome("permanent_skip", "language_threshold")
         direction = "to_zh" if to_chinese else "to_en"
         if len(plain) > length_limit:
             _channel_event(
@@ -679,29 +690,108 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 direction=direction,
                 text_len=safe_text_len(plain),
             )
-            return
-        service: TermService = context.application.bot_data[SERVICE_KEY]
-        lookup_result = service.lookup_exact(pipeline_plain)
-        official = None
-        if lookup_result.exact and lookup_result.best:
-            official = (
-                lookup_result.best.entry.zh if to_chinese else lookup_result.best.entry.en
-            )
-        if not official and not llm_configured():
-            _channel_event(
-                runtime,
-                stage="skipped",
-                reason="llm_not_configured",
-                message=message,
-                chat_id=chat_id,
-                is_edit=is_edit,
-                direction=direction,
-                text_len=safe_text_len(plain),
-            )
-            return
+            return ChannelPostOutcome("permanent_skip", "too_long")
+
+        official: str | None = None
+        if http_backend is not None:
+            try:
+                official = await http_backend.lookup_exact(
+                    pipeline_plain, to_chinese=to_chinese
+                )
+            except CoreBackendError as exc:
+                reason = "upstream" if exc.code == "llm_unavailable" else exc.code
+                _channel_event(
+                    runtime,
+                    stage="llm",
+                    reason=reason,
+                    message=message,
+                    chat_id=chat_id,
+                    is_edit=is_edit,
+                    direction=direction,
+                    text_len=safe_text_len(plain),
+                    mode="http-lookup",
+                )
+                _enqueue_for_recovery(
+                    context,
+                    config,
+                    message=message,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    plain=plain,
+                    html_text=html_text,
+                    is_edit=is_edit,
+                    update=update,
+                    length_limit=length_limit,
+                    reason=reason,
+                )
+                return ChannelPostOutcome("retryable_failure", reason)
+        else:
+            service: TermService = context.application.bot_data[SERVICE_KEY]
+            lookup_result = service.lookup_exact(pipeline_plain)
+            if lookup_result.exact and lookup_result.best:
+                official = (
+                    lookup_result.best.entry.zh
+                    if to_chinese
+                    else lookup_result.best.entry.en
+                )
+
+        if not official:
+            if http_backend is not None:
+                try:
+                    remote_llm_ok = await http_backend.llm_available()
+                except CoreBackendError as exc:
+                    reason = "upstream" if exc.code == "llm_unavailable" else exc.code
+                    _channel_event(
+                        runtime,
+                        stage="llm",
+                        reason=reason,
+                        message=message,
+                        chat_id=chat_id,
+                        is_edit=is_edit,
+                        direction=direction,
+                        text_len=safe_text_len(plain),
+                        mode="http-probe",
+                    )
+                    _enqueue_for_recovery(
+                        context,
+                        config,
+                        message=message,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        plain=plain,
+                        html_text=html_text,
+                        is_edit=is_edit,
+                        update=update,
+                        length_limit=length_limit,
+                        reason=reason,
+                    )
+                    return ChannelPostOutcome("retryable_failure", reason)
+                if not remote_llm_ok:
+                    _channel_event(
+                        runtime,
+                        stage="skipped",
+                        reason="llm_not_configured",
+                        message=message,
+                        chat_id=chat_id,
+                        is_edit=is_edit,
+                        direction=direction,
+                        text_len=safe_text_len(plain),
+                    )
+                    return ChannelPostOutcome("permanent_skip", "llm_not_configured")
+            elif not llm_configured():
+                _channel_event(
+                    runtime,
+                    stage="skipped",
+                    reason="llm_not_configured",
+                    message=message,
+                    chat_id=chat_id,
+                    is_edit=is_edit,
+                    direction=direction,
+                    text_len=safe_text_len(plain),
+                )
+                return ChannelPostOutcome("permanent_skip", "llm_not_configured")
+
         if official:
-            # Dictionary-first invariant: official text byte-for-byte,
-            # plain, trumps formatting. Zero LLM.
             if not _passes_channel_delivery_gate(context, chat_id):
                 _channel_event(
                     runtime,
@@ -713,7 +803,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     direction=direction,
                     text_len=safe_text_len(plain),
                 )
-                return
+                return ChannelPostOutcome("expired", "authorization_changed")
             if is_edit and chat_id is not None:
                 update_id = getattr(update, "update_id", None)
                 edit_work_token = reply_index.begin_edit(
@@ -732,7 +822,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 text_len=safe_text_len(plain),
                 mode="dictionary",
             )
-            await _emit(
+            delivery = await _emit(
                 context,
                 reply_index=reply_index,
                 message=message,
@@ -745,44 +835,52 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode=None,
                 mode="dictionary",
             )
-            if chat_id is not None and not getattr(context, "_from_channel_queue", False):
+            if (
+                delivery.kind == "delivered"
+                and chat_id is not None
+                and not getattr(context, "_from_channel_queue", False)
+            ):
                 existing_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
                 if isinstance(existing_queue, ChannelTaskQueue):
-                    existing_queue.cancel_pending(chat_id, message.message_id)
-            return
+                    update_id = getattr(update, "update_id", None)
+                    existing_queue.cancel_pending(
+                        chat_id,
+                        message.message_id,
+                        update_id=update_id if isinstance(update_id, int) else None,
+                    )
+            return delivery
 
-        # The HTML route reserves a second call so a plain-text retry after a
-        # content-shape failure (broken placeholders / blank output) can run
-        # without hitting "no unused call reservation"; the unused token is
-        # released when the admission exits. A per-minute budget of 1 must
-        # still translate (reserve(2) would reject everything), so the
-        # fallback token is only reserved when the budget allows it and the
-        # fallback only runs when its token was actually reserved. Long posts
-        # plan exact segment calls using paragraph-aware balanced HTML chunks
-        # (when markup is present) or Core segmentation-v1.
-        planned_html_segments: list[str] | None = None
+        planned_html_segments: list[tuple[str, str, str]] | None = None
         planned_plain_segments: list[object] | None = None
         if len(pipeline_plain) <= LLM_INPUT_CHAR_LIMIT:
             required_calls = (
                 min(2, runtime.llm_calls_per_minute) if html_text else 1
             )
+            allow_plain_fallback = bool(html_text) and required_calls >= 2
+            max_corrective_calls = 1 if allow_plain_fallback else 0
+            max_corrective_per_segment = 1 if allow_plain_fallback else 0
         else:
             (
                 planned_html_segments,
                 planned_plain_segments,
-                required_calls,
+                base_calls,
             ) = _plan_long_channel_segments(pipeline_plain, html_text)
-        allow_plain_fallback = (
-            len(pipeline_plain) <= LLM_INPUT_CHAR_LIMIT
-            and bool(html_text)
-            and required_calls >= 2
-        )
-        # New posts outrank edits near budget exhaustion. The check and the
-        # reserve below are both synchronous on the single event loop, so the
-        # headroom reading cannot race the reservation it gates. The gate is
-        # capped by the configured capacity itself: with a per-minute budget
-        # of 1-3 the required+headroom sum is unreachable even on a
-        # completely fresh window, which would yield every edit forever.
+            if planned_html_segments is not None:
+                # Reserve at most 1 shared HTML->plain fallback call when per-minute
+                # budget permits, while keeping per-segment timeout/paragraph
+                # corrective retries disabled (max_corrective_calls_per_segment=0).
+                fallback_slot = (
+                    1 if runtime.llm_calls_per_minute > base_calls else 0
+                )
+                required_calls = base_calls + fallback_slot
+                allow_plain_fallback = fallback_slot >= 1
+                max_corrective_calls = fallback_slot
+                max_corrective_per_segment = 0
+            else:
+                required_calls = base_calls
+                allow_plain_fallback = False
+                max_corrective_calls = 0
+                max_corrective_per_segment = 0
         if is_edit and (
             runtime.budget_remaining()
             < min(
@@ -800,7 +898,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 direction=direction,
                 text_len=safe_text_len(plain),
             )
-            return
+            return ChannelPostOutcome("permanent_skip", "edit_yield")
         admission, rejection_reason = runtime.reserve(required_calls)
         if admission is None:
             resolved_rejection = rejection_reason or "admission_rejected"
@@ -830,10 +928,12 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await _notify_owner_capacity_skip(
                 context, config, resolved_rejection
             )
-            return
+            return ChannelPostOutcome("retryable_failure", resolved_rejection)
         translator: SentenceTranslator = context.application.bot_data[TRANSLATOR_KEY]
         async with admission:
-            if not _message_is_fresh(message, config.channel_max_age_seconds):
+            if _queue_deadline_expired(context) or not _message_is_fresh(
+                message, config.channel_max_age_seconds
+            ):
                 _channel_event(
                     runtime,
                     stage="skipped",
@@ -844,7 +944,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     direction=direction,
                     text_len=safe_text_len(plain),
                 )
-                return
+                return ChannelPostOutcome("expired", "stale_after_wait")
             if not _passes_channel_delivery_gate(context, chat_id):
                 _channel_event(
                     runtime,
@@ -856,7 +956,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     direction=direction,
                     text_len=safe_text_len(plain),
                 )
-                return
+                return ChannelPostOutcome("expired", "authorization_changed_after_wait")
             started_calls = 0
 
             def mark_channel_llm_call_started() -> None:
@@ -864,7 +964,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
                 nonlocal started_calls, edit_work_token
 
-                if not _message_is_fresh(
+                if _queue_deadline_expired(context) or not _message_is_fresh(
                     message, config.channel_max_age_seconds
                 ):
                     raise LLMTranslationError(
@@ -878,16 +978,6 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 admission.mark_call_started()
                 if started_calls == 0 and is_edit and chat_id is not None:
-                    # The edit is now committed to its first LLM call. This is
-                    # the earliest point at which registering the supersede
-                    # token is safe: every earlier bail path (edit_yield,
-                    # queue_full, llm_budget, stale, authorization) must leave
-                    # an admitted in-flight edit's token untouched, or the
-                    # admitted edit's completed translation is dropped as
-                    # stale with nothing replacing it. Registration order
-                    # still matches arrival order: on the single event loop
-                    # the older edit's task reaches every FIFO primitive
-                    # (admission semaphore, LLM slot) first.
                     update_id = getattr(update, "update_id", None)
                     edit_work_token = reply_index.begin_edit(
                         chat_id,
@@ -909,8 +999,8 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
             op_budget = OperationExecutionBudget(
                 max_total_calls=required_calls,
-                max_corrective_calls=1 if allow_plain_fallback else 0,
-                max_corrective_calls_per_segment=1 if allow_plain_fallback else 0,
+                max_corrective_calls=max_corrective_calls,
+                max_corrective_calls_per_segment=max_corrective_per_segment,
             )
             try:
                 with op_budget.activate():
@@ -928,6 +1018,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         execution_budget=op_budget,
                         planned_html_segments=planned_html_segments,
                         planned_plain_segments=planned_plain_segments,
+                        http_backend=http_backend,
                     )
             except LLMTranslationError as exc:
                 reason = getattr(exc, "reason", "translation_unavailable")
@@ -950,6 +1041,11 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     text_len=safe_text_len(plain),
                     mode=getattr(exc, "failure_stage", "none"),
                 )
+                if reason in {
+                    "stale_before_llm",
+                    "authorization_changed_before_llm",
+                }:
+                    return ChannelPostOutcome("expired", reason)
                 _enqueue_for_recovery(
                     context,
                     config,
@@ -963,7 +1059,9 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     length_limit=length_limit,
                     reason=reason,
                 )
-                return
+                if reason in RECOVERABLE_CHANNEL_REASONS:
+                    return ChannelPostOutcome("retryable_failure", reason)
+                return ChannelPostOutcome("permanent_skip", reason)
             _channel_event(
                 runtime,
                 stage="llm",
@@ -976,9 +1074,9 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 mode=translated_mode,
             )
 
+        if translated_parse_mode == "HTML":
+            translated = normalize_telegram_html(translated)
         if translated_parse_mode == "HTML" and not validate_telegram_html(translated):
-            # The translation itself succeeded; only the markup is unusable.
-            # Deliver the stripped plain text instead of dropping the reply.
             _channel_event(
                 runtime,
                 stage="llm",
@@ -993,7 +1091,6 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             translated_parse_mode = None
             translated_mode = "plain-after-invalid-html"
 
-        # Zero-cost deterministic structural output check before publishing.
         output_check = check_channel_translation(
             pipeline_plain,
             translated,
@@ -1028,7 +1125,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 length_limit=length_limit,
                 reason="output_check_blocked",
             )
-            return
+            return ChannelPostOutcome("retryable_failure", "output_check_blocked")
         if output_check.action == "deliver_with_warning":
             LOGGER.info(
                 "channel_output_check severity=warning rules=%s chat=%s "
@@ -1039,6 +1136,24 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 output_check.source_paragraphs,
                 output_check.target_paragraphs,
             )
+
+        update_id = getattr(update, "update_id", None)
+        resolved_update_id = update_id if isinstance(update_id, int) else None
+
+        def _clear_pending_if_delivered(outcome: ChannelPostOutcome) -> ChannelPostOutcome:
+            if (
+                outcome.kind == "delivered"
+                and chat_id is not None
+                and not getattr(context, "_from_channel_queue", False)
+            ):
+                existing_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
+                if isinstance(existing_queue, ChannelTaskQueue):
+                    existing_queue.cancel_pending(
+                        chat_id,
+                        message.message_id,
+                        update_id=resolved_update_id,
+                    )
+            return outcome
 
         if translated_parse_mode == "HTML":
             plain_translated = strip_telegram_html(translated)
@@ -1057,25 +1172,22 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         direction=direction,
                         text_len=safe_text_len(plain),
                     )
-                    return
-                await _emit(
-                    context,
-                    reply_index=reply_index,
-                    message=message,
-                    chat_id=chat_id,
-                    chat_type=chat_type,
-                    is_edit=is_edit,
-                    existing_reply_id=existing_reply_id,
-                    edit_work_token=edit_work_token,
-                    text=plain_translated,
-                    parse_mode=None,
-                    mode=translated_mode,
+                    return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
+                return _clear_pending_if_delivered(
+                    await _emit(
+                        context,
+                        reply_index=reply_index,
+                        message=message,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        is_edit=is_edit,
+                        existing_reply_id=existing_reply_id,
+                        edit_work_token=edit_work_token,
+                        text=plain_translated,
+                        parse_mode=None,
+                        mode=translated_mode,
+                    )
                 )
-                if chat_id is not None and not getattr(context, "_from_channel_queue", False):
-                    existing_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
-                    if isinstance(existing_queue, ChannelTaskQueue):
-                        existing_queue.cancel_pending(chat_id, message.message_id)
-                return
             try:
                 if not _passes_channel_delivery_gate(context, chat_id):
                     _channel_event(
@@ -1088,27 +1200,23 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         direction=direction,
                         text_len=safe_text_len(plain),
                     )
-                    return
-                await _emit(
-                    context,
-                    reply_index=reply_index,
-                    message=message,
-                    chat_id=chat_id,
-                    chat_type=chat_type,
-                    is_edit=is_edit,
-                    existing_reply_id=existing_reply_id,
-                    edit_work_token=edit_work_token,
-                    text=translated,
-                    parse_mode="HTML",
-                    mode=translated_mode,
+                    return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
+                return _clear_pending_if_delivered(
+                    await _emit(
+                        context,
+                        reply_index=reply_index,
+                        message=message,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        is_edit=is_edit,
+                        existing_reply_id=existing_reply_id,
+                        edit_work_token=edit_work_token,
+                        text=translated,
+                        parse_mode="HTML",
+                        mode=translated_mode,
+                    )
                 )
-                if chat_id is not None and not getattr(context, "_from_channel_queue", False):
-                    existing_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
-                    if isinstance(existing_queue, ChannelTaskQueue):
-                        existing_queue.cancel_pending(chat_id, message.message_id)
-                return
             except BadRequest:
-                # Safety net: never let formatting fail the reply.
                 if not _passes_channel_delivery_gate(context, chat_id):
                     _channel_event(
                         runtime,
@@ -1120,25 +1228,22 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         direction=direction,
                         text_len=safe_text_len(plain),
                     )
-                    return
-                await _emit(
-                    context,
-                    reply_index=reply_index,
-                    message=message,
-                    chat_id=chat_id,
-                    chat_type=chat_type,
-                    is_edit=is_edit,
-                    existing_reply_id=existing_reply_id,
-                    edit_work_token=edit_work_token,
-                    text=plain_translated,
-                    parse_mode=None,
-                    mode="plain-after-badrequest",
+                    return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
+                return _clear_pending_if_delivered(
+                    await _emit(
+                        context,
+                        reply_index=reply_index,
+                        message=message,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        is_edit=is_edit,
+                        existing_reply_id=existing_reply_id,
+                        edit_work_token=edit_work_token,
+                        text=plain_translated,
+                        parse_mode=None,
+                        mode="plain-after-badrequest",
+                    )
                 )
-                if chat_id is not None and not getattr(context, "_from_channel_queue", False):
-                    existing_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
-                    if isinstance(existing_queue, ChannelTaskQueue):
-                        existing_queue.cancel_pending(chat_id, message.message_id)
-                return
         if not _passes_channel_delivery_gate(context, chat_id):
             _channel_event(
                 runtime,
@@ -1150,26 +1255,24 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 direction=direction,
                 text_len=safe_text_len(plain),
             )
-            return
-        await _emit(
-            context,
-            reply_index=reply_index,
-            message=message,
-            chat_id=chat_id,
-            chat_type=chat_type,
-            is_edit=is_edit,
-            existing_reply_id=existing_reply_id,
-            edit_work_token=edit_work_token,
-            text=strip_telegram_html(translated)
-            if translated_parse_mode == "HTML"
-            else translated,
-            parse_mode=None,
-            mode="plain" if translated_parse_mode == "HTML" else translated_mode,
+            return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
+        return _clear_pending_if_delivered(
+            await _emit(
+                context,
+                reply_index=reply_index,
+                message=message,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                is_edit=is_edit,
+                existing_reply_id=existing_reply_id,
+                edit_work_token=edit_work_token,
+                text=strip_telegram_html(translated)
+                if translated_parse_mode == "HTML"
+                else translated,
+                parse_mode=None,
+                mode="plain" if translated_parse_mode == "HTML" else translated_mode,
+            )
         )
-        if chat_id is not None and not getattr(context, "_from_channel_queue", False):
-            existing_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
-            if isinstance(existing_queue, ChannelTaskQueue):
-                existing_queue.cancel_pending(chat_id, message.message_id)
     finally:
         if original_claim is not None and chat_id is not None:
             try:
@@ -1203,7 +1306,9 @@ def _passes_final_delivery_gate(
 
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
     runtime = _channel_runtime(context, config)
-    if not _message_is_fresh(message, config.channel_max_age_seconds):
+    if _queue_deadline_expired(context) or not _message_is_fresh(
+        message, config.channel_max_age_seconds
+    ):
         _channel_event(
             runtime,
             stage="skipped",
@@ -1239,8 +1344,9 @@ async def _translate_channel_input(
     before_llm_call,
     allow_plain_fallback: bool = True,
     execution_budget: OperationExecutionBudget | None = None,
-    planned_html_segments: list[str] | None = None,
+    planned_html_segments: list[tuple[str, str, str]] | None = None,
     planned_plain_segments: list[object] | None = None,
+    http_backend: HttpCoreBackend | None = None,
 ) -> tuple[str, str | None, str]:
     """Translate one post; LLMTranslationError carries a ``failure_stage``
     attribute (html-attempt / plain-fallback / plain-no-html /
@@ -1269,9 +1375,12 @@ async def _translate_channel_input(
                 max_total, max_corr = 1, 0
             else:
                 max_total, max_corr = 2, 1
+            max_corr_seg = max_corr
         else:
             if planned_html_segments is not None:
-                max_total = len(planned_html_segments)
+                base = max(1, sum(1 for _l, core, _t in planned_html_segments if core))
+                max_corr = 1 if allow_plain_fallback else 0
+                max_total = base + max_corr
             else:
                 assert planned_plain_segments is not None
                 max_total = max(
@@ -1282,45 +1391,97 @@ async def _translate_channel_input(
                         if seg.core_start < seg.core_end
                     ),
                 )
-            max_corr = 0
+                max_corr = 0
+            max_corr_seg = 0
         budget_cm = OperationExecutionBudget(
             max_total_calls=max_total,
             max_corrective_calls=max_corr,
-            max_corrective_calls_per_segment=max_corr,
+            max_corrective_calls_per_segment=max_corr_seg,
         ).activate()
+
+    async def _call_plain(
+        text: str,
+        *,
+        stage: str,
+        context: TranslationContext | None = None,
+        budget: OperationExecutionBudget | None = None,
+    ) -> str:
+        if http_backend is not None:
+            outcome = await http_backend.translate_text(
+                text,
+                to_chinese=to_chinese,
+                context=context,
+                before_llm_call=before_llm_call,
+                execution_budget=budget,
+            )
+            if outcome.failed:
+                exc = LLMTranslationError(
+                    outcome.text or TRANSLATION_UNAVAILABLE_NOTICE,
+                    reason=outcome.error_code or "upstream",
+                )
+                exc.failure_stage = stage
+                raise exc
+            return outcome.text
+        return await _translate_plain_stage(
+            translator,
+            text,
+            stage=stage,
+            to_chinese=to_chinese,
+            before_llm_call=before_llm_call,
+            context=context,
+            execution_budget=budget,
+        )
+
+    async def _call_html(
+        seg_html: str,
+        *,
+        context: TranslationContext | None = None,
+        budget: OperationExecutionBudget | None = None,
+    ) -> tuple[str, bool]:
+        if http_backend is not None:
+            return await http_backend.translate_protected_html(
+                seg_html,
+                to_chinese=to_chinese,
+                context=context,
+                before_llm_call=before_llm_call,
+                execution_budget=budget,
+            )
+        translated_seg = await translate_html_async(
+            translator,
+            seg_html,
+            to_chinese=to_chinese,
+            before_llm_call=before_llm_call,
+            execution_budget=budget,
+            context=(
+                context
+                if context is not None and translator_supports_protected_context(translator)
+                else None
+            ),
+        )
+        return translated_seg, True
 
     with budget_cm as active_budget:
         if not is_long:
             if not html_text:
-                translated = await _translate_plain_stage(
-                    translator,
+                translated = await _call_plain(
                     plain,
                     stage="plain-no-html",
-                    to_chinese=to_chinese,
-                    before_llm_call=before_llm_call,
-                    execution_budget=active_budget,
+                    budget=active_budget,
                 )
                 return translated, None, "plain-no-html"
             try:
-                return (
-                    await translate_html_async(
-                        translator,
-                        html_text,
-                        to_chinese=to_chinese,
-                        before_llm_call=before_llm_call,
-                        execution_budget=active_budget,
-                    ),
-                    "HTML",
-                    "HTML",
+                translated_html, markup_used = await _call_html(
+                    html_text,
+                    budget=active_budget,
                 )
+                if markup_used:
+                    return translated_html, "HTML", "HTML"
+                return translated_html, None, "plain-http-degraded"
             except LLMTranslationError as exc:
                 if (
                     getattr(exc, "reason", "") not in HTML_CONTENT_FAILURE_REASONS
                     or not allow_plain_fallback
                 ):
-                    # Either not a content failure, or no fallback token was
-                    # reserved (per-minute budget of 1): running the fallback
-                    # anyway would blow the call reservation with a RuntimeError.
                     exc.failure_stage = "html-attempt"
                     raise
                 if active_budget.is_cancelled or active_budget.deadline_expired():
@@ -1332,55 +1493,75 @@ async def _translate_channel_input(
                 ):
                     exc.failure_stage = "html-attempt"
                     raise
-                # The model broke the placeholder structure (or returned nothing).
-                # Retrying as plain drops formatting but keeps the reply delivered;
-                # before_llm_call keeps the budget/staleness/authorization rechecks.
-                translated = await _translate_plain_stage(
-                    translator,
+                translated = await _call_plain(
                     plain,
                     stage="plain-fallback",
-                    to_chinese=to_chinese,
-                    before_llm_call=before_llm_call,
-                    execution_budget=active_budget,
+                    budget=active_budget,
                 )
                 return translated, None, "plain-after-html-failure"
 
         # Long post (> LLM_INPUT_CHAR_LIMIT): prefer paragraph-aware balanced
-        # HTML segmentation when markup is present, passing ContextBefore
-        # across segments when supported by Core.
+        # HTML segmentation with verbatim inter-segment whitespace separators
+        # and budgeted per-segment plain fallback on HTML integrity failure.
         if planned_html_segments is not None:
             translated_html_chunks: list[str] = []
+            any_markup_used = False
             before: ContextBefore | None = None
-            for seg_html in planned_html_segments:
-                seg_plain = strip_telegram_html(seg_html)
+            for lead_ws, core_html, trail_ws in planned_html_segments:
+                if not core_html:
+                    translated_html_chunks.append(lead_ws + trail_ws)
+                    continue
+                seg_plain = strip_telegram_html(core_html)
                 if not seg_plain.strip():
-                    translated_html_chunks.append(seg_html)
+                    translated_html_chunks.append(lead_ws + core_html + trail_ws)
                     continue
                 seg_context = TranslationContext(before=before)
                 try:
-                    translated_seg = await translate_html_async(
-                        translator,
-                        seg_html,
-                        to_chinese=to_chinese,
-                        before_llm_call=before_llm_call,
-                        execution_budget=active_budget,
+                    translated_seg, seg_markup = await _call_html(
+                        core_html,
                         context=seg_context,
+                        budget=active_budget,
                     )
+                    if seg_markup:
+                        any_markup_used = True
+                    else:
+                        translated_seg = html_escape(
+                            _strip_segment_separators(translated_seg), quote=False
+                        )
                 except LLMTranslationError as exc:
-                    exc.failure_stage = "html-input-split"
-                    raise
-                translated_html_chunks.append(translated_seg)
+                    if (
+                        getattr(exc, "reason", "") in HTML_CONTENT_FAILURE_REASONS
+                        and allow_plain_fallback
+                        and not active_budget.is_cancelled
+                        and not active_budget.deadline_expired()
+                        and active_budget.try_consume_html_fallback()
+                    ):
+                        seg_plain_clean = strip_telegram_wrapper_noise(
+                            seg_plain, keep_paragraphs=True
+                        )
+                        plain_seg = await _call_plain(
+                            seg_plain_clean or seg_plain,
+                            stage="plain-fallback",
+                            context=seg_context,
+                            budget=active_budget,
+                        )
+                        plain_seg = _strip_segment_separators(plain_seg)
+                        translated_seg = html_escape(plain_seg, quote=False)
+                    else:
+                        exc.failure_stage = "html-input-split"
+                        raise
+                translated_html_chunks.append(lead_ws + translated_seg + trail_ws)
                 before = ContextBefore(
                     source=_tail_context(seg_plain),
                     target=_tail_context(strip_telegram_html(translated_seg)),
                 )
-            combined_html = "".join(translated_html_chunks)
-            if validate_telegram_html(combined_html):
+            combined_html = normalize_telegram_html("".join(translated_html_chunks))
+            if any_markup_used and validate_telegram_html(combined_html):
                 return combined_html, "HTML", "html-input-split"
             return (
                 strip_telegram_html(combined_html),
                 None,
-                "plain-after-invalid-html",
+                "plain-after-invalid-html" if any_markup_used else "plain-http-degraded",
             )
 
         # Plain long post: Core segmentation-v1 + TranslationContext(before=...)
@@ -1393,14 +1574,11 @@ async def _translate_channel_input(
             if not core:
                 pieces.append(plain[seg.start : seg.end])
                 continue
-            translated = await _translate_plain_stage(
-                translator,
+            translated = await _call_plain(
                 core,
                 stage="plain-input-split",
-                to_chinese=to_chinese,
-                before_llm_call=before_llm_call,
                 context=TranslationContext(before=before),
-                execution_budget=active_budget,
+                budget=active_budget,
             )
             translated = _strip_segment_separators(translated)
             pieces.append(
@@ -1444,7 +1622,7 @@ async def _translate_plain_stage(
 async def _emit(
     context: ContextTypes.DEFAULT_TYPE,
     **kwargs,
-) -> None:
+) -> ChannelPostOutcome:
     message = kwargs["message"]
     chat_id = kwargs.get("chat_id")
     is_edit = bool(kwargs.get("is_edit"))
@@ -1460,14 +1638,15 @@ async def _emit(
         text=text,
         mode=mode,
     ):
-        return
+        return ChannelPostOutcome("expired", "gated")
     try:
         outcome = await _emit_unchecked(context, **kwargs)
     except BadRequest as exc:
+        err_name = safe_error_type(exc)
         _channel_event(
             runtime,
             stage="delivery",
-            reason=safe_error_type(exc),
+            reason=err_name,
             message=message,
             chat_id=chat_id,
             is_edit=is_edit,
@@ -1476,20 +1655,39 @@ async def _emit(
         )
         if kwargs.get("parse_mode") == "HTML":
             raise
-    except TelegramError as exc:
+        return ChannelPostOutcome("permanent_skip", err_name)
+    except RetryAfter as exc:
+        err_name = safe_error_type(exc)
         _channel_event(
             runtime,
             stage="delivery",
-            reason=safe_error_type(exc),
+            reason=err_name,
             message=message,
             chat_id=chat_id,
             is_edit=is_edit,
             text_len=safe_text_len(text),
             mode=mode,
         )
+        # 429 guarantees Telegram did NOT execute the send; safe to retry.
+        return ChannelPostOutcome("retryable_failure", err_name)
+    except (TimedOut, TelegramError) as exc:
+        err_name = safe_error_type(exc)
+        _channel_event(
+            runtime,
+            stage="delivery",
+            reason=err_name,
+            message=message,
+            chat_id=chat_id,
+            is_edit=is_edit,
+            text_len=safe_text_len(text),
+            mode=mode,
+        )
+        # TimedOut / NetworkError / unknown TelegramError may have succeeded
+        # server-side; never report as completed and never blind-resend.
+        return ChannelPostOutcome("uncertain_delivery", err_name)
     else:
         if outcome == "gated":
-            return
+            return ChannelPostOutcome("expired", "gated")
         if outcome == "stale_edit":
             _channel_event(
                 runtime,
@@ -1501,7 +1699,7 @@ async def _emit(
                 text_len=safe_text_len(text),
                 mode=mode,
             )
-            return
+            return ChannelPostOutcome("already_handled", "stale_edit_before_delivery")
         _channel_event(
             runtime,
             stage="delivery",
@@ -1512,6 +1710,9 @@ async def _emit(
             text_len=safe_text_len(text),
             mode=mode,
         )
+        if outcome == "edit_target_unavailable":
+            return ChannelPostOutcome("permanent_skip", outcome)
+        return ChannelPostOutcome("delivered", outcome)
 
 
 async def _emit_unchecked(
@@ -1637,11 +1838,20 @@ async def _emit_unchecked(
             )
         except BadRequest:
             if chunk_parse_mode == "HTML" and index > 0:
-                # Earlier chunks already delivered; degrade only this chunk to
-                # plain text so earlier chunks are never duplicated.
+                # Earlier chunks already delivered; recheck volatile delivery
+                # authorization/freshness before degrading this chunk to plain.
                 chunk_text = strip_telegram_html(chunk)
                 chunk_parse_mode = None
                 chunk_mode = "plain-after-badrequest"
+                if not _passes_final_delivery_gate(
+                    context,
+                    message=message,
+                    chat_id=chat_id,
+                    is_edit=False,
+                    text=chunk_text,
+                    mode=chunk_mode,
+                ):
+                    return "gated"
                 sent_message = await send_with_flood_retry(
                     lambda: message.reply_text(
                         chunk_text,
@@ -1681,6 +1891,7 @@ def _channel_delivery_chunks(
     text: str, parse_mode: str | None, mode: str
 ) -> tuple[list[str], str | None, str]:
     if parse_mode == "HTML":
+        text = normalize_telegram_html(text)
         visible_text = strip_telegram_html(text)
         if telegram_text_units(visible_text) > TELEGRAM_TEXT_MESSAGE_LIMIT:
             if telegram_html_has_tags(text):
@@ -2040,12 +2251,13 @@ class _QueuedChannelMessage:
 async def execute_queued_channel_task(
     application, task: ChannelTask
 ) -> TaskExecutionOutcome:
-    """Replay one queued channel translation task through the normal gates."""
+    """Replay one queued channel translation task using explicit per-post outcome."""
     config: BotConfig = application.bot_data[CONFIG_KEY]
     settings: ChatSettings = application.bot_data[CHAT_SETTINGS_KEY]
-    runtime = _channel_runtime(
-        SimpleNamespace(application=application, bot=application.bot), config
-    )
+    queue = application.bot_data.get(CHANNEL_QUEUE_KEY)
+    clock = getattr(queue, "_clock", time.time)
+    if clock() >= task.expires_at:
+        return TaskExecutionOutcome("expired", "queue_ttl_expired")
     if not settings.is_allowed(task.chat_id):
         return TaskExecutionOutcome("expired", "not_authorized")
     message = _QueuedChannelMessage(application.bot, task)
@@ -2062,47 +2274,17 @@ async def execute_queued_channel_task(
         bot=application.bot,
         application=application,
         _from_channel_queue=True,
+        _queue_expires_at=task.expires_at,
+        _queue_clock=clock,
     )
-    before_outcomes = dict(runtime.snapshot().outcomes)
-    await channel_post_handler(update, context)
-    after_outcomes = runtime.snapshot().outcomes
-    delta = {
-        key: after_outcomes[key] - before_outcomes.get(key, 0)
-        for key in after_outcomes
-        if after_outcomes[key] > before_outcomes.get(key, 0)
-    }
-    if any(key.startswith("delivery:") and key != "delivery:edit_target_unavailable" for key in delta):
-        return TaskExecutionOutcome("completed", "delivered")
-    if any(
-        key in {
-            "skipped:duplicate",
-            "skipped:duplicate_in_flight",
-            "skipped:stale_edit_before_delivery",
-        }
-        for key in delta
-    ):
-        return TaskExecutionOutcome("completed", "already_handled")
-    if any(
-        key in {
-            "skipped:stale",
-            "skipped:stale_after_wait",
-            "skipped:stale_before_llm",
-            "skipped:stale_before_delivery",
-            "skipped:not_authorized",
-            "skipped:authorization_changed",
-            "skipped:authorization_changed_after_wait",
-            "skipped:authorization_changed_before_llm",
-            "skipped:authorization_changed_before_delivery",
-        }
-        for key in delta
-    ):
-        return TaskExecutionOutcome("expired", "policy_expired")
-    for key in delta:
-        stage, _, reason = key.partition(":")
-        if stage in {"skipped", "llm", "output_check"} and (
-            reason in RECOVERABLE_CHANNEL_REASONS or reason == "blocked"
-        ):
-            return TaskExecutionOutcome("retry", reason)
-    if any(key.startswith("skipped:") for key in delta):
-        return TaskExecutionOutcome("failed", next(iter(delta)))
-    return TaskExecutionOutcome("retry", "unknown")
+    outcome = await _handle_channel_post(update, context)
+    if outcome.kind in {"delivered", "already_handled"}:
+        return TaskExecutionOutcome("completed", outcome.reason)
+    if outcome.kind == "expired":
+        return TaskExecutionOutcome("expired", outcome.reason)
+    if outcome.kind == "retryable_failure":
+        return TaskExecutionOutcome("retry", outcome.reason)
+    if outcome.kind == "uncertain_delivery":
+        # Never swallow TimedOut/unknown delivery as completed and never blind-resend.
+        return TaskExecutionOutcome("failed", f"delivery_uncertain:{outcome.reason}")
+    return TaskExecutionOutcome("failed", outcome.reason or "permanent_skip")

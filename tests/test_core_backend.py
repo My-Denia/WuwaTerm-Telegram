@@ -421,3 +421,217 @@ def test_local_core_backend_smoke(sample_db):
             await backend.aclose()
 
     asyncio.run(exercise())
+
+
+def test_http_backend_non_json_capabilities_200_degrades_safely():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/meta":
+            return httpx.Response(200, json=_meta_payload())
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(
+                200,
+                text="<html>proxy gateway ok</html>",
+                headers={"content-type": "text/html"},
+            )
+        raise AssertionError(f"unexpected: {request.url}")
+
+    async def exercise() -> None:
+        backend = HttpCoreBackend(
+            "http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            meta = await backend.probe_capabilities()
+            assert meta.service_version == "0.16.0"
+            assert meta.capabilities == frozenset()
+        finally:
+            await backend.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_http_backend_wires_channel_commands_and_review_without_local_llm(
+    monkeypatch, sample_db
+):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from wuwaterm_telegram.bot import (
+        ADMIN_CACHE_KEY,
+        CHANNEL_REPLY_INDEX_KEY,
+        CHAT_SETTINGS_KEY,
+        CONFIG_KEY,
+        CORE_BACKEND_KEY,
+        RATE_LIMITER_KEY,
+        REJECT_LIMITER_KEY,
+        SERVICE_KEY,
+        TRANSLATOR_KEY,
+        AdminStatusCache,
+        BotConfig,
+        ChannelReplyIndex,
+        PerChatRateLimiter,
+        create_application,
+        sentence_command,
+        term_command,
+    )
+    from wuwaterm_telegram.channel import channel_post_handler
+    from wuwaterm_telegram.review_bot import REVIEW_BACKEND_KEY
+    from wuwaterm_telegram.settings import ChatSettings
+
+    for env_var in (
+        "WUWATERM_OPENAI_BASE_URL",
+        "WUWATERM_OPENAI_API_KEY",
+        "WUWATERM_OPENAI_MODEL",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == "/v1/meta":
+            return httpx.Response(200, json=_meta_payload())
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(
+                200,
+                json={
+                    "api_version": "v1",
+                    "capabilities": [
+                        CAP_PROTECTED_TRANSLATION,
+                        CAP_TRANSLATION_CONTEXT,
+                    ],
+                    "request_id": "req-cap-wire",
+                },
+            )
+        if request.url.path == "/v1/terms":
+            return httpx.Response(
+                200,
+                json={"query": "x", "matches": [], "request_id": "req-terms-wire"},
+            )
+        if request.url.path == "/v1/translations":
+            body = json.loads(request.content)
+            if "protected_text" in body:
+                return httpx.Response(
+                    200,
+                    json={
+                        "kind": "llm",
+                        "text": "Remote HTTP HTML translation.",
+                        "direction": "en",
+                        "dictionary_miss": False,
+                        "request_id": "req-tr-html",
+                        "visible_segments": ["", "Remote HTTP HTML", " translation."],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "llm",
+                    "text": "Remote HTTP plain translation.",
+                    "direction": "en",
+                    "dictionary_miss": False,
+                    "request_id": "req-tr-plain",
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    class _FakeMsg:
+        def __init__(self, msg_id: int, text: str, text_html: str | None = None):
+            self.message_id = msg_id
+            self.text = text
+            self.caption = None
+            self.text_html = text_html if text_html is not None else text
+            self.caption_html = None
+            self.entities = ()
+            self.date = datetime.now(timezone.utc)
+            self.edit_date = None
+            self.reply_to_message = None
+            self.replies: list[tuple[str, str | None]] = []
+
+        async def reply_text(self, text: str, **kwargs):
+            self.replies.append((text, kwargs.get("parse_mode")))
+            return SimpleNamespace(message_id=self.message_id + 100)
+
+    async def exercise() -> None:
+        backend = HttpCoreBackend(
+            "http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            config = BotConfig(owner_user_id=11, channel_llm_calls_per_minute=20)
+            settings = ChatSettings(sample_db.parent / "http_chat_settings.json")
+            settings.allow(-2001)
+            bot_data = {
+                SERVICE_KEY: TermService(sample_db),
+                TRANSLATOR_KEY: SentenceTranslator(sample_db),
+                CORE_BACKEND_KEY: backend,
+                CONFIG_KEY: config,
+                RATE_LIMITER_KEY: PerChatRateLimiter(limit=10),
+                REJECT_LIMITER_KEY: PerChatRateLimiter(limit=10),
+                ADMIN_CACHE_KEY: AdminStatusCache(),
+                CHANNEL_REPLY_INDEX_KEY: ChannelReplyIndex(ttl_seconds=3600.0),
+                CHAT_SETTINGS_KEY: settings,
+            }
+            ctx = SimpleNamespace(
+                args=[],
+                bot=SimpleNamespace(),
+                application=SimpleNamespace(bot_data=bot_data),
+            )
+
+            # 1. Channel post translates via HTTP Core even with local LLM unset.
+            ch_msg = _FakeMsg(8001, "今汐技能说明", "<b>今汐</b>技能说明")
+            ch_update = SimpleNamespace(
+                update_id=8001,
+                effective_message=ch_msg,
+                effective_chat=SimpleNamespace(id=-2001, type="supergroup"),
+                effective_user=None,
+            )
+            await channel_post_handler(ch_update, ctx)
+            assert ch_msg.replies == [("<b>Remote HTTP HTML</b> translation.", "HTML")]
+
+            # 2. /tr translates via HTTP Core even with local LLM unset.
+            tr_msg = _FakeMsg(8002, "/tr 今汐释放共鸣解放")
+            tr_ctx = SimpleNamespace(
+                args=["今汐释放共鸣解放"],
+                bot=SimpleNamespace(),
+                application=SimpleNamespace(bot_data=bot_data),
+            )
+            tr_update = SimpleNamespace(
+                effective_message=tr_msg,
+                effective_chat=SimpleNamespace(id=11, type="private"),
+                effective_user=SimpleNamespace(id=11),
+            )
+            await term_command(tr_update, tr_ctx)
+            assert tr_msg.replies == [("Remote HTTP plain translation.", None)]
+
+            # 3. /sentence translates via HTTP Core even with local LLM unset.
+            sent_msg = _FakeMsg(8003, "/sentence 声骸系统已更新")
+            sent_ctx = SimpleNamespace(
+                args=["声骸系统已更新"],
+                bot=SimpleNamespace(),
+                application=SimpleNamespace(bot_data=bot_data),
+            )
+            sent_update = SimpleNamespace(
+                effective_message=sent_msg,
+                effective_chat=SimpleNamespace(id=11, type="private"),
+                effective_user=SimpleNamespace(id=11),
+            )
+            await sentence_command(sent_update, sent_ctx)
+            assert sent_msg.replies == [("Remote HTTP plain translation.", None)]
+        finally:
+            await backend.aclose()
+
+    asyncio.run(exercise())
+    assert "/v1/translations" in seen_paths
+
+    # 4. create_application wires HttpCoreBackend + HttpReviewBackend when core_api_url is set.
+    app = create_application(
+        "123456:TESTTOKEN",
+        sample_db,
+        config=BotConfig(
+            owner_user_id=11,
+            core_api_url="http://127.0.0.1:8000",
+        ),
+    )
+    assert isinstance(app.bot_data[CORE_BACKEND_KEY], HttpCoreBackend)
+    assert isinstance(app.bot_data[REVIEW_BACKEND_KEY], HttpReviewBackend)
+    asyncio.run(app.bot_data[CORE_BACKEND_KEY].aclose())

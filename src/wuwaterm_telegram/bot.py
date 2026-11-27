@@ -33,6 +33,7 @@ from telegram.ext import (
 from wuwaterm.application import (
     DEFAULT_LLM_MAX_CONCURRENCY,
     DEFAULT_LLM_TIMEOUT_SECONDS,
+    EMPTY_INPUT_MESSAGE,
     KIND_LLM,
     LLM_INPUT_CHAR_LIMIT,
     LLMTranslationError,
@@ -44,7 +45,10 @@ from wuwaterm.application import (
     TranslationOutcome,
     build_term_service,
     build_translator,
+    count_cjk,
+    count_latin,
     error_code_for_llm_reason,
+    input_too_long_message,
     llm_configured,
     translate_request,
     translate_request_async,
@@ -67,8 +71,11 @@ from .channel_reply_schema import ChannelReplyPayloadError, parse_channel_reply_
 from .channel_runtime import ChannelRuntime
 from .core_backend import (
     CoreBackend,
+    CoreBackendError,
+    CoreMeta,
     DEFAULT_CORE_HTTP_TIMEOUT_SECONDS,
     HttpCoreBackend,
+    HttpReviewBackend,
     LocalCoreBackend,
 )
 from .core_compat import (
@@ -95,6 +102,7 @@ from .settings import ChatSettings, ChatSettingsDurabilityError, ChatSettingsErr
 from .state_paths import state_paths
 from .telegram_html import (
     HTML_CONTENT_FAILURE_REASONS,
+    normalize_telegram_html,
     strip_telegram_html,
     translate_html_async,
     validate_telegram_html,
@@ -1040,6 +1048,7 @@ def _reply_chunks(
     text: str, parse_mode: str | None, limit: int = TELEGRAM_TEXT_MESSAGE_LIMIT
 ) -> tuple[list[str], str | None]:
     if parse_mode == "HTML":
+        text = normalize_telegram_html(text)
         if not _validate_telegram_html(text):
             return _telegram_text_chunks(_strip_telegram_html(text), limit), None
         visible = _strip_telegram_html(text)
@@ -1161,13 +1170,21 @@ def create_application(
     app.bot_data[CHANNEL_QUEUE_KEY] = ChannelTaskQueue(
         max_size=config.channel_queue_max_size,
         ttl_seconds=float(config.channel_queue_ttl_seconds),
+        post_max_age_seconds=float(config.channel_max_age_seconds),
         max_attempts=config.channel_queue_max_attempts,
         storage_path=queue_storage_path,
     )
     app.bot_data[CHAT_SETTINGS_KEY] = chat_settings
     app.add_handler(CommandHandler(["tr", "term"], term_command, block=False))
     app.add_handler(CommandHandler(["sentence", "sent"], sentence_command, block=False))
-    review_bot.register_review(app, app.bot_data[SERVICE_KEY], translator)
+    review_backend = (
+        HttpReviewBackend(core_backend)
+        if isinstance(core_backend, HttpCoreBackend)
+        else None
+    )
+    review_bot.register_review(
+        app, app.bot_data[SERVICE_KEY], translator, backend=review_backend
+    )
     app.add_handler(CommandHandler(["help", "start"], help_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -1413,15 +1430,22 @@ async def _translation_command(
     if not request.text:
         await reply_to_user(update, usage_notice)
         return
-    service: TermService = context.application.bot_data[SERVICE_KEY]
-    translator: SentenceTranslator = context.application.bot_data[TRANSLATOR_KEY]
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
-    translated = await telegram_translation_reply(
-        service,
-        translator,
-        request,
-        input_limit=_translation_input_limit(config, request, actor),
-    )
+    core_backend = context.application.bot_data.get(CORE_BACKEND_KEY)
+    input_limit = _translation_input_limit(config, request, actor)
+    if isinstance(core_backend, HttpCoreBackend):
+        translated = await _http_translation_reply(
+            core_backend, request, input_limit=input_limit
+        )
+    else:
+        service: TermService = context.application.bot_data[SERVICE_KEY]
+        translator: SentenceTranslator = context.application.bot_data[TRANSLATOR_KEY]
+        translated = await telegram_translation_reply(
+            service,
+            translator,
+            request,
+            input_limit=input_limit,
+        )
     if not await _passes_delivery_gate(update, context):
         LOGGER.info(
             "translation reply skipped: authorization changed before delivery "
@@ -1834,7 +1858,14 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     service: TermService = context.application.bot_data[SERVICE_KEY]
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
-    await reply_to_user(update, _about_text(service, config))
+    remote_meta: CoreMeta | None = None
+    core_backend = context.application.bot_data.get(CORE_BACKEND_KEY)
+    if isinstance(core_backend, HttpCoreBackend):
+        try:
+            remote_meta = await core_backend.probe_capabilities()
+        except CoreBackendError:
+            remote_meta = core_backend.cached_meta
+    await reply_to_user(update, _about_text(service, config, remote_meta=remote_meta))
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1863,6 +1894,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         channel_queue = None
     core_backend = context.application.bot_data.get(CORE_BACKEND_KEY)
     backend_kind = getattr(core_backend, "backend_kind", "local")
+    remote_meta: CoreMeta | None = None
+    if isinstance(core_backend, HttpCoreBackend):
+        try:
+            remote_meta = await core_backend.probe_capabilities()
+        except CoreBackendError:
+            remote_meta = core_backend.cached_meta
     await reply_to_user(
         update,
         _status_text(
@@ -1873,22 +1910,36 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             channel_runtime,
             channel_queue=channel_queue,
             backend_kind=backend_kind,
+            remote_meta=remote_meta,
         ),
     )
 
 
-def _about_text(service: TermService, config: BotConfig) -> str:
-    meta = service.metadata()
-    profile = meta.get("source_profile") or "unknown"
-    repo = meta.get("source_repo_url")
-    commit = meta.get("wutheringdata_commit") or "unknown (not recorded in DB)"
-    source = f"{profile} ({repo})" if repo else profile
-    llm = "configured" if llm_configured() else "not configured"
+def _about_text(
+    service: TermService,
+    config: BotConfig,
+    *,
+    remote_meta: CoreMeta | None = None,
+) -> str:
+    if remote_meta is not None:
+        profile = remote_meta.source_profile or "unknown"
+        commit = remote_meta.source_commit or "unknown (not recorded in DB)"
+        term_count = remote_meta.term_count
+        llm = "configured" if remote_meta.llm_configured else "not configured"
+        source = profile
+    else:
+        meta = service.metadata()
+        profile = meta.get("source_profile") or "unknown"
+        repo = meta.get("source_repo_url")
+        commit = meta.get("wutheringdata_commit") or "unknown (not recorded in DB)"
+        source = f"{profile} ({repo})" if repo else profile
+        term_count = service.term_count()
+        llm = "configured" if llm_configured() else "not configured"
     return (
         "wuwaterm /about\n"
         f"Data source: {source}\n"
         f"Pinned commit: {commit}\n"
-        f"Dictionary terms: {service.term_count()}\n"
+        f"Dictionary terms: {term_count}\n"
         f"Rate limit: {config.rate_limit_per_minute}/min per chat\n"
         f"LLM: {llm}"
     )
@@ -1903,15 +1954,21 @@ def _status_text(
     *,
     channel_queue: ChannelTaskQueue | None = None,
     backend_kind: str = "local",
+    remote_meta: CoreMeta | None = None,
 ) -> str:
-    meta = service.metadata()
-    commit = meta.get("wutheringdata_commit") or "unknown"
+    if remote_meta is not None:
+        commit = remote_meta.source_commit or "unknown"
+        profile = remote_meta.source_profile or "unknown"
+        term_count = remote_meta.term_count
+        llm = "yes" if remote_meta.llm_configured else "no"
+    else:
+        meta = service.metadata()
+        commit = meta.get("wutheringdata_commit") or "unknown"
+        profile = meta.get("source_profile") or "unknown"
+        term_count = service.term_count()
+        llm = "yes" if llm_configured() else "no"
     short_commit = commit[:12] if re.fullmatch(r"[0-9a-f]{40}", commit) else commit
-    profile = meta.get("source_profile") or "unknown"
-    llm = "yes" if llm_configured() else "no"
     channel_auto = "on" if config.channel_autotranslate else "off"
-    # Counting prunes expired entries; if that triggers a persistence write,
-    # the health fields below report the refreshed state.
     tracked_channel_posts = reply_index.entry_count()
     reply_index_persistence = "on" if reply_index.persistence_enabled() else "off"
     channel_snapshot = channel_runtime.snapshot()
@@ -1942,7 +1999,7 @@ def _status_text(
     return (
         "wuwaterm /status\n"
         f"Core backend: {backend_kind}\n"
-        f"Dictionary terms: {service.term_count()}\n"
+        f"Dictionary terms: {term_count}\n"
         f"Data profile: {profile}\n"
         f"Data commit: {short_commit}\n"
         f"LLM configured: {llm}\n"
@@ -2095,6 +2152,63 @@ async def translate_query_async(
         offload=asyncio.to_thread,
     )
     return _telegram_text(outcome)
+
+
+def _resolve_direction_for_http(
+    prepared: str, forced_to_chinese: bool | None
+) -> bool:
+    if forced_to_chinese is not None:
+        return forced_to_chinese
+    cjk = count_cjk(prepared)
+    if cjk == 0:
+        return True
+    return count_latin(prepared) > cjk * 4
+
+
+async def _http_translation_reply(
+    backend: HttpCoreBackend,
+    request: TranslationRequest,
+    *,
+    input_limit: int = LLM_INPUT_CHAR_LIMIT,
+) -> TranslationReply:
+    """Serve `/tr` and `/sentence` via an independent Core HTTP service."""
+    prepared = strip_telegram_wrapper_noise(request.text, keep_paragraphs=True)
+    if not prepared:
+        return TranslationReply(EMPTY_INPUT_MESSAGE)
+    if len(prepared) > input_limit:
+        return TranslationReply(input_too_long_message(input_limit))
+    to_chinese = _resolve_direction_for_http(prepared, request.forced_to_chinese)
+
+    # Exact dictionary hit takes precedence over markup (dictionary-first).
+    if request.html and len(prepared) <= LLM_INPUT_CHAR_LIMIT:
+        try:
+            exact = await backend.lookup_exact(prepared, to_chinese=to_chinese)
+        except CoreBackendError:
+            exact = None
+        if exact:
+            return TranslationReply(exact)
+        try:
+            html_out, markup_used = await backend.translate_protected_html(
+                request.html,
+                to_chinese=to_chinese,
+            )
+            outcome = TranslationOutcome(
+                kind=KIND_LLM,
+                text=html_out,
+                to_chinese=to_chinese,
+                markup_used=markup_used,
+            )
+            return _telegram_reply(outcome)
+        except LLMTranslationError as exc:
+            reason = getattr(exc, "reason", "translation_unavailable")
+            if reason not in HTML_CONTENT_FAILURE_REASONS:
+                return TranslationReply(exc.user_message)
+
+    outcome = await backend.translate_text(
+        prepared,
+        to_chinese=request.forced_to_chinese,
+    )
+    return _telegram_reply(outcome)
 
 
 async def telegram_translation_reply(

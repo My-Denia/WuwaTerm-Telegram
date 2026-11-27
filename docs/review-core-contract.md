@@ -35,22 +35,30 @@ This adapter targets WuwaTerm Core `>=0.16.0,<1.0` (verified against Core `0.16.
   blowup; defaults stay `omit` (`en->zh`) and `disabled` (`zh->en`).
 - Linked-channel posts (`channel.py`): `channel_post_handler` aligns an outer
   `OperationExecutionBudget` with `ChannelRuntime.reserve(...)` (`allow_plain_fallback`
-  gated on `len(plain) <= LLM_INPUT_CHAR_LIMIT`). Long posts (>2,000 chars) use
-  paragraph-aware balanced HTML segmentation when markup is present, or Core's
+  gated on `len(plain) <= LLM_INPUT_CHAR_LIMIT` for short posts, and at most one
+  shared HTML-to-plain fallback slot for long rich HTML posts when per-minute
+  budget allows, while keeping per-segment corrective retries at 0). Long posts
+  (>2,000 chars) use paragraph-aware balanced HTML segmentation (preserving
+  inter-segment blank lines verbatim) when markup is present, or Core's
   `segmentation-v1` + `TranslationContext(before=ContextBefore(...))` for plain
-  text, preserving paragraph breaks and carrying prior segment context across
-  chunks. Long HTML replies (>4,096 UTF-16 units) split into balanced HTML
-  chunks rather than stripping all markup, falling back to plain text only when
-  tag validation or Telegram delivery fails. Before delivery, zero-cost
+  text. Local Core `0.16.0`'s `translate_protected_async` does not accept
+  `context` yet, so cross-segment context runs on plain segmentation and plain
+  fallback locally and activates automatically on protected HTML once a newer
+  local Core adds `context` or an HTTP Core advertises both
+  `protected-translation-v1` and `translation-context-v1`. Long HTML replies
+  (>4,096 UTF-16 units) split into balanced HTML chunks rather than stripping
+  all markup, falling back to plain text only when tag validation or Telegram
+  delivery fails. Before delivery, zero-cost
   `wuwaterm.structural_checks.check_segment_structure` (`structure-check-v1`)
   verifies numbers, paragraphs, placeholders, and non-empty output. Capacity
   rejections and transient LLM failures enqueue into a bounded recoverable
-  `ChannelTaskQueue` (`channel_queue.py`) with exponential backoff and edit
-  superseding.
+  `ChannelTaskQueue` (`channel_queue.py`) with exponential backoff, update-id
+  version ordering, and edit superseding.
 - Telegram HTML compatibility (`telegram_html.py`): supports PTB 22.8 / Bot API
   10.0 rich entities including `blockquote`/`expandable`, `<tg-emoji>`,
-  `<tg-time unix="..." format="...">` (validated attributes), and
-  `<pre><code class="{language}">` alongside `language-xxx`.
+  `<tg-time unix="..." format="...">` (validated Bot API 10.0 format tokens),
+  and normalizes PTB 22.8's `<pre><code class="{language}">` to Telegram Bot
+  API's `<pre><code class="language-{language}">` on input and delivery.
 - Telegram wrapper cleanup: the adapter owns screenshot marker removal via Core's
   native `wuwaterm.normalize.strip_telegram_wrapper_noise(..., keep_paragraphs=True)`.
   The pre-0.13.0 `normalize_user_text` fallback has been removed (`MY-360`

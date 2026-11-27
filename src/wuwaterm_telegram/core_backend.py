@@ -22,7 +22,10 @@ from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 import httpx
 
 from wuwaterm.application import (
+    ContextBefore,
     KIND_ERROR,
+    KIND_LLM,
+    LLM_INPUT_CHAR_LIMIT,
     LLMTranslationError,
     OperationExecutionBudget,
     SentenceTranslator,
@@ -34,7 +37,12 @@ from wuwaterm.application import (
     llm_configured,
     translate_request_async,
 )
-from wuwaterm.segmentation import SEGMENT_LIMIT, pair_segments
+from wuwaterm.segmentation import (
+    SEGMENT_LIMIT,
+    WHITESPACE as _SEGMENT_WHITESPACE,
+    pair_segments,
+    segment_text,
+)
 from wuwaterm.structural_checks import check_segment_structure
 
 from .core_compat import CORE_VERSION, probe_local_core_capabilities
@@ -48,6 +56,7 @@ from .review_backend import (
 )
 from .review_model import PairInfo, Span, TermFinding, VERDICT_VERIFIED
 from .telegram_html import (
+    normalize_telegram_html,
     protect_telegram_html,
     strip_telegram_html,
     translate_html_async,
@@ -436,7 +445,12 @@ class HttpCoreBackend:
             raise CoreBackendError("llm_unavailable") from exc
         if meta_resp.status_code != 200:
             raise CoreBackendError(_extract_error_code(meta_resp))
-        meta_body = meta_resp.json()
+        try:
+            meta_body = meta_resp.json()
+        except ValueError as exc:
+            raise CoreBackendError("llm_unavailable") from exc
+        if not isinstance(meta_body, Mapping):
+            raise CoreBackendError("llm_unavailable")
 
         caps: set[str] = set()
         # Primary capability channel: GET /v1/capabilities.
@@ -446,14 +460,19 @@ class HttpCoreBackend:
         except httpx.HTTPError:
             caps_resp = None
         if caps_resp is not None and caps_resp.status_code == 200:
-            caps_body = caps_resp.json()
-            raw_caps = caps_body.get("capabilities")
-            if isinstance(raw_caps, list):
-                caps.update(
-                    item
-                    for item in raw_caps
-                    if isinstance(item, str) and CAPABILITY_TOKEN_RE.fullmatch(item)
-                )
+            try:
+                caps_body = caps_resp.json()
+            except ValueError:
+                LOGGER.warning("core capabilities probe returned non-JSON 200; degrading safely")
+                caps_body = None
+            if isinstance(caps_body, Mapping):
+                raw_caps = caps_body.get("capabilities")
+                if isinstance(raw_caps, list):
+                    caps.update(
+                        item
+                        for item in raw_caps
+                        if isinstance(item, str) and CAPABILITY_TOKEN_RE.fullmatch(item)
+                    )
         elif caps_resp is not None and caps_resp.status_code not in (404, 405):
             LOGGER.warning(
                 "core capabilities probe returned status=%s", caps_resp.status_code
@@ -464,9 +483,11 @@ class HttpCoreBackend:
             try:
                 dict_resp = await self._client.get("/v1/dictionary")
                 if dict_resp.status_code == 200:
-                    rev = dict_resp.json().get("revision")
-                    if isinstance(rev, str):
-                        dictionary_revision = rev
+                    dict_body = dict_resp.json()
+                    if isinstance(dict_body, Mapping):
+                        rev = dict_body.get("revision")
+                        if isinstance(rev, str):
+                            dictionary_revision = rev
             except (httpx.HTTPError, ValueError):
                 pass
 
@@ -523,18 +544,20 @@ class HttpCoreBackend:
                     return official
         return None
 
-    async def translate_text(
+    async def llm_available(self) -> bool:
+        meta = await self.probe_capabilities()
+        return meta.llm_configured
+
+    async def _translate_single_text(
         self,
         text: str,
         *,
+        meta: CoreMeta,
         to_chinese: bool | None = None,
         context: TranslationContext | None = None,
         allow_dictionary_fallback: bool = False,
         before_llm_call=None,
-        execution_budget: OperationExecutionBudget | None = None,
     ) -> TranslationOutcome:
-        del execution_budget
-        meta = await self.probe_capabilities()
         if before_llm_call is not None:
             result = before_llm_call()
             if asyncio.iscoroutine(result):
@@ -552,29 +575,129 @@ class HttpCoreBackend:
 
         try:
             resp = await self._client.post("/v1/translations", json=body)
+        except httpx.TimeoutException:
+            return TranslationOutcome(
+                kind=KIND_ERROR,
+                text=TRANSLATION_UNAVAILABLE_NOTICE,
+                to_chinese=bool(to_chinese),
+                error_code="timeout",
+            )
+        except httpx.ConnectError:
+            return TranslationOutcome(
+                kind=KIND_ERROR,
+                text=TRANSLATION_UNAVAILABLE_NOTICE,
+                to_chinese=bool(to_chinese),
+                error_code="connect",
+            )
         except httpx.HTTPError:
             return TranslationOutcome(
                 kind=KIND_ERROR,
                 text=TRANSLATION_UNAVAILABLE_NOTICE,
                 to_chinese=bool(to_chinese),
-                error_code="llm_unavailable",
+                error_code="request",
             )
         if resp.status_code != 200:
             code = _extract_error_code(resp)
+            if resp.status_code >= 500:
+                code = "upstream"
             return TranslationOutcome(
                 kind=KIND_ERROR,
                 text=TRANSLATION_UNAVAILABLE_NOTICE,
                 to_chinese=bool(to_chinese),
                 error_code=code,
             )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            return TranslationOutcome(
+                kind=KIND_ERROR,
+                text=TRANSLATION_UNAVAILABLE_NOTICE,
+                to_chinese=bool(to_chinese),
+                error_code="invalid_response",
+            )
+        if not isinstance(data, Mapping):
+            return TranslationOutcome(
+                kind=KIND_ERROR,
+                text=TRANSLATION_UNAVAILABLE_NOTICE,
+                to_chinese=bool(to_chinese),
+                error_code="invalid_response",
+            )
         direction = data.get("direction", "zh" if to_chinese else "en")
         return TranslationOutcome(
-            kind=data.get("kind", "llm"),
+            kind=data.get("kind", KIND_LLM),
             text=str(data.get("text", "")),
             to_chinese=(direction == "zh"),
             dictionary_miss=bool(data.get("dictionary_miss", False)),
             markup_used=False,
+        )
+
+    async def translate_text(
+        self,
+        text: str,
+        *,
+        to_chinese: bool | None = None,
+        context: TranslationContext | None = None,
+        allow_dictionary_fallback: bool = False,
+        before_llm_call=None,
+        execution_budget: OperationExecutionBudget | None = None,
+    ) -> TranslationOutcome:
+        del execution_budget
+        try:
+            meta = await self.probe_capabilities()
+        except CoreBackendError as exc:
+            return TranslationOutcome(
+                kind=KIND_ERROR,
+                text=TRANSLATION_UNAVAILABLE_NOTICE,
+                to_chinese=bool(to_chinese),
+                error_code=exc.code,
+            )
+        if len(text) <= LLM_INPUT_CHAR_LIMIT:
+            return await self._translate_single_text(
+                text,
+                meta=meta,
+                to_chinese=to_chinese,
+                context=context,
+                allow_dictionary_fallback=allow_dictionary_fallback,
+                before_llm_call=before_llm_call,
+            )
+        segments = segment_text(text, limit=SEGMENT_LIMIT)
+        pieces: list[str] = []
+        before = context.before if context is not None else None
+        resolved_to_chinese = to_chinese
+        for seg in segments:
+            core = text[seg.core_start : seg.core_end]
+            if not core:
+                pieces.append(text[seg.start : seg.end])
+                continue
+            seg_ctx = TranslationContext(before=before) if before is not None or context is not None else None
+            outcome = await self._translate_single_text(
+                core,
+                meta=meta,
+                to_chinese=resolved_to_chinese,
+                context=seg_ctx,
+                allow_dictionary_fallback=allow_dictionary_fallback,
+                before_llm_call=before_llm_call,
+            )
+            if outcome.failed:
+                return outcome
+            resolved_to_chinese = outcome.to_chinese
+            translated = outcome.text
+            start, end = 0, len(translated)
+            while start < end and translated[start] in _SEGMENT_WHITESPACE:
+                start += 1
+            while end > start and translated[end - 1] in _SEGMENT_WHITESPACE:
+                end -= 1
+            translated = translated[start:end]
+            pieces.append(
+                text[seg.start : seg.core_start]
+                + translated
+                + text[seg.core_end : seg.end]
+            )
+            before = ContextBefore(source=core[-400:], target=translated[-400:])
+        return TranslationOutcome(
+            kind=KIND_LLM,
+            text="".join(pieces),
+            to_chinese=bool(resolved_to_chinese),
         )
 
     async def translate_protected_html(
@@ -596,14 +719,15 @@ class HttpCoreBackend:
         ``markup_used=False``.
         """
         meta = await self.probe_capabilities()
+        normalized_html = normalize_telegram_html(html_text)
         if CAP_PROTECTED_TRANSLATION in meta.capabilities:
-            protected = protect_telegram_html(html_text)
+            protected = protect_telegram_html(normalized_html)
             if before_llm_call is not None:
                 result = before_llm_call()
                 if asyncio.iscoroutine(result):
                     await result
             body: dict[str, Any] = {
-                "text": strip_telegram_html(html_text),
+                "text": strip_telegram_html(normalized_html),
                 "to": "zh" if to_chinese else "en",
                 "protected_text": {
                     "visible_segments": list(protected.visible_segments),
@@ -619,13 +743,26 @@ class HttpCoreBackend:
                     body["context"] = serialized
             try:
                 resp = await self._client.post("/v1/translations", json=body)
+            except httpx.TimeoutException as exc:
+                raise LLMTranslationError(
+                    TRANSLATION_UNAVAILABLE_NOTICE, reason="timeout"
+                ) from exc
+            except httpx.ConnectError as exc:
+                raise LLMTranslationError(
+                    TRANSLATION_UNAVAILABLE_NOTICE, reason="connect"
+                ) from exc
             except httpx.HTTPError as exc:
                 raise LLMTranslationError(
-                    TRANSLATION_UNAVAILABLE_NOTICE, reason="network"
+                    TRANSLATION_UNAVAILABLE_NOTICE, reason="request"
                 ) from exc
             if resp.status_code == 200:
-                data = resp.json()
-                returned_segments = data.get("visible_segments")
+                try:
+                    data = resp.json()
+                except ValueError as exc:
+                    raise LLMTranslationError(
+                        TRANSLATION_UNAVAILABLE_NOTICE, reason="invalid_response"
+                    ) from exc
+                returned_segments = data.get("visible_segments") if isinstance(data, Mapping) else None
                 if (
                     isinstance(returned_segments, list)
                     and len(returned_segments) == len(protected.visible_segments)
@@ -639,22 +776,19 @@ class HttpCoreBackend:
                     restored = "".join(restored_parts)
                     if validate_telegram_html(restored):
                         return restored, True
-                # Structured markup response was invalid -> degrade safely to plain.
-                plain_text = data.get("text")
+                plain_text = data.get("text") if isinstance(data, Mapping) else None
                 if isinstance(plain_text, str) and plain_text.strip():
                     return strip_telegram_html(plain_text), False
                 raise LLMTranslationError(
                     TRANSLATION_UNAVAILABLE_NOTICE, reason="html_integrity"
                 )
-            code = _extract_error_code(resp)
+            code = "upstream" if resp.status_code >= 500 else _extract_error_code(resp)
             if code != "invalid_request":
                 raise LLMTranslationError(
                     TRANSLATION_UNAVAILABLE_NOTICE, reason=code
                 )
-            # Server rejected structured payload unexpectedly -> fall through to plain.
 
-        # Plain degradation when server does not advertise protected-text-v1.
-        plain_source = strip_telegram_html(html_text)
+        plain_source = strip_telegram_html(normalized_html)
         outcome = await self.translate_text(
             plain_source,
             to_chinese=to_chinese,
@@ -665,7 +799,7 @@ class HttpCoreBackend:
         if outcome.failed:
             raise LLMTranslationError(
                 outcome.text or TRANSLATION_UNAVAILABLE_NOTICE,
-                reason=outcome.error_code or "llm_unavailable",
+                reason=outcome.error_code or "upstream",
             )
         return outcome.text, False
 

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import logging
 import os
 import stat
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +67,8 @@ from wuwaterm_telegram.telegram_text import telegram_text_units
     [
         '<tg-time unix="1700000000" format="r">tomorrow</tg-time>',
         '<tg-time unix="1700000000" format="wDT">Monday</tg-time>',
+        '<tg-time unix="1700000000" format="dt">12:00</tg-time>',
+        '<tg-time unix="1700000000" format="">12:00</tg-time>',
         '<tg-time unix="1700000000">12:00</tg-time>',
         '<pre><code class="python">print(1)</code></pre>',
         '<pre><code class="language-python">print(1)</code></pre>',
@@ -83,6 +86,12 @@ def test_ptb_228_rich_html_tags_validate(snippet):
         "<tg-time>missing unix</tg-time>",
         '<tg-time unix="not-a-number">x</tg-time>',
         '<tg-time unix="1700000000" format="invalid!">x</tg-time>',
+        '<tg-time unix="1700000000" format="dd">x</tg-time>',
+        '<tg-time unix="1700000000" format="dD">x</tg-time>',
+        '<tg-time unix="1700000000" format="tt">x</tg-time>',
+        '<tg-time unix="1700000000" format="tT">x</tg-time>',
+        '<tg-time unix="1700000000" format="ww">x</tg-time>',
+        '<tg-time unix="1700000000" format="rw">x</tg-time>',
         '<tg-time unix="1700000000" onclick="evil">x</tg-time>',
         '<code class="python">bare class outside pre</code>',
         '<pre><code class="">empty lang</code></pre>',
@@ -91,6 +100,54 @@ def test_ptb_228_rich_html_tags_validate(snippet):
 )
 def test_ptb_228_invalid_rich_html_rejected(snippet):
     assert not validate_telegram_html(snippet)
+
+
+def test_ptb_228_pre_code_class_and_date_time_round_trip():
+    from telegram import Chat, Message, MessageEntity
+
+    from wuwaterm_telegram.telegram_html import (
+        normalize_telegram_html,
+        protect_telegram_html,
+    )
+
+    chat = Chat(id=-2001, type="supergroup")
+    code_msg = Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        text="print(1)",
+        entities=(
+            MessageEntity(
+                type=MessageEntity.PRE, offset=0, length=8, language="python"
+            ),
+        ),
+    )
+    assert code_msg.text_html == '<pre><code class="python">print(1)</code></pre>'
+    normalized = normalize_telegram_html(code_msg.text_html)
+    assert normalized == '<pre><code class="language-python">print(1)</code></pre>'
+    protected = protect_telegram_html(code_msg.text_html)
+    assert protected is not None
+    restored = protected.render()
+    assert restored == '<pre><code class="language-python">print(1)</code></pre>'
+    assert validate_telegram_html(restored)
+
+    dt_msg = Message(
+        message_id=2,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        text="Monday",
+        entities=(
+            MessageEntity(
+                type=MessageEntity.DATE_TIME,
+                offset=0,
+                length=6,
+                unix_time=1700000000,
+                date_time_format="wDT",
+            ),
+        ),
+    )
+    assert dt_msg.text_html is not None
+    assert validate_telegram_html(dt_msg.text_html)
 
 
 def test_split_telegram_html_preserves_paragraphs_and_balances_tags():
@@ -606,3 +663,447 @@ def test_channel_queue_recovers_post_after_transient_llm_failure_and_reports_sta
     assert "Channel queue pending: 0" in reply
     assert "Channel queue completed: 1" in reply
     assert "今汐技能说明文本" not in reply
+
+
+# ---------------------------------------------------------------------------
+# 5. Review regressions: outcomes, queue ordering/TTL, HTML fallback & gate
+# ---------------------------------------------------------------------------
+
+
+def test_queued_task_timed_out_marks_failed_never_completed_even_with_concurrent_delivery(
+    monkeypatch, sample_db
+):
+    from telegram.error import TimedOut
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    async def fake_translate_async(
+        self,
+        text,
+        *,
+        to_chinese=False,
+        before_llm_call=None,
+        propagate_errors=False,
+        context=None,
+        execution_budget=None,
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        return "Translated."
+
+    monkeypatch.setattr(SentenceTranslator, "translate_async", fake_translate_async)
+
+    now = [time.time()]
+    queue = ChannelTaskQueue(
+        base_backoff_seconds=1.0,
+        ttl_seconds=300.0,
+        post_max_age_seconds=86400.0,
+        clock=lambda: now[0],
+    )
+
+    class _TimeoutBot(_FakeBot):
+        async def send_message(self, chat_id: int, text: str, **kwargs):
+            # Simulate a concurrent delivery of another post bumping global runtime counters
+            # while THIS post hits TimedOut.
+            runtime = context.application.bot_data.get(CHANNEL_RUNTIME_KEY)
+            if runtime is not None:
+                runtime.record("delivered", "delivered")
+            raise TimedOut("gateway timeout")
+
+    bot = _TimeoutBot()
+    context = _make_context(sample_db, bot=bot, queue=queue)
+    context.application.bot = bot
+
+    task = queue.enqueue(
+        chat_id=-2001,
+        message_id=5201,
+        chat_type="supergroup",
+        plain="今汐超时交付测试",
+        html=None,
+        is_edit=False,
+        update_id=10,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+    assert task is not None
+    now[0] += 2.0
+    processed = asyncio.run(
+        queue.process_once(
+            lambda t: execute_queued_channel_task(context.application, t)
+        )
+    )
+    assert processed is True
+    assert queue.stats().completed == 0
+    assert queue.stats().failed == 1
+    assert queue.stats().pending == 0
+    reply_index = context.application.bot_data[CHANNEL_REPLY_INDEX_KEY]
+    assert reply_index.get(-2001, 5201) is None
+
+
+def test_channel_queue_rejects_stale_update_id_and_retains_inflight_supersede(
+    tmp_path,
+):
+    now = [1000.0]
+    storage = tmp_path / "queue_supersede.json"
+    queue = ChannelTaskQueue(
+        max_size=4,
+        ttl_seconds=600.0,
+        post_max_age_seconds=86400.0,
+        base_backoff_seconds=2.0,
+        storage_path=storage,
+        clock=lambda: now[0],
+    )
+
+    t20 = queue.enqueue(
+        chat_id=-2001,
+        message_id=7100,
+        chat_type="supergroup",
+        plain="v20",
+        html=None,
+        is_edit=False,
+        update_id=20,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+    assert t20 is not None
+    # Older or equal update_id must not overwrite pending v20.
+    stale = queue.enqueue(
+        chat_id=-2001,
+        message_id=7100,
+        chat_type="supergroup",
+        plain="v19",
+        html=None,
+        is_edit=True,
+        update_id=19,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+    assert stale is t20
+    assert t20.plain == "v20"
+    assert t20.update_id == 20
+
+    # Advance past backoff so v20 runs IN_FLIGHT; enqueue stale v19 and newer v21 mid-flight.
+    now[0] += 5.0
+    seen_order: list[tuple[int | None, str]] = []
+
+    async def runner(task):
+        seen_order.append((task.update_id, task.plain))
+        if task.update_id == 20:
+            # Older update ignored while IN_FLIGHT.
+            queue.enqueue(
+                chat_id=-2001,
+                message_id=7100,
+                chat_type="supergroup",
+                plain="v19-late",
+                html=None,
+                is_edit=True,
+                update_id=19,
+                message_date_ts=now[0],
+                length_limit=4096,
+                reason="timeout",
+            )
+            # Newer edit retained in pending supersede buffer and persisted with 0600.
+            queue.enqueue(
+                chat_id=-2001,
+                message_id=7100,
+                chat_type="supergroup",
+                plain="v21",
+                html=None,
+                is_edit=True,
+                update_id=21,
+                message_date_ts=now[0],
+                length_limit=4096,
+                reason="timeout",
+            )
+            if os.name == "posix":
+                assert stat.S_IMODE(storage.stat().st_mode) == 0o600
+        return TaskExecutionOutcome("completed", "delivered")
+
+    assert asyncio.run(queue.process_once(runner)) is True
+    # After v20 finishes, v21 must immediately be promoted to PENDING (not dropped).
+    promoted = queue.get(-2001, 7100)
+    assert promoted is not None
+    assert promoted.state == ChannelTaskState.PENDING
+    assert promoted.update_id == 21
+    assert promoted.plain == "v21"
+
+    now[0] += 5.0
+    assert asyncio.run(queue.process_once(runner)) is True
+    assert seen_order == [(20, "v20"), (21, "v21")]
+    assert queue.get(-2001, 7100) is None
+
+
+@pytest.mark.parametrize("transient_reason", ["upstream", "connect", "request"])
+def test_channel_enqueues_core_016_transient_transport_reasons(
+    monkeypatch, sample_db, transient_reason
+):
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    async def failing_protected(
+        self, protected, *, to_chinese=False, before_llm_call=None, execution_budget=None
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        raise LLMTranslationError("transient", reason=transient_reason)
+
+    monkeypatch.setattr(
+        SentenceTranslator, "translate_protected_async", failing_protected
+    )
+    queue = ChannelTaskQueue(base_backoff_seconds=1.0)
+    msg = _FakeMessage(5300, "今汐技能测试")
+    update = SimpleNamespace(
+        update_id=5300,
+        effective_message=msg,
+        effective_chat=SimpleNamespace(id=-2001, type="supergroup"),
+        effective_user=None,
+    )
+    context = _make_context(sample_db, queue=queue)
+    asyncio.run(channel_post_handler(update, context))
+    assert queue.stats().pending == 1
+
+
+def test_channel_queue_separates_post_max_age_from_queue_ttl_and_enforces_inflight_deadline(
+    monkeypatch, sample_db, tmp_path
+):
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    now = [time.time()]
+    storage = tmp_path / "ttl_queue.json"
+    queue = ChannelTaskQueue(
+        max_size=4,
+        ttl_seconds=3600.0,
+        post_max_age_seconds=86400.0,
+        base_backoff_seconds=5.0,
+        storage_path=storage,
+        clock=lambda: now[0],
+    )
+    # Post published 2 hours ago (within 24h post_max_age_seconds, older than 1h queue TTL).
+    post_ts = now[0] - 7200.0
+    task = queue.enqueue(
+        chat_id=-2001,
+        message_id=5400,
+        chat_type="supergroup",
+        plain="两小时前发布的今汐帖子",
+        html=None,
+        is_edit=False,
+        update_id=100,
+        message_date_ts=post_ts,
+        length_limit=4096,
+        reason="timeout",
+    )
+    assert task is not None
+    assert task.expires_at == pytest.approx(now[0] + 3600.0)
+    assert queue.prune_expired() == 0
+
+    # Advance past backoff, lease IN_FLIGHT, then advance past queue TTL while IN_FLIGHT.
+    now[0] += 6.0
+    leased = queue.lease_due()
+    assert leased is task
+    assert leased.state == ChannelTaskState.IN_FLIGHT
+    now[0] += 4000.0
+    pruned = queue.prune_expired()
+    assert pruned == 1
+    assert leased.plain == ""
+    assert leased.html is None
+    assert "两小时前发布的今汐帖子" not in storage.read_text(encoding="utf-8")
+
+    # End-to-end delivery gate aborts if queue deadline crosses during in-flight LLM call.
+    now[0] = time.time()
+    queue2 = ChannelTaskQueue(
+        max_size=4,
+        ttl_seconds=60.0,
+        post_max_age_seconds=86400.0,
+        base_backoff_seconds=1.0,
+        clock=lambda: now[0],
+    )
+
+    async def slow_translate_async(
+        self,
+        text,
+        *,
+        to_chinese=False,
+        before_llm_call=None,
+        propagate_errors=False,
+        context=None,
+        execution_budget=None,
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        # Simulate queue TTL expiring mid-flight before send_message runs.
+        now[0] += 120.0
+        return "Late translation."
+
+    monkeypatch.setattr(SentenceTranslator, "translate_async", slow_translate_async)
+    bot = _FakeBot()
+    context = _make_context(sample_db, bot=bot, queue=queue2)
+    context.application.bot = bot
+    task2 = queue2.enqueue(
+        chat_id=-2001,
+        message_id=5401,
+        chat_type="supergroup",
+        plain="今汐在途超时测试",
+        html=None,
+        is_edit=False,
+        update_id=101,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+    assert task2 is not None
+    now[0] += 2.0
+    asyncio.run(
+        queue2.process_once(
+            lambda t: execute_queued_channel_task(context.application, t)
+        )
+    )
+    assert bot.sent == []
+    assert queue2.stats().completed == 0
+    assert queue2.stats().expired >= 1
+
+
+def test_long_html_post_recovers_segment_integrity_via_plain_fallback_and_keeps_blank_lines(
+    monkeypatch, sample_db
+):
+    from wuwaterm_telegram.telegram_html import translator_supports_protected_context
+
+    # Core 0.16.0 SentenceTranslator.translate_protected_async does not declare context yet.
+    assert translator_supports_protected_context(SentenceTranslator(sample_db)) is False
+
+    class _ContextCapableTranslator:
+        async def translate_protected_async(
+            self, protected, *, to_chinese=False, context=None, **kwargs
+        ):
+            return protected
+
+    assert translator_supports_protected_context(_ContextCapableTranslator()) is True
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    protected_calls = [0]
+    fallback_contexts: list[TranslationContext | None] = []
+
+    async def fake_translate_protected_async(
+        self, protected, *, to_chinese=False, before_llm_call=None, execution_budget=None
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        protected_calls[0] += 1
+        if protected_calls[0] == 1:
+            new_segments = list(protected.visible_segments)
+            new_segments[1] = "First rich segment."
+            return type(protected)(tuple(new_segments), protected.structures)
+        # Second segment breaks placeholder integrity -> triggers budgeted plain fallback.
+        raise LLMTranslationError("placeholder broken", reason="html_integrity")
+
+    async def fake_translate_async(
+        self,
+        text,
+        *,
+        to_chinese=False,
+        before_llm_call=None,
+        propagate_errors=False,
+        context=None,
+        execution_budget=None,
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        fallback_contexts.append(context)
+        return "Second segment plain fallback <safe>."
+
+    monkeypatch.setattr(
+        SentenceTranslator, "translate_protected_async", fake_translate_protected_async
+    )
+    monkeypatch.setattr(SentenceTranslator, "translate_async", fake_translate_async)
+
+    seg1_plain = "今汐在第一段展示技能。" * 130
+    seg2_plain = "声骸在第二段提供效果。" * 110
+    full_plain = f"{seg1_plain}\n\n{seg2_plain}"
+    full_html = f"<b>{seg1_plain}</b>\n\n<i>{seg2_plain}</i>"
+    assert len(full_plain) > LLM_INPUT_CHAR_LIMIT
+
+    msg = _FakeMessage(5500, full_plain, text_html=full_html)
+    update = SimpleNamespace(
+        update_id=5500,
+        effective_message=msg,
+        effective_chat=SimpleNamespace(id=-2001, type="supergroup"),
+        effective_user=None,
+    )
+    context = _make_context(sample_db)
+    asyncio.run(channel_post_handler(update, context))
+
+    assert len(msg.replies) == 1
+    delivered_text, parse_mode, _ = msg.replies[0]
+    assert parse_mode == "HTML"
+    assert validate_telegram_html(delivered_text)
+    assert delivered_text == "<b>First rich segment.</b>\n\nSecond segment plain fallback &lt;safe&gt;."
+    assert len(fallback_contexts) == 1
+    assert fallback_contexts[0] is not None
+    assert fallback_contexts[0].before is not None
+    assert fallback_contexts[0].before.target == "First rich segment."
+
+
+def test_subsequent_html_chunk_badrequest_rechecks_delivery_gate_before_plain_fallback(
+    monkeypatch, sample_db
+):
+    from telegram.error import BadRequest
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    part1 = "Chunk one text. " * 140
+    part2 = "Chunk two text. " * 140
+
+    async def fake_protected(
+        self, protected, *, to_chinese=False, before_llm_call=None, execution_budget=None
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        new_segments = list(protected.visible_segments)
+        new_segments[1] = part1
+        new_segments[3] = part2
+        return type(protected)(tuple(new_segments), protected.structures)
+
+    monkeypatch.setattr(SentenceTranslator, "translate_protected_async", fake_protected)
+
+    context = _make_context(sample_db)
+    settings = context.application.bot_data[CHAT_SETTINGS_KEY]
+
+    class _RevokeOnSecondChunkMsg(_FakeMessage):
+        async def reply_text(self, text: str, **kwargs):
+            parse_mode = kwargs.get("parse_mode")
+            if len(self.replies) == 0:
+                return await super().reply_text(text, **kwargs)
+            if parse_mode == "HTML":
+                # Authorization revoked while chunk 2 HTML request was in flight.
+                settings.disallow(-2001)
+                raise BadRequest("Can't parse entities")
+            # Plain fallback must never execute once authorization is revoked!
+            return await super().reply_text(text, **kwargs)
+
+    msg = _RevokeOnSecondChunkMsg(
+        5600,
+        text="第一段\n\n第二段",
+        text_html="<b>第一段</b>\n\n<i>第二段</i>",
+    )
+    update = SimpleNamespace(
+        update_id=5600,
+        effective_message=msg,
+        effective_chat=SimpleNamespace(id=-2001, type="supergroup"),
+        effective_user=None,
+    )
+    asyncio.run(channel_post_handler(update, context))
+
+    assert len(msg.replies) == 1
+    assert msg.replies[0][1] == "HTML"

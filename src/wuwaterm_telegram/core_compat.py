@@ -18,42 +18,87 @@ MAX_CORE_VERSION_EXCLUSIVE = "1.0.0"
 CORE_VERSION_SPEC = ">=0.16.0,<1.0"
 DATABASE_SCHEMA_VERSION = "2"
 
-_VERSION_PREFIX_RE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+_PEP440_FINAL_RE = re.compile(
+    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)(?:\.post(?P<post>\d+))?\Z"
+)
+
+try:
+    from packaging.specifiers import SpecifierSet as _SpecifierSet
+    from packaging.version import InvalidVersion as _InvalidVersion, Version as _Version
+except ImportError:  # pragma: no cover - stdlib fallback
+    _SpecifierSet = None
+    _InvalidVersion = ValueError
+    _Version = None
 
 
 class CoreCompatibilityError(RuntimeError):
     """The installed Core does not support this adapter."""
 
 
-def parse_version_tuple(version: str) -> tuple[int, int, int]:
-    """Extract the leading (major, minor, patch) numeric version tuple."""
-    match = _VERSION_PREFIX_RE.match(version.strip())
+def _stdlib_final_version_key(version: str) -> tuple[int, tuple[int, ...], int]:
+    match = _PEP440_FINAL_RE.fullmatch(version.strip())
     if match is None:
-        raise ValueError(f"invalid version string: {version!r}")
-    major = int(match.group(1))
-    minor = int(match.group(2) or 0)
-    patch = int(match.group(3) or 0)
-    return (major, minor, patch)
+        raise ValueError(f"unsupported or pre-release version: {version!r}")
+    epoch = int(match.group("epoch") or 0)
+    parts = [int(p) for p in match.group("release").split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    post = int(match.group("post")) if match.group("post") is not None else -1
+    return (epoch, tuple(parts), post)
+
+
+def parse_version_tuple(version: str) -> tuple[int, int, int]:
+    """Extract the (major, minor, patch) numeric tuple of a final PEP 440 version."""
+    _epoch, parts, _post = _stdlib_final_version_key(version)
+    return (parts[0], parts[1], parts[2])
 
 
 def _version_at_least(version: str, minimum: str) -> bool:
-    return parse_version_tuple(version) >= parse_version_tuple(minimum)
+    if _Version is not None:
+        try:
+            return _Version(version) >= _Version(minimum)
+        except _InvalidVersion:
+            return False
+    try:
+        return _stdlib_final_version_key(version) >= _stdlib_final_version_key(minimum)
+    except ValueError:
+        return False
 
 
 def is_compatible_core_version(
     version: str,
     *,
-    minimum: str = MIN_CORE_VERSION,
-    maximum_exclusive: str = MAX_CORE_VERSION_EXCLUSIVE,
+    spec: str = CORE_VERSION_SPEC,
 ) -> bool:
-    """True when ``version`` falls inside the supported semver range."""
+    """True when ``version`` satisfies the PEP 440 Core version specifier."""
+    if _SpecifierSet is not None and _Version is not None:
+        try:
+            parsed = _Version(version)
+            return _SpecifierSet(spec).contains(parsed, prereleases=False)
+        except (_InvalidVersion, ValueError):
+            return False
     try:
-        parsed = parse_version_tuple(version)
-        low = parse_version_tuple(minimum)
-        high = parse_version_tuple(maximum_exclusive)
+        parsed_key = _stdlib_final_version_key(version)
     except ValueError:
         return False
-    return low <= parsed < high
+    for clause in (part.strip() for part in spec.split(",") if part.strip()):
+        for op in ("==", ">=", "<=", ">", "<"):
+            if clause.startswith(op):
+                target_key = _stdlib_final_version_key(clause[len(op) :])
+                if op == "==" and not (parsed_key == target_key):
+                    return False
+                if op == ">=" and not (parsed_key >= target_key):
+                    return False
+                if op == "<=" and not (parsed_key <= target_key):
+                    return False
+                if op == ">" and not (parsed_key > target_key):
+                    return False
+                if op == "<" and not (parsed_key < target_key):
+                    return False
+                break
+        else:
+            return False
+    return True
 
 
 def wrapper_strip_is_native() -> bool:

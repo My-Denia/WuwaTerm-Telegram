@@ -12,46 +12,69 @@ ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "My-Denia/WuwaTerm"
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-_VERSION_RE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?")
-_SPEC_CLAUSE_RE = re.compile(r"^(==|>=|<=|>|<)([0-9]+(?:\.[0-9]+)*)\Z")
+_PEP440_FINAL_RE = re.compile(
+    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)(?:\.post(?P<post>\d+))?\Z"
+)
+_SPEC_CLAUSE_RE = re.compile(r"^(==|>=|<=|>|<)([0-9]+(?:\.[0-9]+)*(?:\.post[0-9]+)?)\Z")
+
+try:
+    from packaging.specifiers import InvalidSpecifier as _InvalidSpecifier, SpecifierSet as _SpecifierSet
+    from packaging.version import InvalidVersion as _InvalidVersion, Version as _Version
+except ImportError:  # pragma: no cover - stdlib-only CI runner before venv setup
+    _InvalidSpecifier = ValueError
+    _SpecifierSet = None
+    _InvalidVersion = ValueError
+    _Version = None
 
 
 class LockError(ValueError):
     pass
 
 
-def _version_tuple(value: str) -> tuple[int, int, int]:
-    match = _VERSION_RE.match(value.strip())
+def _stdlib_final_version_key(value: str) -> tuple[int, tuple[int, ...], int]:
+    match = _PEP440_FINAL_RE.fullmatch(value.strip())
     if match is None:
-        raise LockError(f"invalid Core version: {value!r}")
-    return (
-        int(match.group(1)),
-        int(match.group(2) or 0),
-        int(match.group(3) or 0),
-    )
+        raise LockError(f"invalid or pre-release Core version: {value!r}")
+    epoch = int(match.group("epoch") or 0)
+    parts = [int(p) for p in match.group("release").split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    post = int(match.group("post")) if match.group("post") is not None else -1
+    return (epoch, tuple(parts), post)
 
 
 def version_satisfies_spec(version: str, spec: str) -> bool:
-    """Evaluate a simple PEP 440 comma-separated version specifier."""
-    parsed = _version_tuple(version)
+    """Evaluate a PEP 440 version specifier, matching packaging.SpecifierSet."""
     clauses = [part.strip() for part in spec.split(",") if part.strip()]
     if not clauses:
         raise LockError("Core dependency specifier must not be empty")
     for clause in clauses:
-        match = _SPEC_CLAUSE_RE.fullmatch(clause)
-        if match is None:
+        if _SPEC_CLAUSE_RE.fullmatch(clause) is None:
             raise LockError(f"unsupported Core version clause: {clause!r}")
+    if _SpecifierSet is not None and _Version is not None:
+        try:
+            parsed = _Version(version)
+            return _SpecifierSet(spec).contains(parsed, prereleases=False)
+        except (_InvalidVersion, _InvalidSpecifier):
+            return False
+    try:
+        parsed_key = _stdlib_final_version_key(version)
+    except LockError:
+        return False
+    for clause in clauses:
+        match = _SPEC_CLAUSE_RE.fullmatch(clause)
+        assert match is not None
         op, target_raw = match.groups()
-        target = _version_tuple(target_raw)
-        if op == "==" and not (parsed == target):
+        target_key = _stdlib_final_version_key(target_raw)
+        if op == "==" and not (parsed_key == target_key):
             return False
-        if op == ">=" and not (parsed >= target):
+        if op == ">=" and not (parsed_key >= target_key):
             return False
-        if op == "<=" and not (parsed <= target):
+        if op == "<=" and not (parsed_key <= target_key):
             return False
-        if op == ">" and not (parsed > target):
+        if op == ">" and not (parsed_key > target_key):
             return False
-        if op == "<" and not (parsed < target):
+        if op == "<" and not (parsed_key < target_key):
             return False
     return True
 

@@ -52,8 +52,89 @@ _TAG_NAME_RE = re.compile(r"^<\s*(/?)\s*([A-Za-z][A-Za-z0-9-]*)")
 _HTML_TAG_PRESENT_RE = re.compile(r"</?[A-Za-z][^>]*>")
 _CODE_LANG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+#.-]{1,64}\Z")
 _TG_TIME_UNIX_RE = re.compile(r"^-?[0-9]{1,16}\Z")
-_TG_TIME_FORMAT_RE = re.compile(r"^(?:r|[wdDtT]{1,4})\Z")
+_CODE_OPEN_CLASS_RE = re.compile(
+    r'^<code\s+class=(?P<q>["\'])(?P<cls>[^"\']+)(?P=q)\s*>\Z',
+    re.IGNORECASE,
+)
 _SPLIT_BOUNDARY_CHARS = frozenset(" \t\r\n.,;:!?)]}、，。！？；：）】》")
+
+
+def _is_valid_tg_time_format(fmt: str) -> bool:
+    """Validate Telegram Bot API Date-Time format string.
+
+    Allowed: empty string (default format), ``"r"`` (relative), or a
+    non-repeating combination of at most one weekday (``w``), one date
+    (``d``/``D``), and one time (``t``/``T``).
+    """
+    if fmt == "" or fmt == "r":
+        return True
+    if any(ch not in "wdDtT" for ch in fmt):
+        return False
+    return (
+        fmt.count("w") <= 1
+        and (fmt.count("d") + fmt.count("D")) <= 1
+        and (fmt.count("t") + fmt.count("T")) <= 1
+    )
+
+
+def normalize_telegram_html(html_text: str) -> str:
+    """Normalize PTB 22.8 HTML quirks to strict Telegram Bot API / TDLib HTML.
+
+    PTB 22.8 emits ``<pre><code class="python">`` without the ``language-``
+    prefix that Telegram/TDLib requires for syntax highlighting. Rewrites bare
+    language classes inside ``<pre>`` to ``class="language-{lang}"`` while
+    leaving all other tags, attributes, entities, and text untouched.
+    """
+    if "<code" not in html_text or "<pre" not in html_text:
+        return html_text
+    parts: list[str] = []
+    stack: list[str] = []
+    cursor = 0
+    for start, end in _structural_spans(html_text):
+        if start > cursor:
+            parts.append(html_text[cursor:start])
+        raw = html_text[start:end]
+        if raw.startswith("&"):
+            parts.append(raw)
+        else:
+            match = _TAG_NAME_RE.match(raw)
+            if match is None:
+                parts.append(raw)
+            else:
+                closing, name = match.group(1), match.group(2).lower()
+                if closing:
+                    if stack and stack[-1] == name:
+                        stack.pop()
+                    parts.append(raw)
+                else:
+                    parent = stack[-1] if stack else None
+                    if name == "code" and parent == "pre":
+                        cls_match = _CODE_OPEN_CLASS_RE.fullmatch(raw)
+                        if cls_match is not None:
+                            cls = cls_match.group("cls")
+                            if (
+                                not cls.startswith("language-")
+                                and _CODE_LANG_TOKEN_RE.fullmatch(cls)
+                            ):
+                                quote = cls_match.group("q")
+                                raw = f"<code class={quote}language-{cls}{quote}>"
+                    stack.append(name)
+                    parts.append(raw)
+        cursor = end
+    if cursor < len(html_text):
+        parts.append(html_text[cursor:])
+    return "".join(parts)
+
+
+def translator_supports_protected_context(translator) -> bool:
+    """True iff ``translator.translate_protected_async`` accepts a ``context`` arg."""
+    fn = getattr(translator, "translate_protected_async", None)
+    if fn is None:
+        return False
+    try:
+        return "context" in signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 # Retry without formatting only for unusable model content, never for quota,
 # network, authorization or freshness failures.
@@ -127,15 +208,16 @@ def _structural_tokens(html_text: str) -> tuple[str, ...]:
 def protect_telegram_html(html_text: str) -> ProtectedText:
     """Supply exact tags and entities as opaque Core structures."""
 
+    normalized = normalize_telegram_html(html_text)
     segments: list[str] = []
     structures: list[ProtectedStructure] = []
     cursor = 0
-    for start, end in _structural_spans(html_text):
-        segments.append(html_text[cursor:start])
-        raw = html_text[start:end]
+    for start, end in _structural_spans(normalized):
+        segments.append(normalized[cursor:start])
+        raw = normalized[start:end]
         structures.append(ProtectedStructure(raw, unescape(raw) if raw.startswith("&") else ""))
         cursor = end
-    segments.append(html_text[cursor:])
+    segments.append(normalized[cursor:])
     return ProtectedText(tuple(segments), tuple(structures))
 
 
@@ -173,12 +255,8 @@ async def translate_html_async(
         kwargs = {"to_chinese": to_chinese, "before_llm_call": before_llm_call}
         if execution_budget is not None:
             kwargs["execution_budget"] = execution_budget
-        if context is not None:
-            try:
-                if "context" in signature(translator.translate_protected_async).parameters:
-                    kwargs["context"] = context
-            except (TypeError, ValueError):
-                pass
+        if context is not None and translator_supports_protected_context(translator):
+            kwargs["context"] = context
         translated = await translator.translate_protected_async(
             protected, **kwargs
         )
@@ -245,7 +323,7 @@ class _TelegramHTMLValidator(HTMLParser):
                 return False
             if "format" in attrs:
                 fmt_val = attrs.get("format")
-                if not isinstance(fmt_val, str) or not _TG_TIME_FORMAT_RE.fullmatch(fmt_val):
+                if fmt_val is None or not _is_valid_tg_time_format(fmt_val):
                     return False
             return True
         if tag == "code":
@@ -688,3 +766,39 @@ def split_telegram_html(
     if "".join(rebuilt_visible_parts) != original_visible:
         return None
     return chunks
+
+
+def _extract_outer_whitespace(html_chunk: str) -> tuple[str, str, str]:
+    """Split pure leading/trailing top-level whitespace outside any tags."""
+    length = len(html_chunk)
+    start = 0
+    while start < length and html_chunk[start] in " \t\r\n":
+        start += 1
+    end = length
+    while end > start and html_chunk[end - 1] in " \t\r\n":
+        end -= 1
+    return html_chunk[:start], html_chunk[start:end], html_chunk[end:]
+
+
+def split_telegram_html_segments(
+    html_text: str,
+    *,
+    limit: int,
+) -> list[tuple[str, str, str]] | None:
+    """Split long HTML for translation, isolating inter-segment whitespace.
+
+    Returns ``[(leading_ws, core_html, trailing_ws), ...]`` so callers can
+    translate ``core_html`` and reattach the exact original blank lines and
+    separators verbatim even if the model strips trailing newlines.
+    """
+    normalized = normalize_telegram_html(html_text)
+    chunks = split_telegram_html(normalized, limit=limit, unit_counter=len)
+    if not chunks:
+        return None
+    result: list[tuple[str, str, str]] = []
+    for chunk in chunks:
+        lead, core, trail = _extract_outer_whitespace(chunk)
+        if core and not validate_telegram_html(core):
+            return None
+        result.append((lead, core, trail))
+    return result
