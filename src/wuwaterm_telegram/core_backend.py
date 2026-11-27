@@ -430,6 +430,7 @@ class HttpCoreBackend:
         self._cached_at: float | None = None
         self._last_probe_attempt_at: float | None = None
         self._capabilities_probe_ok = False
+        self._inflight_probe: asyncio.Task[CoreMeta] | None = None
 
     @property
     def backend_kind(self) -> Literal["http", "local"]:
@@ -448,16 +449,8 @@ class HttpCoreBackend:
             return self._capability_ttl_seconds
         return min(self._capability_ttl_seconds, self._capability_retry_cooldown_seconds)
 
-    async def probe_capabilities(self, *, force: bool = False) -> CoreMeta:
+    async def _run_probe_once(self) -> CoreMeta:
         now = self._clock()
-        if (
-            not force
-            and self._cached_meta is not None
-            and self._cached_at is not None
-            and (now - self._cached_at) < self._effective_cache_ttl()
-        ):
-            return self._cached_meta
-
         self._last_probe_attempt_at = now
         try:
             meta_resp = await self._client.get("/v1/meta")
@@ -531,18 +524,50 @@ class HttpCoreBackend:
         self._capabilities_probe_ok = caps_probe_ok
         return meta
 
+    async def probe_capabilities(self, *, force: bool = False) -> CoreMeta:
+        now = self._clock()
+        if (
+            not force
+            and self._cached_meta is not None
+            and self._cached_at is not None
+            and (now - self._cached_at) < self._effective_cache_ttl()
+        ):
+            return self._cached_meta
+
+        inflight = self._inflight_probe
+        if inflight is not None and not inflight.done():
+            return await asyncio.shield(inflight)
+
+        task = asyncio.create_task(self._run_probe_once())
+        self._inflight_probe = task
+
+        def _cleanup(done_task: asyncio.Task[CoreMeta]) -> None:
+            if self._inflight_probe is done_task:
+                self._inflight_probe = None
+            if not done_task.cancelled():
+                done_task.exception()
+
+        task.add_done_callback(_cleanup)
+        return await asyncio.shield(task)
+
     async def ensure_capabilities_fresh(self) -> CoreMeta | None:
-        """Refresh cached metadata/capabilities with cooldown after startup or empty probe."""
+        """Refresh cached metadata/capabilities with cooldown & single-flight dedup."""
         now = self._clock()
         if self._cached_meta is not None and self._cached_at is not None:
             if (now - self._cached_at) < self._effective_cache_ttl():
                 return self._cached_meta
-        elif (
+        inflight = self._inflight_probe
+        if inflight is not None and not inflight.done():
+            try:
+                return await asyncio.shield(inflight)
+            except CoreBackendError:
+                return self._cached_meta
+        if (
             self._last_probe_attempt_at is not None
             and (now - self._last_probe_attempt_at)
             < self._capability_retry_cooldown_seconds
         ):
-            return None
+            return self._cached_meta
         try:
             return await self.probe_capabilities(force=True)
         except CoreBackendError:
@@ -1004,6 +1029,14 @@ class HttpCoreBackend:
         return data
 
     async def aclose(self) -> None:
+        inflight = self._inflight_probe
+        self._inflight_probe = None
+        if inflight is not None and not inflight.done():
+            inflight.cancel()
+            try:
+                await inflight
+            except BaseException:
+                pass
         await self._client.aclose()
 
 

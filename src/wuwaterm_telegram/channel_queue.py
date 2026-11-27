@@ -179,7 +179,9 @@ class ChannelTaskQueue:
         self._counts: Counter[str] = Counter()
         self._next_lease_id = 0
         self._wakeup = asyncio.Event()
+        self._expiry_wakeup = asyncio.Event()
         self._worker_task: asyncio.Task | None = None
+        self._sweeper_task: asyncio.Task | None = None
         self._stop_requested = False
 
         if self.storage_path is not None:
@@ -700,30 +702,82 @@ class ChannelTaskQueue:
         *,
         poll_interval_seconds: float = DEFAULT_QUEUE_POLL_INTERVAL_SECONDS,
     ) -> None:
-        """Start the background consumer task on the active event loop."""
-        if self._worker_task is not None and not self._worker_task.done():
-            return
+        """Start the background consumer and independent TTL expiry sweeper."""
         self._stop_requested = False
         loop = asyncio.get_running_loop()
-        self._worker_task = loop.create_task(
-            self._run_worker(executor, poll_interval_seconds=poll_interval_seconds),
-            name="wuwaterm-channel-queue-worker",
-        )
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = loop.create_task(
+                self._run_worker(
+                    executor, poll_interval_seconds=poll_interval_seconds
+                ),
+                name="wuwaterm-channel-queue-worker",
+            )
+        if self._sweeper_task is None or self._sweeper_task.done():
+            self._sweeper_task = loop.create_task(
+                self._run_expiry_sweeper(
+                    poll_interval_seconds=poll_interval_seconds
+                ),
+                name="wuwaterm-channel-queue-sweeper",
+            )
 
     async def stop(self) -> None:
-        """Stop the background consumer cleanly and persist remaining state."""
+        """Stop background consumer & sweeper cleanly and persist remaining state."""
         self._stop_requested = True
         self._signal_wakeup()
-        task = self._worker_task
+        tasks = [
+            task
+            for task in (self._worker_task, self._sweeper_task)
+            if task is not None and not task.done()
+        ]
         self._worker_task = None
-        if task is not None and not task.done():
+        self._sweeper_task = None
+        for task in tasks:
             task.cancel()
+        for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
         self.prune_expired()
         self._persist()
+
+    async def _run_expiry_sweeper(self, *, poll_interval_seconds: float) -> None:
+        """Independently prune and wipe expired tasks even while executor is busy."""
+        while not self._stop_requested:
+            try:
+                self.prune_expired()
+                wait_seconds = self._next_expiry_wait_seconds(poll_interval_seconds)
+                if wait_seconds <= 0:
+                    await asyncio.sleep(0)
+                    continue
+                self._expiry_wakeup.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._expiry_wakeup.wait(), timeout=wait_seconds
+                    )
+                except asyncio.TimeoutError:
+                    self.prune_expired()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001 - keep sweeper alive
+                LOGGER.warning(
+                    "channel_queue sweeper iteration error error_type=%s",
+                    safe_error_type(exc),
+                )
+                await asyncio.sleep(min(0.5, max(0.01, poll_interval_seconds)))
+
+    def _next_expiry_wait_seconds(self, default_interval: float) -> float:
+        now = self._clock()
+        deadlines = [task.expires_at for task in self._tasks.values()]
+        deadlines.extend(
+            task.expires_at for task in self._pending_supersede.values()
+        )
+        if not deadlines:
+            return default_interval
+        soonest = min(deadlines) - now
+        if soonest <= 0:
+            return 0.0
+        return max(0.01, min(default_interval, soonest))
 
     async def _run_worker(
         self, executor: TaskExecutor, *, poll_interval_seconds: float
@@ -812,6 +866,7 @@ class ChannelTaskQueue:
         except RuntimeError:
             return
         self._wakeup.set()
+        self._expiry_wakeup.set()
 
     def _serialize_task(self, task: ChannelTask) -> dict:
         return {

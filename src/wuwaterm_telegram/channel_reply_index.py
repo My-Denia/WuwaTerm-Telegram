@@ -145,7 +145,8 @@ class ChannelReplyIndex:
 
     def mark_complete(self, chat_id: int, message_id: int) -> None:
         """Mark a tracked multi-chunk delivery as completely delivered."""
-        self._incomplete_deliveries.pop((chat_id, message_id), None)
+        if self._incomplete_deliveries.pop((chat_id, message_id), None) is not None:
+            self._save_best_effort()
 
     def is_partial_delivery(
         self, chat_id: int, message_id: int, now: float | None = None
@@ -476,10 +477,16 @@ class ChannelReplyIndex:
         for row in rows:
             if row.expires_at <= now:
                 continue
-            self._entries[(row.chat_id, row.message_id)] = (
+            key = (row.chat_id, row.message_id)
+            self._entries[key] = (
                 row.expires_at,
                 row.reply_message_ids,
             )
+            if (
+                row.expected_chunks is not None
+                and row.expected_chunks > len(row.reply_message_ids)
+            ):
+                self._incomplete_deliveries[key] = row.expected_chunks
         if skipped_malformed_rows:
             self._record_load_failure(
                 "channel reply index contained malformed rows"
@@ -556,14 +563,16 @@ class ChannelReplyIndex:
         for (chat_id, message_id), (expires_at, reply_ids) in sorted(
             self._entries.items()
         ):
-            rows.append(
-                {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "expires_at": expires_at,
-                    "reply_message_ids": list(reply_ids),
-                }
-            )
+            row: dict[str, object] = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "expires_at": expires_at,
+                "reply_message_ids": list(reply_ids),
+            }
+            expected = self._incomplete_deliveries.get((chat_id, message_id))
+            if expected is not None and expected > len(reply_ids):
+                row["expected_chunks"] = expected
+            rows.append(row)
         return {"version": CHANNEL_REPLY_INDEX_VERSION, "entries": rows}
 
     def _write_payload(self, payload: dict) -> None:

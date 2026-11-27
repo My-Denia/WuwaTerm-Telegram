@@ -1423,3 +1423,224 @@ def test_long_html_spanning_tag_preserves_inner_blank_line_at_split_boundary(
     assert parse_mode == "HTML"
     assert validate_telegram_html(delivered)
     assert delivered == "<b>Paragraph 1.</b>\n\n<b>Paragraph 2.</b>"
+
+
+def test_partial_delivery_persists_across_restart_and_completes_only_after_remaining_chunk(
+    monkeypatch, sample_db, tmp_path
+):
+    import json
+
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    long_out = ("A" * 3000) + "\n\n" + ("B" * 3000)
+
+    async def fake_translate_async(
+        self,
+        text,
+        *,
+        to_chinese=False,
+        before_llm_call=None,
+        propagate_errors=False,
+        context=None,
+        execution_budget=None,
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        return long_out
+
+    monkeypatch.setattr(SentenceTranslator, "translate_async", fake_translate_async)
+
+    now = [time.time()]
+    reply_path = tmp_path / "channel_replies.json"
+    queue_path = tmp_path / "channel_queue.json"
+
+    # Legacy file without expected_chunks loads as complete (backward compatibility).
+    reply_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "entries": [
+                    {
+                        "chat_id": -2001,
+                        "message_id": 5949,
+                        "expires_at": now[0] + 3600.0,
+                        "reply_message_ids": [8999],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_idx = ChannelReplyIndex(
+        ttl_seconds=3600.0, storage_path=reply_path, clock=lambda: now[0]
+    )
+    assert legacy_idx.is_partial_delivery(-2001, 5949) is False
+    assert legacy_idx.claim_original(-2001, 5949).role == "done"
+
+    # Process 1: Chunk 0 sends (9001), chunk 1 raises RetryAfter -> flush to disk.
+    class _Chunk2ControlledBot(_FakeBot):
+        def __init__(self, allow_chunk2: bool):
+            super().__init__()
+            self.allow_chunk2 = allow_chunk2
+
+        async def send_message(self, chat_id: int, text: str, **kwargs):
+            if text.startswith("B") and not self.allow_chunk2:
+                raise RetryAfter(0.0)
+            return await super().send_message(chat_id, text, **kwargs)
+
+    queue1 = ChannelTaskQueue(
+        max_attempts=4,
+        base_backoff_seconds=1.0,
+        ttl_seconds=300.0,
+        post_max_age_seconds=86400.0,
+        storage_path=queue_path,
+        clock=lambda: now[0],
+    )
+    bot1 = _Chunk2ControlledBot(allow_chunk2=False)
+    ctx1 = _make_context(sample_db, bot=bot1, queue=queue1)
+    ctx1.application.bot = bot1
+    ctx1.application.bot_data[CHANNEL_REPLY_INDEX_KEY] = legacy_idx
+
+    queue1.enqueue(
+        chat_id=-2001,
+        message_id=5950,
+        chat_type="supergroup",
+        plain="今汐重启后多块投递测试",
+        html=None,
+        is_edit=False,
+        update_id=501,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+    now[0] += 2.0
+    asyncio.run(
+        queue1.process_once(
+            lambda t: execute_queued_channel_task(ctx1.application, t)
+        )
+    )
+    asyncio.run(legacy_idx.aflush())
+    assert legacy_idx.is_partial_delivery(-2001, 5950) is True
+    assert queue1.stats().completed == 0
+
+    # Process 2 (simulated restart): fresh instances loaded from disk.
+    reloaded_idx = ChannelReplyIndex(
+        ttl_seconds=3600.0, storage_path=reply_path, clock=lambda: now[0]
+    )
+    reloaded_queue = ChannelTaskQueue(
+        max_attempts=4,
+        base_backoff_seconds=1.0,
+        ttl_seconds=300.0,
+        post_max_age_seconds=86400.0,
+        storage_path=queue_path,
+        clock=lambda: now[0],
+    )
+    assert reloaded_idx.is_partial_delivery(-2001, 5950) is True
+    assert reloaded_idx.claim_original(-2001, 5950).role == "partial"
+
+    # Replay 1 after restart with chunk 2 still failing -> MUST NOT mark completed.
+    bot2 = _Chunk2ControlledBot(allow_chunk2=False)
+    ctx2 = _make_context(sample_db, bot=bot2, queue=reloaded_queue)
+    ctx2.application.bot = bot2
+    ctx2.application.bot_data[CHANNEL_REPLY_INDEX_KEY] = reloaded_idx
+    now[0] += 5.0
+    asyncio.run(
+        reloaded_queue.process_once(
+            lambda t: execute_queued_channel_task(ctx2.application, t)
+        )
+    )
+    assert reloaded_queue.stats().completed == 0
+    assert reloaded_idx.is_partial_delivery(-2001, 5950) is True
+
+    # Replay 2 after restart with chunk 2 succeeding -> edits chunk 0, sends chunk 1, marks completed.
+    bot2.allow_chunk2 = True
+    now[0] += 10.0
+    asyncio.run(
+        reloaded_queue.process_once(
+            lambda t: execute_queued_channel_task(ctx2.application, t)
+        )
+    )
+    asyncio.run(reloaded_idx.aflush())
+    assert reloaded_queue.stats().completed == 1
+    assert reloaded_idx.is_partial_delivery(-2001, 5950) is False
+    assert len(bot2.edits) == 2  # once on replay 1, once on replay 2
+    assert len(bot2.sent) == 1  # chunk 1 sent once (no duplicate chunk 0)
+
+    # Process 3: persisted snapshot reflects completion (no longer partial).
+    final_idx = ChannelReplyIndex(
+        ttl_seconds=3600.0, storage_path=reply_path, clock=lambda: now[0]
+    )
+    assert final_idx.is_partial_delivery(-2001, 5950) is False
+    assert final_idx.claim_original(-2001, 5950).role == "done"
+    assert len(final_idx.get_many(-2001, 5950)) == 2
+
+
+def test_channel_queue_sweeper_wipes_inflight_and_pending_text_while_executor_blocks(
+    tmp_path,
+):
+    storage = tmp_path / "sweeper_busy.json"
+    inflight_secret = "INFLIGHT_BLOCKED_SECRET_BODY"
+    pending_secret = "PENDING_QUEUED_SECRET_BODY"
+
+    async def exercise() -> None:
+        queue = ChannelTaskQueue(
+            max_size=4,
+            ttl_seconds=0.08,
+            base_backoff_seconds=0.0,
+            storage_path=storage,
+        )
+        t_inflight = queue.enqueue(
+            chat_id=-2001,
+            message_id=5960,
+            chat_type="supergroup",
+            plain=inflight_secret,
+            html=f"<b>{inflight_secret}</b>",
+            is_edit=False,
+            update_id=601,
+            message_date_ts=time.time(),
+            length_limit=4096,
+            reason="timeout",
+            initial_delay_seconds=0.0,
+        )
+        t_pending = queue.enqueue(
+            chat_id=-2001,
+            message_id=5961,
+            chat_type="supergroup",
+            plain=pending_secret,
+            html=f"<b>{pending_secret}</b>",
+            is_edit=False,
+            update_id=602,
+            message_date_ts=time.time(),
+            length_limit=4096,
+            reason="timeout",
+            initial_delay_seconds=30.0,
+        )
+        assert t_inflight is not None and t_pending is not None
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_executor(task):
+            started.set()
+            await release.wait()
+            return TaskExecutionOutcome("completed", "late")
+
+        queue.start(blocking_executor, poll_interval_seconds=60.0)
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            # While executor is STILL blocked on task 1, wait past TTL (0.08s).
+            await asyncio.sleep(0.22)
+            assert queue.get(-2001, 5960) is None
+            assert queue.get(-2001, 5961) is None
+            assert t_inflight.plain == "" and t_inflight.html is None
+            assert t_pending.plain == "" and t_pending.html is None
+            persisted = storage.read_text(encoding="utf-8")
+            assert inflight_secret not in persisted
+            assert pending_secret not in persisted
+        finally:
+            release.set()
+            await queue.stop()
+
+    asyncio.run(exercise())

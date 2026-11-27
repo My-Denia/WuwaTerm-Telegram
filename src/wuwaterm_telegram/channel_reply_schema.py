@@ -20,6 +20,7 @@ class ChannelReplyRow:
     message_id: int
     expires_at: float
     reply_message_ids: tuple[int, ...]
+    expected_chunks: int | None = None
 
 
 def parse_channel_reply_payload(
@@ -69,7 +70,19 @@ def _parse_row(raw: Any) -> ChannelReplyRow:
     reply_message_ids = tuple(
         _strict_int(value, "reply_message_id") for value in reply_raw
     )
-    return ChannelReplyRow(chat_id, message_id, expires_at, reply_message_ids)
+    expected_raw = raw.get("expected_chunks")
+    expected_chunks: int | None = None
+    if expected_raw is not None:
+        expected_chunks = _strict_int(expected_raw, "expected_chunks")
+        if expected_chunks < 1:
+            raise ChannelReplyPayloadError("expected_chunks must be positive")
+    return ChannelReplyRow(
+        chat_id,
+        message_id,
+        expires_at,
+        reply_message_ids,
+        expected_chunks=expected_chunks,
+    )
 
 
 def _strict_int(value: Any, name: str) -> int:
