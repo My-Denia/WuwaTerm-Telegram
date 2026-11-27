@@ -13,7 +13,9 @@ REPOSITORY = "My-Denia/WuwaTerm"
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _PEP440_FINAL_RE = re.compile(
-    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)(?:\.post(?P<post>\d+))?\Z"
+    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)"
+    r"(?:\.post(?P<post>\d+))?"
+    r"(?:\+(?P<local>[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*))?\Z"
 )
 _SPEC_CLAUSE_RE = re.compile(r"^(==|>=|<=|>|<)([0-9]+(?:\.[0-9]+)*(?:\.post[0-9]+)?)\Z")
 

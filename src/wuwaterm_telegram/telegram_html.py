@@ -52,6 +52,7 @@ _TAG_NAME_RE = re.compile(r"^<\s*(/?)\s*([A-Za-z][A-Za-z0-9-]*)")
 _HTML_TAG_PRESENT_RE = re.compile(r"</?[A-Za-z][^>]*>")
 _CODE_LANG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+#.-]{1,64}\Z")
 _TG_TIME_UNIX_RE = re.compile(r"^-?[0-9]{1,16}\Z")
+_TG_TIME_FORMAT_RE = re.compile(r"^(?:|r|(?=.+)w?[dD]?[tT]?)\Z")
 _CODE_OPEN_CLASS_RE = re.compile(
     r'^<code\s+class=(?P<q>["\'])(?P<cls>[^"\']+)(?P=q)\s*>\Z',
     re.IGNORECASE,
@@ -62,19 +63,10 @@ _SPLIT_BOUNDARY_CHARS = frozenset(" \t\r\n.,;:!?)]}、，。！？；：）】�
 def _is_valid_tg_time_format(fmt: str) -> bool:
     """Validate Telegram Bot API Date-Time format string.
 
-    Allowed: empty string (default format), ``"r"`` (relative), or a
-    non-repeating combination of at most one weekday (``w``), one date
-    (``d``/``D``), and one time (``t``/``T``).
+    Allowed: empty string (default format), ``"r"`` (relative), or a non-empty
+    subset strictly in canonical order ``w?`` + ``[dD]?`` + ``[tT]?``.
     """
-    if fmt == "" or fmt == "r":
-        return True
-    if any(ch not in "wdDtT" for ch in fmt):
-        return False
-    return (
-        fmt.count("w") <= 1
-        and (fmt.count("d") + fmt.count("D")) <= 1
-        and (fmt.count("t") + fmt.count("T")) <= 1
-    )
+    return _TG_TIME_FORMAT_RE.fullmatch(fmt) is not None
 
 
 def normalize_telegram_html(html_text: str) -> str:
@@ -780,6 +772,78 @@ def _extract_outer_whitespace(html_chunk: str) -> tuple[str, str, str]:
     return html_chunk[:start], html_chunk[start:end], html_chunk[end:]
 
 
+def _extract_boundary_whitespace(html_chunk: str) -> tuple[str, str, str]:
+    """Extract leading/trailing whitespace outside tags AND at spanning tag edges.
+
+    When a single tag such as ``<b>...\\n\\n...</b>`` spans a segment split
+    boundary, ``split_telegram_html`` emits ``<b>para1\\n\\n</b>`` and
+    ``<b>para2</b>``. Extracting the ``\\n\\n`` sitting immediately before the
+    trailing closing tags (or right after leading opening tags) preserves
+    inter-segment blank lines verbatim even if the translator strips edge
+    whitespace from translated segments.
+    """
+    outer_lead, middle, outer_trail = _extract_outer_whitespace(html_chunk)
+    if not middle:
+        return outer_lead, "", outer_trail
+
+    tokens = _tokenize_html(middle)
+    if not tokens:
+        return outer_lead, middle, outer_trail
+
+    inner_lead = ""
+    inner_trail = ""
+
+    # Leading whitespace immediately after pure opening tags (e.g. <b>\n\nText).
+    lead_idx = 0
+    while (
+        lead_idx < len(tokens)
+        and tokens[lead_idx][0] == "open"
+        and tokens[lead_idx][2] not in _ATOMIC_TAGS
+    ):
+        lead_idx += 1
+    if lead_idx < len(tokens) and tokens[lead_idx][0] == "text":
+        raw_text = tokens[lead_idx][1]
+        ws_end = 0
+        while ws_end < len(raw_text) and raw_text[ws_end] in " \t\r\n":
+            ws_end += 1
+        if ws_end > 0:
+            inner_lead = raw_text[:ws_end]
+            rest = raw_text[ws_end:]
+            tokens[lead_idx] = ("text", rest, rest)
+
+    # Trailing whitespace immediately before pure closing tags (e.g. Text\n\n</b>).
+    trail_idx = len(tokens) - 1
+    while (
+        trail_idx >= 0
+        and tokens[trail_idx][0] == "close"
+        and tokens[trail_idx][2] not in _ATOMIC_TAGS
+    ):
+        trail_idx -= 1
+    if trail_idx >= 0 and tokens[trail_idx][0] == "text":
+        raw_text = tokens[trail_idx][1]
+        ws_start = len(raw_text)
+        while ws_start > 0 and raw_text[ws_start - 1] in " \t\r\n":
+            ws_start -= 1
+        if ws_start < len(raw_text):
+            inner_trail = raw_text[ws_start:]
+            rest = raw_text[:ws_start]
+            tokens[trail_idx] = ("text", rest, rest)
+
+    if not inner_lead and not inner_trail:
+        return outer_lead, middle, outer_trail
+
+    core = "".join(raw for _kind, raw, _extra in tokens if raw)
+    lead = outer_lead + inner_lead
+    trail = inner_trail + outer_trail
+    if not strip_telegram_html(core):
+        return lead, "", trail
+    if not validate_telegram_html(core):
+        return outer_lead, middle, outer_trail
+    if lead + strip_telegram_html(core) + trail != strip_telegram_html(html_chunk):
+        return outer_lead, middle, outer_trail
+    return lead, core, trail
+
+
 def split_telegram_html_segments(
     html_text: str,
     *,
@@ -797,7 +861,7 @@ def split_telegram_html_segments(
         return None
     result: list[tuple[str, str, str]] = []
     for chunk in chunks:
-        lead, core, trail = _extract_outer_whitespace(chunk)
+        lead, core, trail = _extract_boundary_whitespace(chunk)
         if core and not validate_telegram_html(core):
             return None
         result.append((lead, core, trail))

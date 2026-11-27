@@ -635,3 +635,281 @@ def test_http_backend_wires_channel_commands_and_review_without_local_llm(
     assert isinstance(app.bot_data[CORE_BACKEND_KEY], HttpCoreBackend)
     assert isinstance(app.bot_data[REVIEW_BACKEND_KEY], HttpReviewBackend)
     asyncio.run(app.bot_data[CORE_BACKEND_KEY].aclose())
+
+
+def test_http_channel_post_over_200_chars_skips_terms_and_translates(
+    monkeypatch, sample_db
+):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from wuwaterm_telegram.bot import (
+        ADMIN_CACHE_KEY,
+        CHANNEL_REPLY_INDEX_KEY,
+        CHAT_SETTINGS_KEY,
+        CONFIG_KEY,
+        CORE_BACKEND_KEY,
+        RATE_LIMITER_KEY,
+        REJECT_LIMITER_KEY,
+        SERVICE_KEY,
+        TRANSLATOR_KEY,
+        AdminStatusCache,
+        BotConfig,
+        ChannelReplyIndex,
+        PerChatRateLimiter,
+    )
+    from wuwaterm_telegram.channel import channel_post_handler
+    from wuwaterm_telegram.settings import ChatSettings
+
+    for env_var in (
+        "WUWATERM_OPENAI_BASE_URL",
+        "WUWATERM_OPENAI_API_KEY",
+        "WUWATERM_OPENAI_MODEL",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    terms_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/meta":
+            return httpx.Response(200, json=_meta_payload())
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(
+                200,
+                json={"api_version": "v1", "capabilities": [], "request_id": "cap-200"},
+            )
+        if request.url.path == "/v1/terms":
+            q = request.url.params.get("q", "")
+            terms_calls.append(q)
+            if len(q) > 200:
+                return httpx.Response(
+                    400,
+                    json={"error": {"code": "invalid_request", "message": "too long"}},
+                )
+            return httpx.Response(
+                400, json={"error": {"code": "invalid_request", "message": "bad"}}
+            )
+        if request.url.path == "/v1/translations":
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "llm",
+                    "text": "Translated 224-char channel post.",
+                    "direction": "en",
+                    "dictionary_miss": False,
+                    "request_id": "req-tr-224",
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    class _FakeMsg:
+        def __init__(self, msg_id: int, text: str):
+            self.message_id = msg_id
+            self.text = text
+            self.caption = None
+            self.text_html = text
+            self.caption_html = None
+            self.date = datetime.now(timezone.utc)
+            self.edit_date = None
+            self.replies: list[tuple[str, str | None]] = []
+
+        async def reply_text(self, text: str, **kwargs):
+            self.replies.append((text, kwargs.get("parse_mode")))
+            return SimpleNamespace(message_id=self.message_id + 100)
+
+    async def exercise() -> None:
+        backend = HttpCoreBackend(
+            "http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            config = BotConfig(owner_user_id=11, channel_llm_calls_per_minute=20)
+            settings = ChatSettings(sample_db.parent / "http_224_settings.json")
+            settings.allow(-2001)
+            bot_data = {
+                SERVICE_KEY: TermService(sample_db),
+                TRANSLATOR_KEY: SentenceTranslator(sample_db),
+                CORE_BACKEND_KEY: backend,
+                CONFIG_KEY: config,
+                RATE_LIMITER_KEY: PerChatRateLimiter(limit=10),
+                REJECT_LIMITER_KEY: PerChatRateLimiter(limit=10),
+                ADMIN_CACHE_KEY: AdminStatusCache(),
+                CHANNEL_REPLY_INDEX_KEY: ChannelReplyIndex(ttl_seconds=3600.0),
+                CHAT_SETTINGS_KEY: settings,
+            }
+            ctx = SimpleNamespace(
+                args=[],
+                bot=SimpleNamespace(),
+                application=SimpleNamespace(bot_data=bot_data),
+            )
+            post_224 = "今汐技能说明" * 37 + "测试"
+            assert len(post_224) == 224
+            msg = _FakeMsg(8100, post_224)
+            update = SimpleNamespace(
+                update_id=8100,
+                effective_message=msg,
+                effective_chat=SimpleNamespace(id=-2001, type="supergroup"),
+                effective_user=None,
+            )
+            await channel_post_handler(update, ctx)
+            assert terms_calls == []
+            assert msg.replies == [("Translated 224-char channel post.", None)]
+
+            # Even for <=200 chars, invalid_request from /v1/terms degrades to cache miss.
+            assert await backend.lookup_exact("今汐测试", to_chinese=False) is None
+            assert terms_calls == ["今汐测试"]
+        finally:
+            await backend.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_http_long_tr_uses_full_text_direction_for_all_segments(monkeypatch, sample_db):
+    from wuwaterm_telegram.bot import TranslationRequest, _http_translation_reply
+
+    sent_bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/meta":
+            return httpx.Response(200, json=_meta_payload())
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(
+                200,
+                json={
+                    "api_version": "v1",
+                    "capabilities": [CAP_TRANSLATION_CONTEXT],
+                    "request_id": "cap-dir",
+                },
+            )
+        if request.url.path == "/v1/translations":
+            body = json.loads(request.content)
+            sent_bodies.append(body)
+            direction = body.get("to") or "zh"
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "llm",
+                    "text": f"seg-{len(sent_bodies)}-{direction}",
+                    "direction": direction,
+                    "dictionary_miss": False,
+                    "request_id": f"req-{len(sent_bodies)}",
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    # First paragraph is purely English, followed by predominantly Chinese content.
+    # Full-text rule: CJK is dominant (latin <= cjk * 4) -> overall direction must be to_en.
+    en_lead = "Wuthering Waves patch notes overview. " * 25
+    zh_body = "今汐在本次更新中调整了共鸣回路与共鸣解放的倍率数值。" * 80
+    long_text = f"{en_lead}\n\n{zh_body}"
+    assert len(long_text) > 2000
+
+    async def exercise() -> None:
+        backend = HttpCoreBackend(
+            "http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            reply = await _http_translation_reply(
+                backend,
+                TranslationRequest(text=long_text, forced_to_chinese=None),
+                input_limit=10000,
+            )
+            assert "seg-1-en" in reply.text
+            assert "seg-2-en" in reply.text
+            assert len(sent_bodies) >= 2
+            assert all(b.get("to") == "en" for b in sent_bodies)
+        finally:
+            await backend.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_http_review_backend_recovers_semantic_capability_after_startup_failure():
+    from wuwaterm_telegram.review_flow import run_review
+    from wuwaterm_telegram.review_model import SEMANTIC_DONE, SEMANTIC_UNAVAILABLE
+
+    now = [100.0]
+    core_up = [False]
+    cap_calls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/meta":
+            if not core_up[0]:
+                return httpx.Response(503, json={"error": {"code": "llm_unavailable"}})
+            return httpx.Response(200, json=_meta_payload())
+        if request.url.path == "/v1/capabilities":
+            cap_calls[0] += 1
+            if not core_up[0]:
+                return httpx.Response(503, json={"error": {"code": "llm_unavailable"}})
+            return httpx.Response(
+                200,
+                json={
+                    "api_version": "v1",
+                    "capabilities": [CAP_SEMANTIC_REVIEW],
+                    "request_id": f"cap-{cap_calls[0]}",
+                },
+            )
+        if request.url.path == "/v1/reviews":
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "rev-1",
+                    "source_revision": "a" * 64,
+                    "target_revision": "b" * 64,
+                    "rule_version": "review-v2",
+                    "dictionary": {
+                        "schema_version": "2",
+                        "source_commit": "x",
+                        "term_count": 1,
+                    },
+                    "coverage": {"evaluated": 1, "not_evaluated": 0, "rules": []},
+                    "findings": [],
+                    "truncated": False,
+                },
+            )
+        if request.url.path == "/v1/semantic-reviews":
+            return httpx.Response(
+                200,
+                json={
+                    "review_version": "semantic-review-v1",
+                    "status": "complete",
+                    "issues": [],
+                    "dropped_unanchored": 0,
+                    "omitted_issues": 0,
+                    "truncated_reason": None,
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async def exercise() -> None:
+        backend = HttpCoreBackend(
+            "http://127.0.0.1:8000",
+            capability_retry_cooldown_seconds=15.0,
+            transport=httpx.MockTransport(handler),
+            clock=lambda: now[0],
+        )
+        review_backend = HttpReviewBackend(backend)
+        try:
+            # Startup capability probe fails while Core is down.
+            with pytest.raises(CoreBackendError):
+                await backend.probe_capabilities()
+            assert review_backend.semantic_available() is False
+
+            # Within cooldown (now=105), /review stays dictionary-only without hammering.
+            now[0] = 105.0
+            first_report = await run_review(review_backend, "今汐登场", "Jinhsi appears", "en")
+            assert first_report.semantic_state == SEMANTIC_UNAVAILABLE
+            assert cap_calls[0] == 0
+
+            # Core recovers and cooldown elapses (now=120) -> /review automatically recovers.
+            core_up[0] = True
+            now[0] = 120.0
+            second_report = await run_review(review_backend, "今汐登场", "Jinhsi appears", "en")
+            assert second_report.semantic_state == SEMANTIC_DONE
+            assert review_backend.semantic_available() is True
+            assert cap_calls[0] == 1
+        finally:
+            await backend.aclose()
+
+    asyncio.run(exercise())

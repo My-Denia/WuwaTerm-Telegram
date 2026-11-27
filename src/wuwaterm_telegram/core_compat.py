@@ -19,7 +19,9 @@ CORE_VERSION_SPEC = ">=0.16.0,<1.0"
 DATABASE_SCHEMA_VERSION = "2"
 
 _PEP440_FINAL_RE = re.compile(
-    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)(?:\.post(?P<post>\d+))?\Z"
+    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)"
+    r"(?:\.post(?P<post>\d+))?"
+    r"(?:\+(?P<local>[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*))?\Z"
 )
 
 try:

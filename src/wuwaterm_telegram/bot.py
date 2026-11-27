@@ -2204,9 +2204,14 @@ async def _http_translation_reply(
             if reason not in HTML_CONTENT_FAILURE_REASONS:
                 return TranslationReply(exc.user_message)
 
+    resolved_direction = (
+        to_chinese
+        if len(prepared) > LLM_INPUT_CHAR_LIMIT
+        else request.forced_to_chinese
+    )
     outcome = await backend.translate_text(
         prepared,
-        to_chinese=request.forced_to_chinese,
+        to_chinese=resolved_direction,
     )
     return _telegram_reply(outcome)
 

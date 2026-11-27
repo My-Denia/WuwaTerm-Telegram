@@ -34,6 +34,8 @@ from wuwaterm.application import (
     TranslationContext,
     TranslationJob,
     TranslationOutcome,
+    count_cjk,
+    count_latin,
     llm_configured,
     translate_request_async,
 )
@@ -81,7 +83,9 @@ CAP_KNOWLEDGE_RETRIEVAL = "knowledge-retrieval-v1"
 CAP_HYBRID_RAG = "hybrid-rag-v1"
 
 DEFAULT_CAPABILITY_CACHE_TTL_SECONDS = 60.0
+DEFAULT_CAPABILITY_RETRY_COOLDOWN_SECONDS = 15.0
 DEFAULT_CORE_HTTP_TIMEOUT_SECONDS = 45.0
+HTTP_TERM_QUERY_MAX_CHARS = 200
 
 
 class CoreBackendError(RuntimeError):
@@ -398,6 +402,7 @@ class HttpCoreBackend:
         api_token: str | None = None,
         timeout_seconds: float = DEFAULT_CORE_HTTP_TIMEOUT_SECONDS,
         capability_ttl_seconds: float = DEFAULT_CAPABILITY_CACHE_TTL_SECONDS,
+        capability_retry_cooldown_seconds: float = DEFAULT_CAPABILITY_RETRY_COOLDOWN_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -408,6 +413,9 @@ class HttpCoreBackend:
         self._api_token = (api_token or "").strip() or None
         self._timeout_seconds = timeout_seconds
         self._capability_ttl_seconds = capability_ttl_seconds
+        self._capability_retry_cooldown_seconds = max(
+            0.0, float(capability_retry_cooldown_seconds)
+        )
         self._clock = clock
         headers = {"Accept": "application/json"}
         if self._api_token:
@@ -420,6 +428,8 @@ class HttpCoreBackend:
         )
         self._cached_meta: CoreMeta | None = None
         self._cached_at: float | None = None
+        self._last_probe_attempt_at: float | None = None
+        self._capabilities_probe_ok = False
 
     @property
     def backend_kind(self) -> Literal["http", "local"]:
@@ -429,16 +439,26 @@ class HttpCoreBackend:
     def cached_meta(self) -> CoreMeta | None:
         return self._cached_meta
 
+    def _effective_cache_ttl(self) -> float:
+        if (
+            self._cached_meta is not None
+            and self._capabilities_probe_ok
+            and bool(self._cached_meta.capabilities)
+        ):
+            return self._capability_ttl_seconds
+        return min(self._capability_ttl_seconds, self._capability_retry_cooldown_seconds)
+
     async def probe_capabilities(self, *, force: bool = False) -> CoreMeta:
         now = self._clock()
         if (
             not force
             and self._cached_meta is not None
             and self._cached_at is not None
-            and (now - self._cached_at) < self._capability_ttl_seconds
+            and (now - self._cached_at) < self._effective_cache_ttl()
         ):
             return self._cached_meta
 
+        self._last_probe_attempt_at = now
         try:
             meta_resp = await self._client.get("/v1/meta")
         except httpx.HTTPError as exc:
@@ -453,6 +473,7 @@ class HttpCoreBackend:
             raise CoreBackendError("llm_unavailable")
 
         caps: set[str] = set()
+        caps_probe_ok = False
         # Primary capability channel: GET /v1/capabilities.
         # GET /v1/meta keeps its published exact-key contract for Web/Windows clients.
         try:
@@ -468,6 +489,7 @@ class HttpCoreBackend:
             if isinstance(caps_body, Mapping):
                 raw_caps = caps_body.get("capabilities")
                 if isinstance(raw_caps, list):
+                    caps_probe_ok = True
                     caps.update(
                         item
                         for item in raw_caps
@@ -506,7 +528,25 @@ class HttpCoreBackend:
         )
         self._cached_meta = meta
         self._cached_at = now
+        self._capabilities_probe_ok = caps_probe_ok
         return meta
+
+    async def ensure_capabilities_fresh(self) -> CoreMeta | None:
+        """Refresh cached metadata/capabilities with cooldown after startup or empty probe."""
+        now = self._clock()
+        if self._cached_meta is not None and self._cached_at is not None:
+            if (now - self._cached_at) < self._effective_cache_ttl():
+                return self._cached_meta
+        elif (
+            self._last_probe_attempt_at is not None
+            and (now - self._last_probe_attempt_at)
+            < self._capability_retry_cooldown_seconds
+        ):
+            return None
+        try:
+            return await self.probe_capabilities(force=True)
+        except CoreBackendError:
+            return self._cached_meta
 
     async def has_capability(self, capability: str) -> bool:
         meta = await self.probe_capabilities()
@@ -536,7 +576,19 @@ class HttpCoreBackend:
     async def lookup_exact(
         self, query: str, *, to_chinese: bool = False
     ) -> str | None:
-        matches = await self.lookup_terms(query)
+        if (
+            not query
+            or len(query) > HTTP_TERM_QUERY_MAX_CHARS
+            or "\n" in query
+            or "\r" in query
+        ):
+            return None
+        try:
+            matches = await self.lookup_terms(query)
+        except CoreBackendError as exc:
+            if exc.code in {"invalid_request", "input_too_long"}:
+                return None
+            raise
         for item in matches:
             if item.reason == "exact":
                 official = item.zh if to_chinese else item.en
@@ -663,7 +715,11 @@ class HttpCoreBackend:
         segments = segment_text(text, limit=SEGMENT_LIMIT)
         pieces: list[str] = []
         before = context.before if context is not None else None
-        resolved_to_chinese = to_chinese
+        if to_chinese is None:
+            cjk = count_cjk(text)
+            resolved_to_chinese = True if cjk == 0 else (count_latin(text) > cjk * 4)
+        else:
+            resolved_to_chinese = to_chinese
         for seg in segments:
             core = text[seg.core_start : seg.core_end]
             if not core:
@@ -680,7 +736,6 @@ class HttpCoreBackend:
             )
             if outcome.failed:
                 return outcome
-            resolved_to_chinese = outcome.to_chinese
             translated = outcome.text
             start, end = 0, len(translated)
             while start < end and translated[start] in _SEGMENT_WHITESPACE:
@@ -966,6 +1021,11 @@ class HttpReviewBackend:
             and CAP_SEMANTIC_REVIEW in meta.capabilities
         )
 
+    async def refresh_capabilities(self) -> bool:
+        """Retry Core capability probing with cooldown when unavailable or empty."""
+        await self._backend.ensure_capabilities_fresh()
+        return self.semantic_available()
+
     def plan_pairs(self, source: str, target: str) -> list[PairInfo]:
         pairs = [
             PairInfo(
@@ -989,7 +1049,10 @@ class HttpReviewBackend:
     async def term_review(
         self, source: str, target: str, direction: str
     ) -> TermReview:
-        return await self._backend.term_review(source, target, direction)
+        result = await self._backend.term_review(source, target, direction)
+        if not self.semantic_available():
+            await self.refresh_capabilities()
+        return result
 
     async def semantic_review(
         self,

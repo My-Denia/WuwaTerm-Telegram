@@ -77,22 +77,48 @@ def test_semver_range_accepts_newer_compatible_core_and_rejects_out_of_range(mon
         sys.path.insert(0, scripts_dir)
     import core_lock
 
-    for ok_ver in ("0.16.0", "0.16.0.post1", "0.16.1", "0.17.0", "0.99.9"):
+    for ok_ver in (
+        "0.16.0",
+        "0.16.0+local",
+        "0.16.0.post1",
+        "0.16.1",
+        "0.17.0",
+        "0.17.0+local",
+        "0.17.0+abc.1",
+        "0.17.0.post1+g123",
+        "0.99.9",
+    ):
         assert is_compatible_core_version(ok_ver), ok_ver
         assert core_lock.version_satisfies_spec(ok_ver, core_compat.CORE_VERSION_SPEC), ok_ver
 
     for bad_ver in (
         "0.15.9",
+        "0.15.9+local",
         "0.13.0",
         "0.16.0rc1",
+        "0.16.0rc1+local",
         "0.16.0.dev0",
         "0.16.0a1",
         "0.16.1a1",
+        "0.17.0+bad!",
         "1.0.0rc1",
         "1.0.0",
+        "1.0.0+local",
         "not-a-version",
     ):
         assert not is_compatible_core_version(bad_ver), bad_ver
+        assert not core_lock.version_satisfies_spec(bad_ver, core_compat.CORE_VERSION_SPEC), bad_ver
+
+    # Verify stdlib-only PEP 440 fallback matches packaging.SpecifierSet exactly.
+    monkeypatch.setattr(core_compat, "_SpecifierSet", None)
+    monkeypatch.setattr(core_compat, "_Version", None)
+    monkeypatch.setattr(core_lock, "_SpecifierSet", None)
+    monkeypatch.setattr(core_lock, "_Version", None)
+    for ok_ver in ("0.16.0", "0.16.0+local", "0.17.0+local", "0.17.0.post1+g123"):
+        assert is_compatible_core_version(ok_ver), f"stdlib failed to accept {ok_ver}"
+        assert core_lock.version_satisfies_spec(ok_ver, core_compat.CORE_VERSION_SPEC), ok_ver
+    for bad_ver in ("0.16.0rc1", "0.16.0rc1+local", "0.15.9+local", "1.0.0+local", "0.17.0+bad!"):
+        assert not is_compatible_core_version(bad_ver), f"stdlib failed to reject {bad_ver}"
         assert not core_lock.version_satisfies_spec(bad_ver, core_compat.CORE_VERSION_SPEC), bad_ver
 
     # A newer compatible 0.x Core passes runtime compatibility checks.

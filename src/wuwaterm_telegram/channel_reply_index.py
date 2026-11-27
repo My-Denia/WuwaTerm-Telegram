@@ -22,7 +22,13 @@ from .channel_reply_schema import (
 
 LOGGER = logging.getLogger(__name__)
 CHANNEL_REPLY_INDEX_MAX_ENTRIES = 1024
-OriginalPostClaimRole = Literal["producer", "waiter", "done"]
+OriginalPostClaimRole = Literal[
+    "producer",
+    "partial_producer",
+    "waiter",
+    "done",
+    "partial",
+]
 
 
 class ChannelReplyIndexDurabilityError(OSError):
@@ -69,6 +75,9 @@ class ChannelReplyIndex:
         self.storage_path = Path(storage_path) if storage_path is not None else None
         self._clock = clock
         self._entries: dict[tuple[int, int], tuple[float, tuple[int, ...]]] = {}
+        # Tracks multi-chunk deliveries that sent >=1 chunk before failing mid-way:
+        # (chat_id, message_id) -> expected total chunk count.
+        self._incomplete_deliveries: dict[tuple[int, int], int] = {}
         self._observed_without_reply: dict[tuple[int, int], float] = {}
         self._in_flight: dict[tuple[int, int], asyncio.Event] = {}
         # token -> (value, expires_at): tokens only matter while an edit is
@@ -110,17 +119,48 @@ class ChannelReplyIndex:
         message_id: int,
         reply_message_ids: tuple[int, ...],
         now: float | None = None,
+        *,
+        complete: bool = True,
+        expected_chunks: int | None = None,
     ) -> None:
         if not reply_message_ids:
             return
         now = self._clock() if now is None else now
-        self._entries[(chat_id, message_id)] = (
+        key = (chat_id, message_id)
+        self._entries[key] = (
             now + self.ttl_seconds,
             tuple(reply_message_ids),
         )
-        self._observed_without_reply.pop((chat_id, message_id), None)
+        if complete:
+            self._incomplete_deliveries.pop(key, None)
+        else:
+            expected = max(
+                len(reply_message_ids) + 1,
+                int(expected_chunks) if expected_chunks is not None else 0,
+            )
+            self._incomplete_deliveries[key] = expected
+        self._observed_without_reply.pop(key, None)
         self._trim_entries(now)
         self._save_best_effort()
+
+    def mark_complete(self, chat_id: int, message_id: int) -> None:
+        """Mark a tracked multi-chunk delivery as completely delivered."""
+        self._incomplete_deliveries.pop((chat_id, message_id), None)
+
+    def is_partial_delivery(
+        self, chat_id: int, message_id: int, now: float | None = None
+    ) -> bool:
+        """True when a post delivered only a prefix of its expected chunks."""
+        key = (chat_id, message_id)
+        if key not in self._incomplete_deliveries:
+            return False
+        if self.get(chat_id, message_id, now=now) is None:
+            self._incomplete_deliveries.pop(key, None)
+            return False
+        return True
+
+    def expected_chunks(self, chat_id: int, message_id: int) -> int | None:
+        return self._incomplete_deliveries.get((chat_id, message_id))
 
     def get(
         self, chat_id: int, message_id: int, now: float | None = None
@@ -234,6 +274,7 @@ class ChannelReplyIndex:
 
     def _forget_key(self, key: tuple[int, int], *, persist: bool) -> None:
         self._entries.pop(key, None)
+        self._incomplete_deliveries.pop(key, None)
         self._observed_without_reply.pop(key, None)
         self._latest_edit_tokens.pop(key, None)
         lock = self._edit_delivery_locks.get(key)
@@ -313,6 +354,7 @@ class ChannelReplyIndex:
         message_id: int,
         *,
         resume_observed: bool = False,
+        resume_partial: bool = False,
         now: float | None = None,
     ) -> OriginalPostClaim:
         key = (chat_id, message_id)
@@ -320,6 +362,12 @@ class ChannelReplyIndex:
         if event is not None:
             return OriginalPostClaim(key, event, "waiter")
         if self.get(chat_id, message_id, now=now) is not None:
+            if self.is_partial_delivery(chat_id, message_id, now=now):
+                if resume_partial:
+                    event = asyncio.Event()
+                    self._in_flight[key] = event
+                    return OriginalPostClaim(key, event, "partial_producer")
+                return OriginalPostClaim(key, None, "partial")
             return OriginalPostClaim(key, None, "done")
         if not resume_observed and self.was_observed_without_reply(
             chat_id, message_id, now=now
@@ -341,7 +389,7 @@ class ChannelReplyIndex:
         return True
 
     def finish_original(self, claim: OriginalPostClaim) -> None:
-        if claim.role != "producer" or claim.event is None:
+        if claim.role not in {"producer", "partial_producer"} or claim.event is None:
             return
         if self._in_flight.get(claim.key) is claim.event:
             self._in_flight.pop(claim.key, None)

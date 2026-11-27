@@ -66,8 +66,14 @@ from wuwaterm_telegram.telegram_text import telegram_text_units
     "snippet",
     [
         '<tg-time unix="1700000000" format="r">tomorrow</tg-time>',
+        '<tg-time unix="1700000000" format="w">Mon</tg-time>',
+        '<tg-time unix="1700000000" format="d">1/1</tg-time>',
+        '<tg-time unix="1700000000" format="D">Jan 1</tg-time>',
+        '<tg-time unix="1700000000" format="t">12:00</tg-time>',
+        '<tg-time unix="1700000000" format="T">12:00:00</tg-time>',
         '<tg-time unix="1700000000" format="wDT">Monday</tg-time>',
         '<tg-time unix="1700000000" format="dt">12:00</tg-time>',
+        '<tg-time unix="1700000000" format="wT">Mon 12:00:00</tg-time>',
         '<tg-time unix="1700000000" format="">12:00</tg-time>',
         '<tg-time unix="1700000000">12:00</tg-time>',
         '<pre><code class="python">print(1)</code></pre>',
@@ -92,6 +98,10 @@ def test_ptb_228_rich_html_tags_validate(snippet):
         '<tg-time unix="1700000000" format="tT">x</tg-time>',
         '<tg-time unix="1700000000" format="ww">x</tg-time>',
         '<tg-time unix="1700000000" format="rw">x</tg-time>',
+        '<tg-time unix="1700000000" format="wr">x</tg-time>',
+        '<tg-time unix="1700000000" format="Tw">x</tg-time>',
+        '<tg-time unix="1700000000" format="td">x</tg-time>',
+        '<tg-time unix="1700000000" format="dw">x</tg-time>',
         '<tg-time unix="1700000000" onclick="evil">x</tg-time>',
         '<code class="python">bare class outside pre</code>',
         '<pre><code class="">empty lang</code></pre>',
@@ -1107,3 +1117,309 @@ def test_subsequent_html_chunk_badrequest_rechecks_delivery_gate_before_plain_fa
 
     assert len(msg.replies) == 1
     assert msg.replies[0][1] == "HTML"
+
+
+def test_partial_multichunk_delivery_never_marks_completed_and_recovers_remaining_chunk(
+    monkeypatch, sample_db
+):
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    long_out = ("A" * 3000) + "\n\n" + ("B" * 3000)
+
+    async def fake_translate_async(
+        self,
+        text,
+        *,
+        to_chinese=False,
+        before_llm_call=None,
+        propagate_errors=False,
+        context=None,
+        execution_budget=None,
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        return long_out
+
+    monkeypatch.setattr(SentenceTranslator, "translate_async", fake_translate_async)
+
+    # Part A: Chunk 0 sends (9001), Chunk 1 persistently hits RetryAfter across all attempts.
+    # Replay must NEVER falsely mark completed=1 when chunk 1 was not delivered.
+    now = [time.time()]
+    queue_a = ChannelTaskQueue(
+        max_attempts=2,
+        base_backoff_seconds=1.0,
+        ttl_seconds=300.0,
+        post_max_age_seconds=86400.0,
+        clock=lambda: now[0],
+    )
+
+    class _AlwaysFailChunk2Bot(_FakeBot):
+        async def send_message(self, chat_id: int, text: str, **kwargs):
+            if text.startswith("B"):
+                raise RetryAfter(0.0)
+            return await super().send_message(chat_id, text, **kwargs)
+
+    bot_a = _AlwaysFailChunk2Bot()
+    ctx_a = _make_context(sample_db, bot=bot_a, queue=queue_a)
+    ctx_a.application.bot = bot_a
+    queue_a.enqueue(
+        chat_id=-2001,
+        message_id=5701,
+        chat_type="supergroup",
+        plain="今汐多块投递部分失败测试",
+        html=None,
+        is_edit=False,
+        update_id=301,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+    now[0] += 2.0
+    asyncio.run(
+        queue_a.process_once(
+            lambda t: execute_queued_channel_task(ctx_a.application, t)
+        )
+    )
+    reply_index_a = ctx_a.application.bot_data[CHANNEL_REPLY_INDEX_KEY]
+    assert reply_index_a.is_partial_delivery(-2001, 5701) is True
+    assert reply_index_a.claim_original(-2001, 5701).role == "partial"
+    assert queue_a.stats().completed == 0
+    assert queue_a.stats().pending == 1
+
+    # Second attempt still fails chunk 1 -> ends in failed, NEVER completed!
+    now[0] += 5.0
+    asyncio.run(
+        queue_a.process_once(
+            lambda t: execute_queued_channel_task(ctx_a.application, t)
+        )
+    )
+    assert queue_a.stats().completed == 0
+    assert queue_a.stats().failed == 1
+    assert reply_index_a.is_partial_delivery(-2001, 5701) is True
+
+    # Part B: Chunk 1 hits RetryAfter on attempt 1, then succeeds on attempt 2.
+    # Attempt 2 edits chunk 0 in place (no duplicate!) and delivers chunk 1, then marks completed.
+    queue_b = ChannelTaskQueue(
+        max_attempts=3,
+        base_backoff_seconds=1.0,
+        ttl_seconds=300.0,
+        post_max_age_seconds=86400.0,
+        clock=lambda: now[0],
+    )
+
+    class _RecoverChunk2Bot(_FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.chunk2_attempts = 0
+
+        async def send_message(self, chat_id: int, text: str, **kwargs):
+            if text.startswith("B"):
+                self.chunk2_attempts += 1
+                if self.chunk2_attempts <= 2:  # initial + flood retry on attempt 1
+                    raise RetryAfter(0.0)
+            return await super().send_message(chat_id, text, **kwargs)
+
+    bot_b = _RecoverChunk2Bot()
+    ctx_b = _make_context(sample_db, bot=bot_b, queue=queue_b)
+    ctx_b.application.bot = bot_b
+    queue_b.enqueue(
+        chat_id=-2001,
+        message_id=5702,
+        chat_type="supergroup",
+        plain="今汐多块投递恢复测试",
+        html=None,
+        is_edit=False,
+        update_id=302,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+    now[0] += 2.0
+    asyncio.run(
+        queue_b.process_once(
+            lambda t: execute_queued_channel_task(ctx_b.application, t)
+        )
+    )
+    reply_index_b = ctx_b.application.bot_data[CHANNEL_REPLY_INDEX_KEY]
+    assert reply_index_b.is_partial_delivery(-2001, 5702) is True
+    assert queue_b.stats().completed == 0
+
+    now[0] += 5.0
+    asyncio.run(
+        queue_b.process_once(
+            lambda t: execute_queued_channel_task(ctx_b.application, t)
+        )
+    )
+    assert queue_b.stats().completed == 1
+    assert reply_index_b.is_partial_delivery(-2001, 5702) is False
+    assert len(bot_b.sent) == 2  # Chunk 0 once + Chunk 1 once (no duplicate chunk 0)
+    assert len(bot_b.edits) == 1  # Chunk 0 updated in place
+    assert len(reply_index_b.get_many(-2001, 5702)) == 2
+
+
+def test_channel_queue_worker_proactively_wakes_on_ttl_and_wipes_expired_text(tmp_path):
+    storage = tmp_path / "proactive_ttl.json"
+    secret = "PROACTIVE_TTL_SECRET_BODY"
+
+    async def exercise() -> None:
+        queue = ChannelTaskQueue(
+            max_size=4,
+            ttl_seconds=0.08,
+            base_backoff_seconds=30.0,  # next attempt far beyond TTL
+            storage_path=storage,
+        )
+        queue.enqueue(
+            chat_id=-2001,
+            message_id=5800,
+            chat_type="supergroup",
+            plain=secret,
+            html=f"<b>{secret}</b>",
+            is_edit=False,
+            update_id=401,
+            message_date_ts=time.time(),
+            length_limit=4096,
+            reason="timeout",
+        )
+        assert secret in storage.read_text(encoding="utf-8")
+
+        async def never_runs(task):
+            raise AssertionError("task past TTL before backoff should never run")
+
+        # Large default poll_interval_seconds verifies wakeup is driven by expires_at.
+        queue.start(never_runs, poll_interval_seconds=60.0)
+        try:
+            await asyncio.sleep(0.25)
+            assert queue.get(-2001, 5800) is None
+            assert secret not in storage.read_text(encoding="utf-8")
+        finally:
+            await queue.stop()
+
+    asyncio.run(exercise())
+
+
+def test_channel_queue_lease_id_prevents_old_cancelled_task_from_expiring_promoted_edit(
+    tmp_path,
+):
+    now = [1000.0]
+    storage = tmp_path / "lease_isolation.json"
+    queue = ChannelTaskQueue(
+        max_size=4,
+        ttl_seconds=10.0,
+        post_max_age_seconds=86400.0,
+        base_backoff_seconds=1.0,
+        storage_path=storage,
+        clock=lambda: now[0],
+    )
+    queue.enqueue(
+        chat_id=-2001,
+        message_id=5801,
+        chat_type="supergroup",
+        plain="v1-old-body",
+        html=None,
+        is_edit=False,
+        update_id=10,
+        message_date_ts=now[0],
+        length_limit=4096,
+        reason="timeout",
+    )
+
+    async def exercise() -> None:
+        now[0] = 1002.0
+        started = asyncio.Event()
+
+        async def slow_v1(task):
+            started.set()
+            await asyncio.sleep(10.0)
+            return TaskExecutionOutcome("completed", "done")
+
+        runner_task = asyncio.create_task(queue.process_once(slow_v1))
+        await started.wait()
+
+        # Newer edit v2 arrives while v1 is IN_FLIGHT, with a fresh TTL (1005 + 10 = 1015).
+        now[0] = 1005.0
+        queue.enqueue(
+            chat_id=-2001,
+            message_id=5801,
+            chat_type="supergroup",
+            plain="v2-newer-edit",
+            html=None,
+            is_edit=True,
+            update_id=11,
+            message_date_ts=now[0],
+            length_limit=4096,
+            reason="timeout",
+        )
+
+        # Clock passes v1's expires_at (1010) while v2 is still valid (1015).
+        now[0] = 1011.0
+        queue.prune_expired(now=now[0])
+        promoted = queue.get(-2001, 5801)
+        assert promoted is not None
+        assert promoted.update_id == 11
+        assert promoted.plain == "v2-newer-edit"
+
+        # Cancelling the stale v1 coroutine MUST NOT expire or delete promoted v2!
+        runner_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runner_task
+
+        still_there = queue.get(-2001, 5801)
+        assert still_there is promoted
+        assert still_there.state == ChannelTaskState.PENDING
+        assert still_there.update_id == 11
+        assert still_there.plain == "v2-newer-edit"
+        assert "v2-newer-edit" in storage.read_text(encoding="utf-8")
+
+    asyncio.run(exercise())
+
+
+def test_long_html_spanning_tag_preserves_inner_blank_line_at_split_boundary(
+    monkeypatch, sample_db
+):
+    monkeypatch.setenv("WUWATERM_OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+    monkeypatch.setenv("WUWATERM_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("WUWATERM_OPENAI_MODEL", "test-model")
+
+    call_idx = [0]
+
+    async def stripping_protected(
+        self, protected, *, to_chinese=False, before_llm_call=None, execution_budget=None
+    ):
+        if before_llm_call is not None:
+            before_llm_call()
+        call_idx[0] += 1
+        # Simulate an LLM/translator that trims edge whitespace inside tags.
+        new_segments = tuple(
+            f"Paragraph {call_idx[0]}." if seg.strip() else ""
+            for seg in protected.visible_segments
+        )
+        return type(protected)(new_segments, protected.structures)
+
+    monkeypatch.setattr(
+        SentenceTranslator, "translate_protected_async", stripping_protected
+    )
+
+    p1 = "今汐在第一段展示技能效果。" * 120
+    p2 = "声骸在第二段提供增益效果。" * 100
+    full_plain = f"{p1}\n\n{p2}"
+    # Single <b> tag spans BOTH paragraphs across the segment split boundary!
+    full_html = f"<b>{p1}\n\n{p2}</b>"
+    assert len(full_plain) > LLM_INPUT_CHAR_LIMIT
+
+    msg = _FakeMessage(5900, full_plain, text_html=full_html)
+    update = SimpleNamespace(
+        update_id=5900,
+        effective_message=msg,
+        effective_chat=SimpleNamespace(id=-2001, type="supergroup"),
+        effective_user=None,
+    )
+    context = _make_context(sample_db)
+    asyncio.run(channel_post_handler(update, context))
+
+    assert len(msg.replies) == 1
+    delivered, parse_mode, _ = msg.replies[0]
+    assert parse_mode == "HTML"
+    assert validate_telegram_html(delivered)
+    assert delivered == "<b>Paragraph 1.</b>\n\n<b>Paragraph 2.</b>"

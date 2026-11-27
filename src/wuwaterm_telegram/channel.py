@@ -43,7 +43,11 @@ from .channel_checks import check_channel_translation
 from .channel_queue import ChannelTask, ChannelTaskQueue, TaskExecutionOutcome
 from .channel_reply_index import ChannelReplyIndex, OriginalPostClaim
 from .channel_runtime import ChannelRuntime
-from .core_backend import CoreBackendError, HttpCoreBackend
+from .core_backend import (
+    HTTP_TERM_QUERY_MAX_CHARS,
+    CoreBackendError,
+    HttpCoreBackend,
+)
 from .core_compat import strip_telegram_wrapper_noise
 from .runtime_keys import (
     CHANNEL_CAPACITY_NOTIFIER_KEY,
@@ -595,13 +599,16 @@ async def _handle_channel_post(
             resume_observed = True
     edit_work_token: int | None = None
     original_claim: OriginalPostClaim | None = None
+    resuming_partial = False
     if not is_edit and chat_id is not None:
-        if getattr(context, "_from_channel_queue", False):
+        from_queue = bool(getattr(context, "_from_channel_queue", False))
+        if from_queue:
             resume_observed = True
         claim = reply_index.claim_original(
             chat_id,
             message.message_id,
             resume_observed=resume_observed,
+            resume_partial=from_queue,
         )
         if claim.role == "done":
             _channel_event(
@@ -613,6 +620,16 @@ async def _handle_channel_post(
                 text_len=safe_text_len(initial_text),
             )
             return ChannelPostOutcome("already_handled", "duplicate")
+        if claim.role == "partial":
+            _channel_event(
+                runtime,
+                stage="delivery",
+                reason="partial_delivery",
+                message=message,
+                chat_id=chat_id,
+                text_len=safe_text_len(initial_text),
+            )
+            return ChannelPostOutcome("uncertain_delivery", "partial_delivery")
         if claim.role == "waiter":
             await reply_index.wait_for_original(claim)
             _channel_event(
@@ -624,6 +641,9 @@ async def _handle_channel_post(
                 text_len=safe_text_len(initial_text),
             )
             return ChannelPostOutcome("already_handled", "duplicate_in_flight")
+        if claim.role == "partial_producer":
+            resuming_partial = True
+            existing_reply_id = reply_index.get(chat_id, message.message_id)
         original_claim = claim
     try:
         if message.text:
@@ -694,37 +714,47 @@ async def _handle_channel_post(
 
         official: str | None = None
         if http_backend is not None:
-            try:
-                official = await http_backend.lookup_exact(
-                    pipeline_plain, to_chinese=to_chinese
-                )
-            except CoreBackendError as exc:
-                reason = "upstream" if exc.code == "llm_unavailable" else exc.code
-                _channel_event(
-                    runtime,
-                    stage="llm",
-                    reason=reason,
-                    message=message,
-                    chat_id=chat_id,
-                    is_edit=is_edit,
-                    direction=direction,
-                    text_len=safe_text_len(plain),
-                    mode="http-lookup",
-                )
-                _enqueue_for_recovery(
-                    context,
-                    config,
-                    message=message,
-                    chat_id=chat_id,
-                    chat_type=chat_type,
-                    plain=plain,
-                    html_text=html_text,
-                    is_edit=is_edit,
-                    update=update,
-                    length_limit=length_limit,
-                    reason=reason,
-                )
-                return ChannelPostOutcome("retryable_failure", reason)
+            if (
+                len(pipeline_plain) <= HTTP_TERM_QUERY_MAX_CHARS
+                and "\n" not in pipeline_plain
+                and "\r" not in pipeline_plain
+            ):
+                try:
+                    official = await http_backend.lookup_exact(
+                        pipeline_plain, to_chinese=to_chinese
+                    )
+                except CoreBackendError as exc:
+                    if exc.code in {"invalid_request", "input_too_long"}:
+                        official = None
+                    else:
+                        reason = (
+                            "upstream" if exc.code == "llm_unavailable" else exc.code
+                        )
+                        _channel_event(
+                            runtime,
+                            stage="llm",
+                            reason=reason,
+                            message=message,
+                            chat_id=chat_id,
+                            is_edit=is_edit,
+                            direction=direction,
+                            text_len=safe_text_len(plain),
+                            mode="http-lookup",
+                        )
+                        _enqueue_for_recovery(
+                            context,
+                            config,
+                            message=message,
+                            chat_id=chat_id,
+                            chat_type=chat_type,
+                            plain=plain,
+                            html_text=html_text,
+                            is_edit=is_edit,
+                            update=update,
+                            length_limit=length_limit,
+                            reason=reason,
+                        )
+                        return ChannelPostOutcome("retryable_failure", reason)
         else:
             service: TermService = context.application.bot_data[SERVICE_KEY]
             lookup_result = service.lookup_exact(pipeline_plain)
@@ -1140,12 +1170,10 @@ async def _handle_channel_post(
         update_id = getattr(update, "update_id", None)
         resolved_update_id = update_id if isinstance(update_id, int) else None
 
-        def _clear_pending_if_delivered(outcome: ChannelPostOutcome) -> ChannelPostOutcome:
-            if (
-                outcome.kind == "delivered"
-                and chat_id is not None
-                and not getattr(context, "_from_channel_queue", False)
-            ):
+        def _finalize_delivery(outcome: ChannelPostOutcome) -> ChannelPostOutcome:
+            if chat_id is None or getattr(context, "_from_channel_queue", False):
+                return outcome
+            if outcome.kind == "delivered":
                 existing_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
                 if isinstance(existing_queue, ChannelTaskQueue):
                     existing_queue.cancel_pending(
@@ -1153,8 +1181,23 @@ async def _handle_channel_post(
                         message.message_id,
                         update_id=resolved_update_id,
                     )
+            elif outcome.kind == "retryable_failure":
+                _enqueue_for_recovery(
+                    context,
+                    config,
+                    message=message,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    plain=plain,
+                    html_text=html_text,
+                    is_edit=is_edit,
+                    update=update,
+                    length_limit=length_limit,
+                    reason="rate_limit",
+                )
             return outcome
 
+        emit_as_edit = is_edit or resuming_partial
         if translated_parse_mode == "HTML":
             plain_translated = strip_telegram_html(translated)
             if (
@@ -1173,14 +1216,14 @@ async def _handle_channel_post(
                         text_len=safe_text_len(plain),
                     )
                     return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
-                return _clear_pending_if_delivered(
+                return _finalize_delivery(
                     await _emit(
                         context,
                         reply_index=reply_index,
                         message=message,
                         chat_id=chat_id,
                         chat_type=chat_type,
-                        is_edit=is_edit,
+                        is_edit=emit_as_edit,
                         existing_reply_id=existing_reply_id,
                         edit_work_token=edit_work_token,
                         text=plain_translated,
@@ -1201,14 +1244,14 @@ async def _handle_channel_post(
                         text_len=safe_text_len(plain),
                     )
                     return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
-                return _clear_pending_if_delivered(
+                return _finalize_delivery(
                     await _emit(
                         context,
                         reply_index=reply_index,
                         message=message,
                         chat_id=chat_id,
                         chat_type=chat_type,
-                        is_edit=is_edit,
+                        is_edit=emit_as_edit,
                         existing_reply_id=existing_reply_id,
                         edit_work_token=edit_work_token,
                         text=translated,
@@ -1229,14 +1272,14 @@ async def _handle_channel_post(
                         text_len=safe_text_len(plain),
                     )
                     return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
-                return _clear_pending_if_delivered(
+                return _finalize_delivery(
                     await _emit(
                         context,
                         reply_index=reply_index,
                         message=message,
                         chat_id=chat_id,
                         chat_type=chat_type,
-                        is_edit=is_edit,
+                        is_edit=emit_as_edit,
                         existing_reply_id=existing_reply_id,
                         edit_work_token=edit_work_token,
                         text=plain_translated,
@@ -1256,14 +1299,14 @@ async def _handle_channel_post(
                 text_len=safe_text_len(plain),
             )
             return ChannelPostOutcome("expired", "authorization_changed_before_delivery")
-        return _clear_pending_if_delivered(
+        return _finalize_delivery(
             await _emit(
                 context,
                 reply_index=reply_index,
                 message=message,
                 chat_id=chat_id,
                 chat_type=chat_type,
-                is_edit=is_edit,
+                is_edit=emit_as_edit,
                 existing_reply_id=existing_reply_id,
                 edit_work_token=edit_work_token,
                 text=strip_telegram_html(translated)
@@ -1874,7 +1917,11 @@ async def _emit_unchecked(
             reply_message_ids.append(reply_message_id)
             if chat_id is not None:
                 reply_index.remember_many(
-                    chat_id, message.message_id, tuple(reply_message_ids)
+                    chat_id,
+                    message.message_id,
+                    tuple(reply_message_ids),
+                    complete=(index == len(chunks) - 1),
+                    expected_chunks=len(chunks),
                 )
         _log_emit(
             chat_type,
@@ -1884,6 +1931,8 @@ async def _emit_unchecked(
             edited=False,
             text=chunk_text,
         )
+    if chat_id is not None and reply_message_ids:
+        reply_index.mark_complete(chat_id, message.message_id)
     return "success"
 
 
@@ -1941,7 +1990,7 @@ async def _edit_reply_chunks(
     # replacement as an extra chunk to delete.
     stale_extra_ids: list[int] = []
     remaining_reply_ids = list(existing_reply_ids)
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks):
         while remaining_reply_ids:
             if not _passes_final_delivery_gate(
                 context,
@@ -2031,7 +2080,11 @@ async def _edit_reply_chunks(
             if reply_message_id is not None:
                 remembered_reply_ids.append(reply_message_id)
                 reply_index.remember_many(
-                    chat_id, message.message_id, tuple(remembered_reply_ids)
+                    chat_id,
+                    message.message_id,
+                    tuple(remembered_reply_ids),
+                    complete=(chunk_index == len(chunks) - 1),
+                    expected_chunks=len(chunks),
                 )
             _log_emit(
                 chat_type,
@@ -2054,6 +2107,8 @@ async def _edit_reply_chunks(
             chat_id,
             message.message_id,
             tuple(remembered_reply_ids) + tuple(stale_extra_ids),
+            complete=True,
+            expected_chunks=len(chunks),
         )
     else:
         reply_index.forget(chat_id, message.message_id)

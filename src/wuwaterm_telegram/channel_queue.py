@@ -87,6 +87,7 @@ class ChannelTask:
     next_attempt_at: float
     expires_at: float
     last_reason: str = ""
+    lease_id: int | None = None
 
     @property
     def post_key(self) -> tuple[int, int]:
@@ -176,6 +177,7 @@ class ChannelTaskQueue:
         # active execution settles, then promote immediately to PENDING.
         self._pending_supersede: dict[tuple[int, int], ChannelTask] = {}
         self._counts: Counter[str] = Counter()
+        self._next_lease_id = 0
         self._wakeup = asyncio.Event()
         self._worker_task: asyncio.Task | None = None
         self._stop_requested = False
@@ -452,8 +454,18 @@ class ChannelTaskQueue:
         )
         return True
 
+    def _matches_lease(
+        self, key: tuple[int, int], *, lease_id: int | None
+    ) -> ChannelTask | None:
+        task = self._tasks.get(key)
+        if task is None:
+            return None
+        if lease_id is not None and task.lease_id != lease_id:
+            return None
+        return task
+
     def lease_due(self, *, now: float | None = None) -> ChannelTask | None:
-        """Transition the earliest due pending task to IN_FLIGHT."""
+        """Transition the earliest due pending task to IN_FLIGHT with a unique lease_id."""
         now = self._clock() if now is None else now
         self.prune_expired(now=now)
         due = [
@@ -465,16 +477,30 @@ class ChannelTaskQueue:
             return None
         due.sort(key=lambda item: (item.next_attempt_at, item.created_at))
         chosen = due[0]
+        self._next_lease_id += 1
+        chosen.lease_id = self._next_lease_id
         chosen.state = ChannelTaskState.IN_FLIGHT
         chosen.attempts += 1
         chosen.updated_at = now
         self._persist(now=now)
         return chosen
 
-    def complete(self, chat_id: int, message_id: int, *, now: float | None = None) -> None:
+    def complete(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        now: float | None = None,
+        lease_id: int | None = None,
+    ) -> None:
         now = self._clock() if now is None else now
         key = (chat_id, message_id)
-        task = self._tasks.get(key)
+        if lease_id is not None:
+            task = self._matches_lease(key, lease_id=lease_id)
+            if task is None:
+                return
+        else:
+            task = self._tasks.get(key)
         if task is not None:
             self._wipe_and_remove(key, ChannelTaskState.COMPLETED, count_key="completed")
             LOGGER.info(
@@ -493,10 +519,16 @@ class ChannelTaskQueue:
         *,
         reason: str = "expired",
         now: float | None = None,
+        lease_id: int | None = None,
     ) -> None:
         now = self._clock() if now is None else now
         key = (chat_id, message_id)
-        task = self._tasks.get(key)
+        if lease_id is not None:
+            task = self._matches_lease(key, lease_id=lease_id)
+            if task is None:
+                return
+        else:
+            task = self._tasks.get(key)
         if task is not None:
             task.last_reason = reason
             self._wipe_and_remove(key, ChannelTaskState.EXPIRED, count_key="expired")
@@ -517,11 +549,17 @@ class ChannelTaskQueue:
         reason: str,
         retryable: bool = True,
         now: float | None = None,
+        lease_id: int | None = None,
     ) -> ChannelTaskState:
         """Retry with exponential backoff or move to terminal failed/expired state."""
         now = self._clock() if now is None else now
         key = (chat_id, message_id)
-        task = self._tasks.get(key)
+        if lease_id is not None:
+            task = self._matches_lease(key, lease_id=lease_id)
+            if task is None:
+                return ChannelTaskState.FAILED
+        else:
+            task = self._tasks.get(key)
         if task is None:
             if self._promote_supersede(key, now=now):
                 self._persist(now=now)
@@ -548,6 +586,7 @@ class ChannelTaskQueue:
                 self._persist(now=now)
                 return ChannelTaskState.EXPIRED
             task.state = ChannelTaskState.PENDING
+            task.lease_id = None
             task.next_attempt_at = now + delay
             self._persist(now=now)
             self._signal_wakeup()
@@ -579,42 +618,61 @@ class ChannelTaskQueue:
         task = self.lease_due(now=now)
         if task is None:
             return False
+        lease_id = task.lease_id
         try:
             outcome = await executor(task)
         except asyncio.CancelledError:
             current_now = self._clock() if now is None else now
-            if task.expires_at <= current_now:
-                self.expire(task.chat_id, task.message_id, reason="expired_on_cancel", now=current_now)
-            elif self._tasks.get(task.post_key) is task:
-                task.state = ChannelTaskState.PENDING
-                task.attempts = max(0, task.attempts - 1)
-                self._persist(now=current_now)
+            if (
+                self._tasks.get(task.post_key) is task
+                and task.lease_id == lease_id
+            ):
+                if task.expires_at <= current_now:
+                    self.expire(
+                        task.chat_id,
+                        task.message_id,
+                        reason="expired_on_cancel",
+                        now=current_now,
+                        lease_id=lease_id,
+                    )
+                else:
+                    task.state = ChannelTaskState.PENDING
+                    task.lease_id = None
+                    task.attempts = max(0, task.attempts - 1)
+                    self._persist(now=current_now)
             raise
         except Exception as exc:  # noqa: BLE001 - worker must never crash loop
-            self.fail_or_requeue(
-                task.chat_id,
-                task.message_id,
-                reason=safe_error_type(exc),
-                retryable=True,
-                now=now,
-            )
+            if (
+                self._tasks.get(task.post_key) is task
+                and task.lease_id == lease_id
+            ):
+                self.fail_or_requeue(
+                    task.chat_id,
+                    task.message_id,
+                    reason=safe_error_type(exc),
+                    retryable=True,
+                    now=now,
+                    lease_id=lease_id,
+                )
             return True
 
-        # Check whether the in-flight task was already expired & pruned while running.
-        if self._tasks.get(task.post_key) is not task:
-            current_now = self._clock() if now is None else now
-            self._promote_supersede(task.post_key, now=current_now)
-            self._persist(now=current_now)
+        # Check whether the in-flight task was already expired & pruned/replaced while running.
+        if self._tasks.get(task.post_key) is not task or task.lease_id != lease_id:
+            if task.post_key not in self._tasks:
+                current_now = self._clock() if now is None else now
+                if self._promote_supersede(task.post_key, now=current_now):
+                    self._persist(now=current_now)
             return True
 
         if outcome.status == "completed":
-            self.complete(task.chat_id, task.message_id, now=now)
+            self.complete(task.chat_id, task.message_id, now=now, lease_id=lease_id)
         elif outcome.status == "expired":
             self.expire(
                 task.chat_id,
                 task.message_id,
                 reason=outcome.reason or "expired",
                 now=now,
+                lease_id=lease_id,
             )
         elif outcome.status == "retry":
             self.fail_or_requeue(
@@ -623,6 +681,7 @@ class ChannelTaskQueue:
                 reason=outcome.reason or "retry",
                 retryable=True,
                 now=now,
+                lease_id=lease_id,
             )
         else:
             self.fail_or_requeue(
@@ -631,6 +690,7 @@ class ChannelTaskQueue:
                 reason=outcome.reason or "failed",
                 retryable=False,
                 now=now,
+                lease_id=lease_id,
             )
         return True
 
@@ -682,24 +742,33 @@ class ChannelTaskQueue:
             if processed:
                 await asyncio.sleep(0)
                 continue
+            self.prune_expired()
             wait_seconds = self._next_wait_seconds(poll_interval_seconds)
+            if wait_seconds <= 0:
+                self.prune_expired()
+                await asyncio.sleep(0)
+                continue
             self._wakeup.clear()
             try:
                 await asyncio.wait_for(self._wakeup.wait(), timeout=wait_seconds)
             except asyncio.TimeoutError:
-                pass
+                self.prune_expired()
 
     def _next_wait_seconds(self, default_interval: float) -> float:
         now = self._clock()
-        pending = [
+        candidates = [
             task.next_attempt_at
             for task in self._tasks.values()
             if task.state == ChannelTaskState.PENDING
         ]
-        if not pending:
+        candidates.extend(task.expires_at for task in self._tasks.values())
+        candidates.extend(task.expires_at for task in self._pending_supersede.values())
+        if not candidates:
             return default_interval
-        soonest = min(pending) - now
-        return max(0.05, min(default_interval, soonest))
+        soonest = min(candidates) - now
+        if soonest <= 0:
+            return 0.0
+        return max(0.01, min(default_interval, soonest))
 
     def _pending_count(self) -> int:
         return sum(
