@@ -2,11 +2,21 @@
 
 # WuwaTerm Telegram
 
-A standalone Telegram bot for WuwaTerm's Chinese–English game terminology. It uses the WuwaTerm Core dictionary and translation library directly; no HTTP API process is required. It supports `/tr` and `/term`, `/sentence` and `/sent`, group access settings, and linked-channel translation.
+A standalone Telegram adapter for WuwaTerm's Chinese–English game terminology, centered on **linked-channel auto-translation (P0)** while fully preserving **group/private translation, terminology lookup, and `/review` (P1)**.
 
-Telegram `0.6.1` builds against the published WuwaTerm Core `0.13.0` release. `core-lock.json` pins that release's wheel and SHA-256, so the Core wheel is a public release download rather than a cross-repository CI artifact.
+- **Core compatibility & service decoupling**: Compatible with WuwaTerm Core `>=0.16.0,<1.0` via semantic version range + runtime capability probing. `core-lock.json` pins the reviewed Core `0.16.0` release wheel and SHA-256 for deterministic CI and container builds. Telegram also supports consuming an independently deployed Core HTTP API via `WUWATERM_CORE_API_URL` (`HttpCoreBackend` with `GET /v1/capabilities` negotiation and safe fallback), alongside the embedded `LocalCoreBackend`.
 
-## Commands
+## Channel auto-translation (P0)
+
+When the bot is authorized in a linked discussion group (`WUWATERM_CHANNEL_AUTOTRANSLATE=1`), it automatically translates channel posts in-thread and syncs edits in place:
+
+- **Cross-segment context for long posts**: Posts over 2,000 characters use Core's `segmentation-v1` and pass `TranslationContext(before=ContextBefore(...))` across segments to keep character, skill, and mechanic translations consistent while preserving paragraph boundaries and blank lines.
+- **Paragraph-aware rich HTML preservation**: Both long inputs (>2,000 chars) and long outputs (>4,096 UTF-16 units) preserve balanced Telegram HTML across chunks (bold, italic, links, quotes, spoilers, custom emojis, timestamps) and fall back to plain text only when tag validation or Telegram API delivery cannot preserve markup.
+- **PTB 22.8 / Bot API 10.0 rich message compatibility**: Supports `blockquote` and `blockquote expandable`, `<tg-emoji emoji-id="...">`, `<tg-time unix="..." format="...">` (with attribute validation), and fenced code blocks rendered as `<pre><code class="{language}">` as well as `language-xxx`.
+- **Zero-cost deterministic output checks**: Before publishing or editing a channel reply, the adapter runs Core `0.16.0`'s deterministic `check_segment_structure` (`structure-check-v1`) plus leaked-placeholder and severe-truncation checks with zero model cost. Critical defects (empty output or leaked internal placeholders) block delivery and trigger safe retry; structural warnings record sanitized counters without leaking post text.
+- **Bounded, recoverable retry queue**: Capacity rejections (`queue_full`, `llm_budget`) and transient LLM/gateway failures enqueue the post into a bounded `ChannelTaskQueue` (`pending` → `in_flight` → `completed` / exponential-backoff `pending` / `failed` / `expired`) instead of silently dropping it. Newer edits overwrite pending queued tasks for the same post, and extra-chunk deletion (`delete_message`) is protected by flood-wait retry. By default the queue is pure in-memory; optional disk persistence (`WUWATERM_CHANNEL_QUEUE_PERSIST=1`) writes with `0600` permissions, enforces TTL and max-size caps, wipes post text immediately on completion/failure/expiration, and never writes post text to logs or `/status`.
+
+## Commands (P1)
 
 `/help` and `/start` print the same list inside Telegram, including who may use each command. A chat the owner adds the bot to is authorized automatically; if someone else adds it, the bot leaves unless the owner authorizes that chat with `/grant`. Translate commands in a group are admin-only until a group admin runs `/public on`.
 
@@ -18,23 +28,24 @@ Telegram `0.6.1` builds against the published WuwaTerm Core `0.13.0` release. `c
 | `/sent` | Same as `/sentence`. |
 | `/review` (alias `/check`) | Reviews a translation against its source; see [Reviewing a translation](#reviewing-a-translation). `/review last` returns to the previous result. |
 | `/about` | Dictionary source, pinned commit, term count, rate limit and whether a model is configured. |
-| `/status` | Owner-only runtime status. Other callers get no reply. |
+| `/status` | Owner-only runtime status (including sanitized channel queue and Core backend stats). Other callers get no reply. |
 | `/public on\|off\|status` | Group admins only, in groups: open the translate commands to every member, or restore admins-only. |
 | `/grant`, `/revoke` | Owner-only group authorization: `/grant` authorizes the current group, `/grant <chat_id>` by id, `/grant list` lists them; `/revoke` removes the current group and leaves it. |
 
 Translation in a private chat is owner-only.
 
-Without `--to`, `/tr`, `/term` and `/sentence` pick the direction themselves: text with no CJK character goes to Chinese, and text with CJK characters goes to Chinese only when its Latin letters outnumber the CJK characters more than four to one (an English paragraph with one Chinese term is translated into Chinese). Screenshot wrapper markers (`[spoiler]`, `(WW 3.4)`, `[Wuthering Waves 3.7]`, quote bars) are removed from the plain text the bot reads for direction, dictionary lookup and the plain fallback; a formatted message's HTML is translated as written, markers included. Prose that only looks like a marker, such as `>50% Energy Regen` or `#spoilersafe ...`, is kept.
+Without `--to`, `/tr`, `/term` and `/sentence` pick the direction themselves: text with no CJK character goes to Chinese, and text with CJK characters goes to Chinese only when its Latin letters outnumber the CJK characters more than four to one (an English paragraph with one Chinese term is translated into Chinese). Screenshot wrapper markers (`[spoiler]`, `(WW 3.4)`, `[Wuthering Waves 3.7]`, quote bars) are removed via Core's native `strip_telegram_wrapper_noise` on plain paths; a formatted message's HTML is translated as written, markers included. Prose that only looks like a marker, such as `>50% Energy Regen` or `#spoilersafe ...`, is kept.
 
 ## Requirements
 
 - Python 3.11 or later.
+- WuwaTerm Core `>=0.16.0,<1.0` (embedded library) and/or a running WuwaTerm Core HTTP API service (`WUWATERM_CORE_API_URL`).
 - A schema-2 WuwaTerm terms database, built or obtained separately with WuwaTerm Core.
 - A Telegram bot token. A configured OpenAI-compatible model is optional; without it dictionary lookup remains available.
 
 ## Installation from verified artifacts
 
-Download the pinned Core wheel through the lock and the Telegram `v0.6.1` wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
+Download the pinned Core wheel through the lock and the Telegram wheel from its release, and obtain the Telegram wheel's SHA-256 from that release's `SHA256SUMS`. From a checkout of this repository:
 
 ```sh
 python3 -m venv .venv
@@ -53,7 +64,7 @@ Set the environment variables needed by your deployment using [the example](depl
 .venv/bin/wuwaterm-telegram --db data/terms.db
 ```
 
-`TELEGRAM_BOT_TOKEN` is required. `OWNER_USER_ID` controls owner-only commands and private translation access; without it, private translation is refused. The bot checks the installed Core version, required capabilities and the database before polling. Keep credentials out of the repository and logs.
+`TELEGRAM_BOT_TOKEN` is required. `OWNER_USER_ID` controls owner-only commands and private translation access; without it, private translation is refused. The bot checks the installed Core semver range, required capabilities and the database before polling. Keep credentials out of the repository and logs.
 
 ## Reviewing a translation
 
@@ -65,11 +76,11 @@ Set the environment variables needed by your deployment using [the example](depl
 
 The result has two separate parts: dictionary findings (deterministic; a "surface match" only says that an official form appears) and, when enabled, semantic issues from the model (experimental, can be wrong; shown with the reason and a suggested change inside an expandable quote). Semantic review is off by default in Core (`WUWATERM_SEMANTIC_REVIEW_ENABLED`) and needs a configured model; while it is off `/review` gives the dictionary findings and says semantic issues are not enabled. Buttons under the result step through the issues, accept a suggestion and build a revised translation. `/review last` points back to your own previous result, or to the newest one in the chat if you have none. After a model translation, `/tr` adds a "审校这段译文" button when the model track is on.
 
-Texts over 2,000 characters are paired by [segmentation-v1](https://github.com/My-Denia/WuwaTerm/blob/main/docs/segmentation-v1.md) and reviewed one segment at a time, at most 12 per command. When the two sides cannot be paired the bot says so and asks for a blank line at matching places; it never guesses. Long `/tr` texts follow the same segmentation in Core, keep the sender's blank lines and carry the previous segment as context. Review state is memory-only (30 minutes, five per chat). Content already under review is not reviewed twice: another member who submits the same pair is queued and receives her own result and buttons when that review finishes. Each result keeps its own 30 minutes for its buttons, while a computed report is reused for at most 30 minutes from when the model answered. If a result cannot be sent, its notice carries a button that sends the stored result again without a new review. Only a send that provably never reached Telegram is retried automatically: a connection that never opened is retried once, while a timeout or a connection that broke after the request went out is not retried, because Telegram may already have posted it. Those notices say the outcome is unknown and that resending may show the result twice. Semantic review sends both texts to the configured model. Channel auto-translation has no review. Core assumptions and limits: [docs/review-core-contract.md](docs/review-core-contract.md).
+Texts over 2,000 characters are paired by [segmentation-v1](https://github.com/My-Denia/WuwaTerm/blob/main/docs/segmentation-v1.md) and reviewed one segment at a time, at most 12 per command. When the two sides cannot be paired the bot says so and asks for a blank line at matching places; it never guesses. Long `/tr` texts follow the same segmentation in Core, keep the sender's blank lines and carry the previous segment as context. Review state is memory-only (30 minutes, five per chat). Content already under review is not reviewed twice: another member who submits the same pair is queued and receives her own result and buttons when that review finishes. Each result keeps its own 30 minutes for its buttons, while a computed report is reused for at most 30 minutes from when the model answered. If a result cannot be sent, its notice carries a button that sends the stored result again without a new review. Only a send that provably never reached Telegram is retried automatically: a connection that never opened is retried once, while a timeout or a connection that broke after the request went out is not retried, because Telegram may already have posted it. Those notices say the outcome is unknown and that resending may show the result twice. Semantic review sends both texts to the configured model. Channel auto-translation has no interactive `/review` track (it uses zero-cost deterministic structural checks instead). Core assumptions and limits: [docs/review-core-contract.md](docs/review-core-contract.md).
 
 ## State and recovery
 
-The bot reads the terms database and writes its settings and channel reply index separately. By default, `chat_settings.json` and `channel_replies.json` live beside the database; `WUWATERM_STATE_DIR` puts both in that directory, and `WUWATERM_SETTINGS_PATH` and `WUWATERM_CHANNEL_REPLY_INDEX_PATH` select individual paths. If a state directory is configured, an existing DB-adjacent legacy file is copied to the new location without replacing an existing target. An invalid existing state file is handled according to the application's fail-closed persistence rules.
+The bot reads the terms database and writes its settings and channel reply index separately. By default, `chat_settings.json` and `channel_replies.json` live beside the database; `WUWATERM_STATE_DIR` puts both in that directory, and `WUWATERM_SETTINGS_PATH` and `WUWATERM_CHANNEL_REPLY_INDEX_PATH` select individual paths. If a state directory is configured, an existing DB-adjacent legacy file is copied to the new location without replacing an existing target. An invalid existing state file is handled according to the application's fail-closed persistence rules. The channel retry queue is pure in-memory by default and only persists to `channel_queue.json` (mode `0600`) when `WUWATERM_CHANNEL_QUEUE_PERSIST=1` is explicitly set.
 
 Before moving or upgrading, stop the bot and back up the database and both state files, including any explicitly configured paths. Restore those files to their original locations when rolling back. Keep the old release and its matching Core artifact available. Do not overwrite a current state file with an old backup without first preserving the current file.
 
@@ -116,7 +127,7 @@ cp deploy/env.example .env
 docker compose -f deploy/docker-compose.yml up --build -d
 ```
 
-For an offline or local build, pass one explicit Core wheel instead of the lock: `--local-core-wheel <wheel> --local-core-sha256 <sha256>` replaces `--lock`/`--core`. The wheel must match that hash and the exact Core version; the committed lock is not read or changed, and the context carries no lock. Build it with the printed `--build-arg CORE_WHEEL_SHA256=<sha256>`; the image then records no reviewed Core lock.
+For an offline or local build, pass one explicit Core wheel instead of the lock: `--local-core-wheel <wheel> --local-core-sha256 <sha256>` replaces `--lock`/`--core`. The wheel must match that hash and satisfy the `wuwaterm` semver range in `pyproject.toml`; the committed lock is not read or changed, and the context carries no lock. Build it with the printed `--build-arg CORE_WHEEL_SHA256=<sha256>`; the image then records no reviewed Core lock.
 
 The final image layer only adds `/usr/local/share/wuwaterm/install-probe.json`, a build-time report of the installed files and their SHA-256 values for `wuwaterm` and `wuwaterm-telegram`.
 

@@ -161,7 +161,7 @@ def _mock_chat_completion(content: str) -> httpx.Response:
 
 
 def test_core_compat_verifies_pinned_core_symbols() -> None:
-    assert CORE_VERSION == "0.13.0"
+    assert CORE_VERSION == "0.16.0"
     verify_core_compatibility()
     assert missing_review_symbols() == ()
     assert callable(llm_transport.current_execution_budget)
@@ -377,7 +377,8 @@ def test_channel_long_split_post_with_html_disables_corrective_calls(
     assert seen_fail[0].get("thinking") != {"type": "disabled"}
     assert msg_fail.replies == []
 
-    # When chunks keep placeholders valid, split executes 1 call per chunk as plain text.
+    # When chunks keep placeholders valid, split executes 1 call per chunk and
+    # preserves balanced HTML formatting instead of stripping everything to plain.
     seen_ok: list[dict] = []
 
     def ok_split_handler(request: httpx.Request) -> httpx.Response:
@@ -385,6 +386,16 @@ def test_channel_long_split_post_with_html_disables_corrective_calls(
         seen_ok.append(payload)
         user_content = payload["messages"][-1]["content"]
         term_tokens = re.findall(r"__WUWA_TERM_[0-9a-f]{16}_[0-9]{4}__", user_content)
+        html_tokens = re.findall(r"__WUWA_HTML_[0-9a-f]{16}_[0-9]{4}__", user_content)
+        if len(html_tokens) == 2:
+            return _mock_chat_completion(
+                f"{html_tokens[0]}{term_tokens[0]}状态稳定。{html_tokens[1]}"
+            )
+        if len(html_tokens) == 4:
+            return _mock_chat_completion(
+                f"{html_tokens[0]}续段{html_tokens[1]}\n"
+                f"{html_tokens[2]}{term_tokens[0]}状态稳定。{html_tokens[3]}"
+            )
         return _mock_chat_completion(f"{term_tokens[0]}状态稳定。")
 
     update_ok, msg_ok = _channel_update(
@@ -398,10 +409,9 @@ def test_channel_long_split_post_with_html_disables_corrective_calls(
     assert len(seen_ok) == 2
     assert len(msg_ok.replies) == 1
     reply_text, reply_mode, _reply_to = msg_ok.replies[0]
-    assert reply_mode is None
-    assert "云陵谷状态稳定。" in reply_text
-    assert "声骸状态稳定。" in reply_text
-    assert "<b>" not in reply_text
+    assert reply_mode == "HTML"
+    assert "<b>云陵谷状态稳定。</b>" in reply_text
+    assert "<i>声骸状态稳定。</i>" in reply_text
 
 
 def test_review_run_budget_and_cancellation_boundaries(monkeypatch, sample_db) -> None:

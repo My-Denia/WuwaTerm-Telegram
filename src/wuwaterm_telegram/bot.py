@@ -51,10 +51,26 @@ from wuwaterm.application import (
 )
 from wuwaterm.logging_utils import redact_id, safe_error_type, safe_text_len
 
-from .channel import channel_post_handler, send_with_flood_retry
+from .channel import (
+    channel_post_handler,
+    execute_queued_channel_task,
+    send_with_flood_retry,
+)
+from .channel_queue import (
+    ChannelTaskQueue,
+    DEFAULT_QUEUE_MAX_ATTEMPTS,
+    DEFAULT_QUEUE_MAX_SIZE,
+    DEFAULT_QUEUE_TTL_SECONDS,
+)
 from .channel_reply_index import ChannelReplyIndex
 from .channel_reply_schema import ChannelReplyPayloadError, parse_channel_reply_payload
 from .channel_runtime import ChannelRuntime
+from .core_backend import (
+    CoreBackend,
+    DEFAULT_CORE_HTTP_TIMEOUT_SECONDS,
+    HttpCoreBackend,
+    LocalCoreBackend,
+)
 from .core_compat import (
     strip_telegram_wrapper_noise,
     verify_core_compatibility,
@@ -64,10 +80,12 @@ from . import poll_health
 from . import review_bot
 from .runtime_keys import (
     ADMIN_CACHE_KEY,
+    CHANNEL_QUEUE_KEY,
     CHANNEL_REPLY_INDEX_KEY,
     CHANNEL_RUNTIME_KEY,
     CHAT_SETTINGS_KEY,
     CONFIG_KEY,
+    CORE_BACKEND_KEY,
     RATE_LIMITER_KEY,
     REJECT_LIMITER_KEY,
     SERVICE_KEY,
@@ -397,11 +415,26 @@ class BotConfig:
     channel_max_pending: int = 16
     channel_llm_calls_per_minute: int = 60
     channel_reply_index_path: str | None = None
+    channel_queue_max_size: int = DEFAULT_QUEUE_MAX_SIZE
+    channel_queue_ttl_seconds: int = int(DEFAULT_QUEUE_TTL_SECONDS)
+    channel_queue_max_attempts: int = DEFAULT_QUEUE_MAX_ATTEMPTS
+    channel_queue_persist: bool = False
+    channel_queue_path: str | None = None
+    core_api_url: str | None = None
+    core_api_token: str | None = None
+    core_api_timeout_seconds: float = DEFAULT_CORE_HTTP_TIMEOUT_SECONDS
     llm_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
     llm_max_concurrency: int = DEFAULT_LLM_MAX_CONCURRENCY
 
     @classmethod
     def from_env(cls) -> "BotConfig":
+        core_api_url = os.getenv("WUWATERM_CORE_API_URL", "").strip() or None
+        if core_api_url is not None:
+            parsed_core = urlparse(core_api_url)
+            if parsed_core.scheme not in {"http", "https"} or not parsed_core.netloc:
+                raise BotConfigError(
+                    "WUWATERM_CORE_API_URL must be an absolute HTTP(S) URL"
+                )
         return cls(
             rate_limit_per_minute=_env_int(
                 "WUWATERM_RATE_LIMIT_PER_MINUTE",
@@ -468,6 +501,41 @@ class BotConfig:
             ),
             channel_reply_index_path=(
                 os.getenv("WUWATERM_CHANNEL_REPLY_INDEX_PATH", "").strip() or None
+            ),
+            channel_queue_max_size=_env_int(
+                "WUWATERM_CHANNEL_QUEUE_MAX_SIZE",
+                DEFAULT_QUEUE_MAX_SIZE,
+                minimum=1,
+                maximum=4096,
+            ),
+            channel_queue_ttl_seconds=_env_int(
+                "WUWATERM_CHANNEL_QUEUE_TTL_SECONDS",
+                int(DEFAULT_QUEUE_TTL_SECONDS),
+                minimum=10,
+                maximum=86400,
+            ),
+            channel_queue_max_attempts=_env_int(
+                "WUWATERM_CHANNEL_QUEUE_MAX_ATTEMPTS",
+                DEFAULT_QUEUE_MAX_ATTEMPTS,
+                minimum=1,
+                maximum=20,
+            ),
+            channel_queue_persist=_env_bool(
+                "WUWATERM_CHANNEL_QUEUE_PERSIST",
+                False,
+            ),
+            channel_queue_path=(
+                os.getenv("WUWATERM_CHANNEL_QUEUE_PATH", "").strip() or None
+            ),
+            core_api_url=core_api_url,
+            core_api_token=(
+                os.getenv("WUWATERM_CORE_API_TOKEN", "").strip() or None
+            ),
+            core_api_timeout_seconds=_env_float(
+                "WUWATERM_CORE_API_TIMEOUT_SECONDS",
+                DEFAULT_CORE_HTTP_TIMEOUT_SECONDS,
+                minimum=0.5,
+                maximum=300.0,
             ),
             llm_timeout_seconds=_env_float(
                 "WUWATERM_LLM_TIMEOUT_SECONDS",
@@ -703,17 +771,23 @@ def _inline_translation_html(message, inline_text: str) -> str | None:
             entity.offset + entity.length > start_units + tail_units
         ):
             return None  # straddles the prefix boundary; not preservable
-        shifted.append(
-            MessageEntity(
-                type=entity.type,
-                offset=entity.offset - start_units,
-                length=entity.length,
-                url=entity.url,
-                user=entity.user,
-                language=entity.language,
-                custom_emoji_id=entity.custom_emoji_id,
-            )
-        )
+        entity_kwargs = {
+            "type": entity.type,
+            "offset": entity.offset - start_units,
+            "length": entity.length,
+            "url": entity.url,
+            "user": entity.user,
+            "language": entity.language,
+            "custom_emoji_id": entity.custom_emoji_id,
+        }
+        if hasattr(entity, "unix_time") and getattr(entity, "unix_time", None) is not None:
+            entity_kwargs["unix_time"] = entity.unix_time
+        if (
+            hasattr(entity, "date_time_format")
+            and getattr(entity, "date_time_format", None) is not None
+        ):
+            entity_kwargs["date_time_format"] = entity.date_time_format
+        shifted.append(MessageEntity(**entity_kwargs))
     if not shifted:
         return None
     # A locally built Message renders entity HTML exactly like PTB does for
@@ -1003,13 +1077,30 @@ BOT_COMMANDS = (
 
 
 async def _publish_commands(application: Application) -> None:
-    """Best-effort Telegram command menu; a failed call must not stop polling."""
+    """Best-effort Telegram command menu, Core probe, and channel queue startup."""
     try:
         await application.bot.set_my_commands(list(BOT_COMMANDS))
     except Exception as exc:  # noqa: BLE001 - startup must continue
         LOGGER.warning(
             "set_my_commands failed error_type=%s", safe_error_type(exc)
         )
+    backend = application.bot_data.get(CORE_BACKEND_KEY)
+    if isinstance(backend, HttpCoreBackend):
+        try:
+            meta = await backend.probe_capabilities(force=True)
+            LOGGER.info(
+                "core http backend probed version=%s capabilities=%s",
+                meta.service_version,
+                ",".join(sorted(meta.capabilities)) or "none",
+            )
+        except Exception as exc:  # noqa: BLE001 - lazy retry on demand
+            LOGGER.warning(
+                "core http capability probe failed error_type=%s",
+                safe_error_type(exc),
+            )
+    queue = application.bot_data.get(CHANNEL_QUEUE_KEY)
+    if isinstance(queue, ChannelTaskQueue):
+        queue.start(lambda task: execute_queued_channel_task(application, task))
 
 
 def create_application(
@@ -1032,7 +1123,8 @@ def create_application(
         builder = ApplicationBuilder().token(token)
     builder = builder.post_init(_publish_commands)
     app = builder.post_shutdown(_close_translator_on_shutdown).build()
-    app.bot_data[SERVICE_KEY] = build_term_service(db_path)
+    service = build_term_service(db_path)
+    app.bot_data[SERVICE_KEY] = service
     translator = build_translator(
         db_path,
         timeout=config.llm_timeout_seconds,
@@ -1040,6 +1132,16 @@ def create_application(
     )
     app.bot_data[TRANSLATOR_KEY] = translator
     app.bot_data[CONFIG_KEY] = config
+    core_backend: CoreBackend
+    if config.core_api_url:
+        core_backend = HttpCoreBackend(
+            config.core_api_url,
+            api_token=config.core_api_token,
+            timeout_seconds=config.core_api_timeout_seconds,
+        )
+    else:
+        core_backend = LocalCoreBackend(service, translator)
+    app.bot_data[CORE_BACKEND_KEY] = core_backend
     app.bot_data[RATE_LIMITER_KEY] = PerChatRateLimiter(config.rate_limit_per_minute)
     app.bot_data[REJECT_LIMITER_KEY] = PerChatRateLimiter(config.rate_limit_per_minute)
     app.bot_data[ADMIN_CACHE_KEY] = AdminStatusCache()
@@ -1051,6 +1153,15 @@ def create_application(
         max_active=config.llm_max_concurrency,
         max_pending=config.channel_max_pending,
         llm_calls_per_minute=config.channel_llm_calls_per_minute,
+    )
+    queue_storage_path = (
+        _channel_queue_path(config, db_path) if config.channel_queue_persist else None
+    )
+    app.bot_data[CHANNEL_QUEUE_KEY] = ChannelTaskQueue(
+        max_size=config.channel_queue_max_size,
+        ttl_seconds=float(config.channel_queue_ttl_seconds),
+        max_attempts=config.channel_queue_max_attempts,
+        storage_path=queue_storage_path,
     )
     app.bot_data[CHAT_SETTINGS_KEY] = chat_settings
     app.add_handler(CommandHandler(["tr", "term"], term_command, block=False))
@@ -1100,6 +1211,12 @@ async def _log_update_error(
 
 async def _close_translator_on_shutdown(application: Application) -> None:
     try:
+        queue = application.bot_data.get(CHANNEL_QUEUE_KEY)
+        if isinstance(queue, ChannelTaskQueue):
+            await queue.stop()
+        backend = application.bot_data.get(CORE_BACKEND_KEY)
+        if isinstance(backend, HttpCoreBackend):
+            await backend.aclose()
         translator = application.bot_data.get(TRANSLATOR_KEY)
         if isinstance(translator, SentenceTranslator):
             await translator.aclose()
@@ -1111,6 +1228,15 @@ async def _close_translator_on_shutdown(application: Application) -> None:
         reply_index = application.bot_data.get(CHANNEL_REPLY_INDEX_KEY)
         if isinstance(reply_index, ChannelReplyIndex):
             await reply_index.aflush()
+
+
+def _channel_queue_path(config: BotConfig, db_path: str | Path) -> Path:
+    return _state_file_path(
+        db_path,
+        filename="channel_queue.json",
+        explicit_path=config.channel_queue_path,
+        label="channel retry queue",
+    )
 
 
 def _chat_settings_path_from_env(db_path: str | Path) -> Path:
@@ -1730,9 +1856,22 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             llm_calls_per_minute=config.channel_llm_calls_per_minute,
         )
         context.application.bot_data[CHANNEL_RUNTIME_KEY] = channel_runtime
+    channel_queue = context.application.bot_data.get(CHANNEL_QUEUE_KEY)
+    if not isinstance(channel_queue, ChannelTaskQueue):
+        channel_queue = None
+    core_backend = context.application.bot_data.get(CORE_BACKEND_KEY)
+    backend_kind = getattr(core_backend, "backend_kind", "local")
     await reply_to_user(
         update,
-        _status_text(service, config, settings, reply_index, channel_runtime),
+        _status_text(
+            service,
+            config,
+            settings,
+            reply_index,
+            channel_runtime,
+            channel_queue=channel_queue,
+            backend_kind=backend_kind,
+        ),
     )
 
 
@@ -1759,6 +1898,9 @@ def _status_text(
     settings: ChatSettings,
     reply_index: ChannelReplyIndex,
     channel_runtime: ChannelRuntime,
+    *,
+    channel_queue: ChannelTaskQueue | None = None,
+    backend_kind: str = "local",
 ) -> str:
     meta = service.metadata()
     commit = meta.get("wutheringdata_commit") or "unknown"
@@ -1774,8 +1916,30 @@ def _status_text(
     channel_outcomes = ",".join(
         f"{key}={value}" for key, value in channel_snapshot.outcomes.items()
     ) or "none"
+    queue_lines = ""
+    if channel_queue is not None:
+        qstats = channel_queue.stats()
+        queue_persist = "on" if qstats.persistence_enabled else "off"
+        queue_lines = (
+            f"Channel queue persistence: {queue_persist}\n"
+            f"Channel queue pending: {qstats.pending}\n"
+            f"Channel queue in-flight: {qstats.in_flight}\n"
+            f"Channel queue completed: {qstats.completed}\n"
+            f"Channel queue failed: {qstats.failed}\n"
+            f"Channel queue expired: {qstats.expired}\n"
+        )
+    else:
+        queue_lines = (
+            "Channel queue persistence: off\n"
+            "Channel queue pending: 0\n"
+            "Channel queue in-flight: 0\n"
+            "Channel queue completed: 0\n"
+            "Channel queue failed: 0\n"
+            "Channel queue expired: 0\n"
+        )
     return (
         "wuwaterm /status\n"
+        f"Core backend: {backend_kind}\n"
         f"Dictionary terms: {service.term_count()}\n"
         f"Data profile: {profile}\n"
         f"Data commit: {short_commit}\n"
@@ -1791,6 +1955,7 @@ def _status_text(
         f"Channel translation pending: {channel_snapshot.pending}\n"
         f"Channel translation high-water: {channel_snapshot.high_water}\n"
         f"Channel translation outcomes: {channel_outcomes}\n"
+        f"{queue_lines}"
         f"Channel pending cap: {config.channel_max_pending}\n"
         f"Channel LLM call budget: {config.channel_llm_calls_per_minute}/min\n"
         f"Authorized chats: {settings.allowed_count()}\n"
