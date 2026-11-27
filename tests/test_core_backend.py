@@ -1013,3 +1013,117 @@ def test_http_review_backend_dedups_concurrent_probes_and_enforces_cooldown_afte
             await backend.aclose()
 
     asyncio.run(exercise())
+
+
+def test_http_review_preserves_term_report_and_respects_cooldown_when_cached_semantic_expires_to_503():
+    from wuwaterm_telegram.review_flow import run_review
+    from wuwaterm_telegram.review_model import SEMANTIC_DONE, SEMANTIC_UNAVAILABLE
+
+    now = [100.0]
+    meta_down = [False]
+    meta_calls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/meta":
+            meta_calls[0] += 1
+            if meta_down[0]:
+                return httpx.Response(
+                    503, json={"error": {"code": "llm_unavailable"}}
+                )
+            return httpx.Response(200, json=_meta_payload())
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(
+                200,
+                json={
+                    "api_version": "v1",
+                    "capabilities": [CAP_SEMANTIC_REVIEW],
+                    "request_id": "cap-sem-on",
+                },
+            )
+        if request.url.path == "/v1/reviews":
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "rev-term-ok",
+                    "source_revision": "a" * 64,
+                    "target_revision": "b" * 64,
+                    "rule_version": "review-v2",
+                    "dictionary": {
+                        "schema_version": "2",
+                        "source_commit": "x",
+                        "term_count": 1,
+                    },
+                    "coverage": {"evaluated": 1, "not_evaluated": 0, "rules": []},
+                    "findings": [
+                        {
+                            "id": "f-term-1",
+                            "verdict": "verified_constraint",
+                            "rule_id": "exact",
+                            "source_span": {"start": 0, "end": 2, "text": "今汐"},
+                            "target_span": {"start": 0, "end": 6, "text": "Jinhsi"},
+                            "candidates": [],
+                            "candidates_truncated": False,
+                        }
+                    ],
+                    "truncated": False,
+                },
+            )
+        if request.url.path == "/v1/semantic-reviews":
+            return httpx.Response(
+                200,
+                json={
+                    "review_version": "semantic-review-v1",
+                    "status": "complete",
+                    "issues": [],
+                    "dropped_unanchored": 0,
+                    "omitted_issues": 0,
+                    "truncated_reason": None,
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async def exercise() -> None:
+        backend = HttpCoreBackend(
+            "http://127.0.0.1:8000",
+            capability_ttl_seconds=60.0,
+            capability_retry_cooldown_seconds=15.0,
+            transport=httpx.MockTransport(handler),
+            clock=lambda: now[0],
+        )
+        review_backend = HttpReviewBackend(backend)
+        try:
+            # 1. Cache semantic-review-v1 enabled at t=100.
+            await backend.probe_capabilities()
+            assert review_backend.semantic_available() is True
+            assert meta_calls[0] == 1
+
+            # 2. Advance past 60s TTL (t=170) and simulate /v1/meta returning 503.
+            # Two /review runs in the same 15s cooldown window must trigger only 1 /v1/meta
+            # probe total and both must deliver the dictionary term report cleanly.
+            meta_down[0] = True
+            meta_calls[0] = 0
+            now[0] = 170.0
+            r1 = await run_review(review_backend, "今汐登场", "Jinhsi appears", "en")
+            assert r1.term_matches_verified == 1
+            assert r1.term_track_error is None
+            assert r1.semantic_state == SEMANTIC_UNAVAILABLE
+            assert meta_calls[0] == 1
+
+            now[0] = 175.0
+            r2 = await run_review(review_backend, "今汐登场", "Jinhsi appears", "en")
+            assert r2.term_matches_verified == 1
+            assert r2.term_track_error is None
+            assert r2.semantic_state == SEMANTIC_UNAVAILABLE
+            assert meta_calls[0] == 1
+
+            # 3. After cooldown elapses (t=186) and Core recovers, semantic review resumes.
+            meta_down[0] = False
+            now[0] = 186.0
+            r3 = await run_review(review_backend, "今汐登场", "Jinhsi appears", "en")
+            assert r3.term_matches_verified == 1
+            assert r3.semantic_state == SEMANTIC_DONE
+            assert meta_calls[0] == 2
+        finally:
+            await backend.aclose()
+
+    asyncio.run(exercise())

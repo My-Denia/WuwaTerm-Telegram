@@ -430,6 +430,7 @@ class HttpCoreBackend:
         self._cached_at: float | None = None
         self._last_probe_attempt_at: float | None = None
         self._capabilities_probe_ok = False
+        self._last_probe_failed = False
         self._inflight_probe: asyncio.Task[CoreMeta] | None = None
 
     @property
@@ -439,6 +440,10 @@ class HttpCoreBackend:
     @property
     def cached_meta(self) -> CoreMeta | None:
         return self._cached_meta
+
+    @property
+    def last_probe_failed(self) -> bool:
+        return self._last_probe_failed
 
     def _effective_cache_ttl(self) -> float:
         if (
@@ -455,14 +460,18 @@ class HttpCoreBackend:
         try:
             meta_resp = await self._client.get("/v1/meta")
         except httpx.HTTPError as exc:
+            self._last_probe_failed = True
             raise CoreBackendError("llm_unavailable") from exc
         if meta_resp.status_code != 200:
+            self._last_probe_failed = True
             raise CoreBackendError(_extract_error_code(meta_resp))
         try:
             meta_body = meta_resp.json()
         except ValueError as exc:
+            self._last_probe_failed = True
             raise CoreBackendError("llm_unavailable") from exc
         if not isinstance(meta_body, Mapping):
+            self._last_probe_failed = True
             raise CoreBackendError("llm_unavailable")
 
         caps: set[str] = set()
@@ -522,6 +531,7 @@ class HttpCoreBackend:
         self._cached_meta = meta
         self._cached_at = now
         self._capabilities_probe_ok = caps_probe_ok
+        self._last_probe_failed = False
         return meta
 
     async def probe_capabilities(self, *, force: bool = False) -> CoreMeta:
@@ -999,8 +1009,13 @@ class HttpCoreBackend:
         execution_budget: OperationExecutionBudget | None = None,
     ) -> Mapping[str, Any]:
         del execution_budget
-        meta = await self.probe_capabilities()
-        if CAP_SEMANTIC_REVIEW not in meta.capabilities:
+        meta = await self.ensure_capabilities_fresh()
+        if (
+            meta is None
+            or self._last_probe_failed
+            or not meta.llm_configured
+            or CAP_SEMANTIC_REVIEW not in meta.capabilities
+        ):
             raise ReviewBackendError(CODE_UNAVAILABLE)
         payload: dict[str, Any] = {
             "source": source,
@@ -1050,6 +1065,7 @@ class HttpReviewBackend:
         meta = self._backend.cached_meta
         return bool(
             meta is not None
+            and not self._backend.last_probe_failed
             and meta.llm_configured
             and CAP_SEMANTIC_REVIEW in meta.capabilities
         )
