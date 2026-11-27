@@ -1084,7 +1084,8 @@ async def _publish_commands(application: Application) -> None:
         LOGGER.warning(
             "set_my_commands failed error_type=%s", safe_error_type(exc)
         )
-    backend = application.bot_data.get(CORE_BACKEND_KEY)
+    bot_data = getattr(application, "bot_data", None) or {}
+    backend = bot_data.get(CORE_BACKEND_KEY)
     if isinstance(backend, HttpCoreBackend):
         try:
             meta = await backend.probe_capabilities(force=True)
@@ -1098,7 +1099,7 @@ async def _publish_commands(application: Application) -> None:
                 "core http capability probe failed error_type=%s",
                 safe_error_type(exc),
             )
-    queue = application.bot_data.get(CHANNEL_QUEUE_KEY)
+    queue = bot_data.get(CHANNEL_QUEUE_KEY)
     if isinstance(queue, ChannelTaskQueue):
         queue.start(lambda task: execute_queued_channel_task(application, task))
 
@@ -1210,14 +1211,15 @@ async def _log_update_error(
 
 
 async def _close_translator_on_shutdown(application: Application) -> None:
+    bot_data = getattr(application, "bot_data", None) or {}
     try:
-        queue = application.bot_data.get(CHANNEL_QUEUE_KEY)
+        queue = bot_data.get(CHANNEL_QUEUE_KEY)
         if isinstance(queue, ChannelTaskQueue):
             await queue.stop()
-        backend = application.bot_data.get(CORE_BACKEND_KEY)
+        backend = bot_data.get(CORE_BACKEND_KEY)
         if isinstance(backend, HttpCoreBackend):
             await backend.aclose()
-        translator = application.bot_data.get(TRANSLATOR_KEY)
+        translator = bot_data.get(TRANSLATOR_KEY)
         if isinstance(translator, SentenceTranslator):
             await translator.aclose()
     finally:
@@ -1225,7 +1227,7 @@ async def _close_translator_on_shutdown(application: Application) -> None:
         # so replies remembered just before exit are durable; otherwise the
         # offloaded save task can be cancelled during loop teardown and
         # replayed posts would be retranslated on restart.
-        reply_index = application.bot_data.get(CHANNEL_REPLY_INDEX_KEY)
+        reply_index = bot_data.get(CHANNEL_REPLY_INDEX_KEY)
         if isinstance(reply_index, ChannelReplyIndex):
             await reply_index.aflush()
 
