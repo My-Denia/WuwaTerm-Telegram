@@ -9,21 +9,42 @@ import re
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-from core_lock import HEX64, ROOT, LockError, load_lock, product_core_version
+from core_lock import (
+    HEX64,
+    ROOT,
+    LockError,
+    load_lock,
+    product_core_spec,
+    version_satisfies_spec,
+)
 import tomllib
 
 
-def check_wheel(path: Path, digest: str, name: str, version: str | None = None) -> None:
+def check_wheel(
+    path: Path,
+    digest: str,
+    name: str,
+    version: str | None = None,
+    *,
+    version_spec: str | None = None,
+) -> None:
     if not HEX64.fullmatch(digest):
         raise LockError("invalid expected wheel SHA-256")
     try:
         data = path.read_bytes()
-        check_wheel_bytes(data, digest, name, version)
+        check_wheel_bytes(data, digest, name, version, version_spec=version_spec)
     except OSError as exc:
         raise LockError(f"{name} wheel cannot be read") from exc
 
 
-def check_wheel_bytes(data: bytes, digest: str, name: str, version: str | None = None) -> None:
+def check_wheel_bytes(
+    data: bytes,
+    digest: str,
+    name: str,
+    version: str | None = None,
+    *,
+    version_spec: str | None = None,
+) -> None:
     try:
         if hashlib.sha256(data).hexdigest() != digest:
             raise LockError(f"{name} wheel SHA-256 mismatch")
@@ -36,24 +57,29 @@ def check_wheel_bytes(data: bytes, digest: str, name: str, version: str | None =
                 return re.sub(r"[-_.]+", "-", s).lower()
             if canonical(fields.get("Name", "")) != canonical(name):
                 raise LockError(f"{name} wheel has the wrong package name")
-            if version is not None and fields.get("Version") != version:
+            found_version = fields.get("Version")
+            if version is not None and found_version != version:
+                raise LockError(f"{name} wheel has the wrong version")
+            if version_spec is not None and (
+                not isinstance(found_version, str)
+                or not version_satisfies_spec(found_version, version_spec)
+            ):
                 raise LockError(f"{name} wheel has the wrong version")
     except (OSError, BadZipFile) as exc:
         raise LockError(f"{name} wheel cannot be read") from exc
 
 
 def verify(args: argparse.Namespace) -> None:
-    version = product_core_version()
+    spec = product_core_spec()
     if args.lock:
         lock = load_lock(args.lock)
         if args.core.name != lock["filename"]:
             raise LockError("Core wheel filename does not match lock")
-        core_digest = lock["sha256"]
+        check_wheel(args.core, lock["sha256"], "wuwaterm", lock["version"], version_spec=spec)
     else:
         # For an explicitly supplied local development fixture only. CI and
         # published builds use the reviewed lock, not this argument.
-        core_digest = args.local_core_sha256
-    check_wheel(args.core, core_digest, "wuwaterm", version)
+        check_wheel(args.core, args.local_core_sha256, "wuwaterm", version_spec=spec)
     product = tomllib.loads((ROOT / "pyproject.toml").read_text())
     check_wheel(args.telegram, args.telegram_sha256, "wuwaterm-telegram", product["project"]["version"])
 

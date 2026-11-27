@@ -140,6 +140,11 @@ async def run_review(
         report.semantic_state = SEMANTIC_UNAVAILABLE
         report.semantic_note = NO_READY_NOTE
         return report
+    refresh_caps = getattr(backend, "refresh_capabilities", None)
+    if callable(refresh_caps):
+        refreshed = refresh_caps()
+        if inspect.isawaitable(refreshed):
+            await refreshed
     if not backend.semantic_available():
         report.semantic_state = SEMANTIC_UNAVAILABLE
         report.semantic_note = SEMANTIC_OFF_NOTE

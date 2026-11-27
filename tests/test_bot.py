@@ -778,7 +778,7 @@ def test_telegram_tr_keeps_comparators_and_spoilersafe_hashtag(monkeypatch, samp
 def test_telegram_translation_reply_strips_wrappers_on_the_plain_route_only(
     monkeypatch, sample_db
 ):
-    from wuwaterm.bot import TranslationRequest, telegram_translation_reply
+    from wuwaterm_telegram.bot import TranslationRequest, telegram_translation_reply
     from wuwaterm.lookup import TermService
     from wuwaterm.sentence import SentenceTranslator
 

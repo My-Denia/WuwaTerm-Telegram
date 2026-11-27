@@ -12,25 +12,107 @@ ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "My-Denia/WuwaTerm"
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_PEP440_FINAL_RE = re.compile(
+    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)"
+    r"(?:\.post(?P<post>\d+))?"
+    r"(?:\+(?P<local>[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*))?\Z"
+)
+_SPEC_CLAUSE_RE = re.compile(r"^(==|>=|<=|>|<)([0-9]+(?:\.[0-9]+)*(?:\.post[0-9]+)?)\Z")
+
+try:
+    from packaging.specifiers import InvalidSpecifier as _InvalidSpecifier, SpecifierSet as _SpecifierSet
+    from packaging.version import InvalidVersion as _InvalidVersion, Version as _Version
+except ImportError:  # pragma: no cover - stdlib-only CI runner before venv setup
+    _InvalidSpecifier = ValueError
+    _SpecifierSet = None
+    _InvalidVersion = ValueError
+    _Version = None
 
 
 class LockError(ValueError):
     pass
 
 
-def product_core_version() -> str:
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+def _stdlib_final_version_key(value: str) -> tuple[int, tuple[int, ...], int]:
+    match = _PEP440_FINAL_RE.fullmatch(value.strip())
+    if match is None:
+        raise LockError(f"invalid or pre-release Core version: {value!r}")
+    epoch = int(match.group("epoch") or 0)
+    parts = [int(p) for p in match.group("release").split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    post = int(match.group("post")) if match.group("post") is not None else -1
+    return (epoch, tuple(parts), post)
+
+
+def version_satisfies_spec(version: str, spec: str) -> bool:
+    """Evaluate a PEP 440 version specifier, matching packaging.SpecifierSet."""
+    clauses = [part.strip() for part in spec.split(",") if part.strip()]
+    if not clauses:
+        raise LockError("Core dependency specifier must not be empty")
+    for clause in clauses:
+        if _SPEC_CLAUSE_RE.fullmatch(clause) is None:
+            raise LockError(f"unsupported Core version clause: {clause!r}")
+    if _SpecifierSet is not None and _Version is not None:
+        try:
+            parsed = _Version(version)
+            return _SpecifierSet(spec).contains(parsed, prereleases=False)
+        except (_InvalidVersion, _InvalidSpecifier):
+            return False
+    try:
+        parsed_key = _stdlib_final_version_key(version)
+    except LockError:
+        return False
+    for clause in clauses:
+        match = _SPEC_CLAUSE_RE.fullmatch(clause)
+        assert match is not None
+        op, target_raw = match.groups()
+        target_key = _stdlib_final_version_key(target_raw)
+        if op == "==" and not (parsed_key == target_key):
+            return False
+        if op == ">=" and not (parsed_key >= target_key):
+            return False
+        if op == "<=" and not (parsed_key <= target_key):
+            return False
+        if op == ">" and not (parsed_key > target_key):
+            return False
+        if op == "<" and not (parsed_key < target_key):
+            return False
+    return True
+
+
+def product_core_spec(root: Path = ROOT) -> str:
+    """Return the `wuwaterm` dependency version specifier from pyproject.toml."""
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = project["project"]["dependencies"]
-    pins = [s.removeprefix("wuwaterm==") for s in dependencies if s.startswith("wuwaterm==")]
-    if len(pins) != 1:
-        raise LockError("project must specify one exact Core dependency")
-    source = ast.parse((ROOT / "src/wuwaterm_telegram/core_compat.py").read_text())
-    constants = [n.value.value for n in source.body if isinstance(n, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == "CORE_VERSION" for t in n.targets)
-                 and isinstance(n.value, ast.Constant)]
-    if constants != pins:
+    specs = [
+        s.removeprefix("wuwaterm").strip()
+        for s in dependencies
+        if re.match(r"^wuwaterm(?:==|>=|<=|>|<)", s)
+    ]
+    if len(specs) != 1:
+        raise LockError("project must specify one wuwaterm Core dependency")
+    return specs[0]
+
+
+def product_core_version(root: Path = ROOT) -> str:
+    """Return the locked Core release version and verify it fits pyproject.toml."""
+    spec = product_core_spec(root)
+    source = ast.parse((root / "src/wuwaterm_telegram/core_compat.py").read_text(encoding="utf-8"))
+    constants = [
+        n.value.value
+        for n in source.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "CORE_VERSION" for t in n.targets)
+        and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+    ]
+    if len(constants) != 1:
+        raise LockError("runtime Core version constant is missing")
+    core_version = constants[0]
+    if not version_satisfies_spec(core_version, spec):
         raise LockError("runtime and package Core versions disagree")
-    return pins[0]
+    return core_version
 
 
 def timestamp(value: object) -> datetime:
@@ -53,7 +135,13 @@ def load_lock(path: Path) -> dict:
         if lock.get("repository") != REPOSITORY:
             raise LockError("unexpected Core repository")
         version = product_core_version()
-        if lock.get("version") != version:
+        spec = product_core_spec()
+        lock_version = lock.get("version")
+        if (
+            not isinstance(lock_version, str)
+            or lock_version != version
+            or not version_satisfies_spec(lock_version, spec)
+        ):
             raise LockError("Core lock version differs from package dependency")
         if lock.get("filename") != f"wuwaterm-{version}-py3-none-any.whl":
             raise LockError("unexpected Core wheel filename")

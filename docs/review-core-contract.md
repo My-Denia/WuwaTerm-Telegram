@@ -1,12 +1,8 @@
-# `/review`: what it relies on in Core
+# Core contract: channel auto-translation, `/tr`, and `/review`
 
-`/review` is built for Core 0.13.0 (ADR 0018 and 0019, `docs/segmentation-v1.md`,
-`contracts/semantic-review-v1/`); the review contract is the one Core 0.12.0
-introduced, and Core 0.13.0 leaves it unchanged. All Core access is in
-`review_backend.py`; `core_compat.REVIEW_CORE_SYMBOLS` is the symbol list that
-`verify_core_compatibility` requires at start-up.
+This adapter targets WuwaTerm Core `>=0.16.0,<1.0` (verified against Core `0.16.0`, commit `8565b48b`, ADR 0018, 0019, and 0022, `docs/segmentation-v1.md`, `contracts/semantic-review-v1/`). Runtime startup checks the semantic version range plus runtime capability probing (`core_compat.py`) instead of rejecting newer compatible `0.x` Core releases. Service-consumption mode (`core_backend.py`, `HttpCoreBackend`) negotiates optional capabilities via `GET /v1/capabilities` without modifying `GET /v1/meta`'s exact-key contract.
 
-## What the adapter uses (checked against Core v0.13.0, commit e5b7f1a8)
+## What the adapter uses (checked against Core v0.16.0, commit 8565b48b)
 
 - `semantic_review_async(service, translator, SemanticReviewJob, *, request_id,
   before_llm_call, offload, execution_budget)` returns a
@@ -39,37 +35,37 @@ introduced, and Core 0.13.0 leaves it unchanged. All Core access is in
   blowup; defaults stay `omit` (`en->zh`) and `disabled` (`zh->en`).
 - Linked-channel posts (`channel.py`): `channel_post_handler` aligns an outer
   `OperationExecutionBudget` with `ChannelRuntime.reserve(...)` (`allow_plain_fallback`
-  gated on `len(plain) <= LLM_INPUT_CHAR_LIMIT`), keeping plain single-segment,
-  HTML fallback, and long split chunks bounded to their reserved admission calls.
-- Long-text `/tr`: Telegram no longer passes a `splitter` (Core ignores it).
-  Core cuts by segmentation-v1, keeps the sender's separators and carries the
-  previous segment as context. Core's guard reads a per-line share ratio,
-  `(answer line / answer total) / (source line / source total)`, and looks for a
-  merge and a split over the whole segment at any distance and in either order;
-  an answer is regrouped into the source's paragraphs only when neither appears,
-  so a distant merge-and-split that shifts a line across a paragraph boundary is
-  refused, and the model's own blank lines are kept (`MY-359`).
-- Telegram wrapper cleanup: the adapter, not Core, removes screenshot markers
-  (version tags, spoiler labels, quote bars). Core `0.13.0` provides
-  `wuwaterm.normalize.strip_telegram_wrapper_noise(..., keep_paragraphs=True)`
-  and stops deleting these markers during generic preparation. The pin is
-  `0.13.0`, so `verify_core_compatibility` requires the symbol at start-up;
-  `core_compat.strip_telegram_wrapper_noise` still degrades to
-  `normalize_user_text` for a Core older than `WRAPPER_STRIP_CORE_VERSION`,
-  which the compatibility check no longer accepts. `/tr` strips the plain text
-  Core reads (dictionary stage, automatic direction, size gate and plain
-  fallback) on every path; a rendered-HTML payload stays as written, because
-  Core's markup translator works on it alone. Linked-channel posts
-  keep a second text, `pipeline_plain`: it is what the dictionary lookup, the
-  direction check, the call reservation, the over-2,000-character split and
-  every plain stage (plain-only post, the retry after a failed HTML attempt)
-  use, while the HTML attempt is translated exactly as written, because
-  stripping there would desync the markup its placeholders must be restored
-  into. The marker patterns on `0.13.0` are narrower than on `0.12.0`: a
-  line-leading comparator (`>50% Energy Regen`) and a hashtag that only starts
-  with a marker word (`#spoilersafe ...`, `#剧透警告 今汐`) are content and
-  survive; `0.12.0` stripped them. The tests for these cases run on the pin
-  with no skip.
+  gated on `len(plain) <= LLM_INPUT_CHAR_LIMIT` for short posts, and at most one
+  shared HTML-to-plain fallback slot for long rich HTML posts when per-minute
+  budget allows, while keeping per-segment corrective retries at 0). Long posts
+  (>2,000 chars) use paragraph-aware balanced HTML segmentation (preserving
+  inter-segment blank lines verbatim) when markup is present, or Core's
+  `segmentation-v1` + `TranslationContext(before=ContextBefore(...))` for plain
+  text. Local Core `0.16.0`'s `translate_protected_async` does not accept
+  `context` yet, so cross-segment context runs on plain segmentation and plain
+  fallback locally and activates automatically on protected HTML once a newer
+  local Core adds `context` or an HTTP Core advertises both
+  `protected-translation-v1` and `translation-context-v1`. Long HTML replies
+  (>4,096 UTF-16 units) split into balanced HTML chunks rather than stripping
+  all markup, falling back to plain text only when tag validation or Telegram
+  delivery fails. Before delivery, zero-cost
+  `wuwaterm.structural_checks.check_segment_structure` (`structure-check-v1`)
+  verifies numbers, paragraphs, placeholders, and non-empty output. Capacity
+  rejections and transient LLM failures enqueue into a bounded recoverable
+  `ChannelTaskQueue` (`channel_queue.py`) with exponential backoff, update-id
+  version ordering, and edit superseding.
+- Telegram HTML compatibility (`telegram_html.py`): supports PTB 22.8 / Bot API
+  10.0 rich entities including `blockquote`/`expandable`, `<tg-emoji>`,
+  `<tg-time unix="..." format="...">` (validated Bot API 10.0 format tokens),
+  and normalizes PTB 22.8's `<pre><code class="{language}">` to Telegram Bot
+  API's `<pre><code class="language-{language}">` on input and delivery.
+- Telegram wrapper cleanup: the adapter owns screenshot marker removal via Core's
+  native `wuwaterm.normalize.strip_telegram_wrapper_noise(..., keep_paragraphs=True)`.
+  The pre-0.13.0 `normalize_user_text` fallback has been removed (`MY-360`
+  documentation aligned). `/tr` and linked-channel plain routes strip markers;
+  HTML payloads stay untouched so placeholders remain aligned. Line-leading
+  comparators (`>50% Energy Regen`) and non-marker hashtags (`#spoilersafe ...`,
+  `#剧透警告 今汐`) are preserved.
 - Automatic direction (Core 0.13.0): with no `--to`, Core reads the direction
   from the normalized user text, and text containing CJK characters goes to
   Chinese only when its Latin letters outnumber the CJK characters more than

@@ -813,10 +813,12 @@ def test_channel_multichunk_flood_wait_never_duplicates(monkeypatch, sample_db):
 
     asyncio.run(channel_post_handler(update, context))
 
-    # Long HTML output downgrades to plain split chunks; each chunk exactly once.
+    # Long HTML output splits into balanced HTML chunks; each chunk sent once.
     assert len(message.replies) == 2
+    assert all(mode == "HTML" for _text, mode, _reply_to in message.replies)
     delivered = [text for text, _mode, _reply_to in message.replies]
-    assert "".join(delivered) == long_visible
+    assert all(validate_telegram_html(chunk) for chunk in delivered)
+    assert "".join(strip_telegram_html(chunk) for chunk in delivered) == long_visible
     assert message.attempts == 3  # chunk1 ok, chunk2 flood, chunk2 retry
 
 
@@ -1889,7 +1891,9 @@ def test_long_channel_input_is_split_instead_of_rejected(monkeypatch, sample_db)
 
     asyncio.run(channel_post_handler(update, context))
 
-    assert message.replies == [("chunk-1\nchunk-2", None, 4103)]
+    # segmentation-v1 hard-cuts the single run without fabricating a newline
+    # between the two pieces (preserving source separators verbatim).
+    assert message.replies == [("chunk-1chunk-2", None, 4103)]
     assert len(calls) == 2
     assert all(len(locked_text) <= LLM_INPUT_CHAR_LIMIT for locked_text, *_ in calls)
     assert [html_mode for *_rest, html_mode in calls] == [False, False]

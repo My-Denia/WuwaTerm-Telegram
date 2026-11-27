@@ -10,39 +10,101 @@ import re
 import sqlite3
 
 
-CORE_VERSION = "0.13.0"
+# Locked Core release used by deterministic CI/container builds, and the
+# runtime semantic version range accepted by the embedded compatibility layer.
+CORE_VERSION = "0.16.0"
+MIN_CORE_VERSION = "0.16.0"
+MAX_CORE_VERSION_EXCLUSIVE = "1.0.0"
+CORE_VERSION_SPEC = ">=0.16.0,<1.0"
 DATABASE_SCHEMA_VERSION = "2"
-# Core #318 moved Telegram wrapper cleanup out of generic text preparation into
-# `wuwaterm.normalize.strip_telegram_wrapper_noise` and stopped `prepare_text`
-# from deleting screenshot markers. Core 0.12.0 folded that cleanup into
-# `normalize_user_text`. The pin is now 0.13.0, so the symbol is mandatory:
-# `verify_core_compatibility` refuses a Core without it, and the
-# `normalize_user_text` branch in `strip_telegram_wrapper_noise` only serves a
-# Core older than this version.
-WRAPPER_STRIP_CORE_VERSION = "0.13.0"
 
-_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n+")
+_PEP440_FINAL_RE = re.compile(
+    r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)"
+    r"(?:\.post(?P<post>\d+))?"
+    r"(?:\+(?P<local>[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*))?\Z"
+)
+
+try:
+    from packaging.specifiers import SpecifierSet as _SpecifierSet
+    from packaging.version import InvalidVersion as _InvalidVersion, Version as _Version
+except ImportError:  # pragma: no cover - stdlib fallback
+    _SpecifierSet = None
+    _InvalidVersion = ValueError
+    _Version = None
 
 
 class CoreCompatibilityError(RuntimeError):
     """The installed Core does not support this adapter."""
 
 
-def _version_at_least(version: str, minimum: str) -> bool:
-    def parts(value: str) -> tuple[int, ...]:
-        numbers: list[int] = []
-        for chunk in value.split("."):
-            digits = "".join(char for char in chunk if char.isdigit())
-            if not digits:
-                break
-            numbers.append(int(digits))
-        return tuple(numbers)
+def _stdlib_final_version_key(version: str) -> tuple[int, tuple[int, ...], int]:
+    match = _PEP440_FINAL_RE.fullmatch(version.strip())
+    if match is None:
+        raise ValueError(f"unsupported or pre-release version: {version!r}")
+    epoch = int(match.group("epoch") or 0)
+    parts = [int(p) for p in match.group("release").split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    post = int(match.group("post")) if match.group("post") is not None else -1
+    return (epoch, tuple(parts), post)
 
-    return parts(version) >= parts(minimum)
+
+def parse_version_tuple(version: str) -> tuple[int, int, int]:
+    """Extract the (major, minor, patch) numeric tuple of a final PEP 440 version."""
+    _epoch, parts, _post = _stdlib_final_version_key(version)
+    return (parts[0], parts[1], parts[2])
+
+
+def _version_at_least(version: str, minimum: str) -> bool:
+    if _Version is not None:
+        try:
+            return _Version(version) >= _Version(minimum)
+        except _InvalidVersion:
+            return False
+    try:
+        return _stdlib_final_version_key(version) >= _stdlib_final_version_key(minimum)
+    except ValueError:
+        return False
+
+
+def is_compatible_core_version(
+    version: str,
+    *,
+    spec: str = CORE_VERSION_SPEC,
+) -> bool:
+    """True when ``version`` satisfies the PEP 440 Core version specifier."""
+    if _SpecifierSet is not None and _Version is not None:
+        try:
+            parsed = _Version(version)
+            return _SpecifierSet(spec).contains(parsed, prereleases=False)
+        except (_InvalidVersion, ValueError):
+            return False
+    try:
+        parsed_key = _stdlib_final_version_key(version)
+    except ValueError:
+        return False
+    for clause in (part.strip() for part in spec.split(",") if part.strip()):
+        for op in ("==", ">=", "<=", ">", "<"):
+            if clause.startswith(op):
+                target_key = _stdlib_final_version_key(clause[len(op) :])
+                if op == "==" and not (parsed_key == target_key):
+                    return False
+                if op == ">=" and not (parsed_key >= target_key):
+                    return False
+                if op == "<=" and not (parsed_key <= target_key):
+                    return False
+                if op == ">" and not (parsed_key > target_key):
+                    return False
+                if op == "<" and not (parsed_key < target_key):
+                    return False
+                break
+        else:
+            return False
+    return True
 
 
 def wrapper_strip_is_native() -> bool:
-    """True when Core ships `strip_telegram_wrapper_noise` (>= 0.13.0)."""
+    """True when Core ships `strip_telegram_wrapper_noise`."""
     try:
         normalize = import_module("wuwaterm.normalize")
     except ImportError:
@@ -51,13 +113,11 @@ def wrapper_strip_is_native() -> bool:
 
 
 def strip_telegram_wrapper_noise(value: str, *, keep_paragraphs: bool = False) -> str:
-    """Strip Telegram screenshot/wrapper markers with the installed Core.
+    """Strip Telegram screenshot/wrapper markers using Core's native helper.
 
     Telegram-facing text only: version tags (`[Wuthering Waves 3.7]`), spoiler
     labels (`[spoiler]`), and quote bars are screenshot furniture, not content.
-    Core >= 0.13.0 exposes the cleanup as its own function; Core 0.12.0 only
-    strips the same markers inside `normalize_user_text`, so that is the
-    fallback for a Core older than `WRAPPER_STRIP_CORE_VERSION`.
+    Core >= 0.16.0 always provides `wuwaterm.normalize.strip_telegram_wrapper_noise`.
     """
     try:
         normalize = import_module("wuwaterm.normalize")
@@ -66,28 +126,20 @@ def strip_telegram_wrapper_noise(value: str, *, keep_paragraphs: bool = False) -
             "installed WuwaTerm Core lacks Telegram wrapper cleanup"
         ) from exc
     strip = getattr(normalize, "strip_telegram_wrapper_noise", None)
-    if strip is not None:
-        return strip(value, keep_paragraphs=keep_paragraphs)
-    legacy = getattr(normalize, "normalize_user_text", None)
-    if legacy is None:  # pragma: no cover - every supported Core has one
+    if strip is None:
         raise CoreCompatibilityError(
-            "installed WuwaTerm Core lacks Telegram wrapper cleanup"
+            "installed WuwaTerm Core lacks wuwaterm.normalize.strip_telegram_wrapper_noise"
         )
-    if not keep_paragraphs:
-        return legacy(value)
-    parts = (legacy(part) for part in _PARAGRAPH_BREAK_RE.split(value))
-    return "\n\n".join(part for part in parts if part)
+    return strip(value, keep_paragraphs=keep_paragraphs)
 
 
-# What `/review` needs from the pinned Core (semantic-review-v1, segmentation-v1,
-# present since Core 0.12.0).
-# `verify_core_compatibility` requires all of them: the adapter is built for
-# exactly this Core. Whether the model track is *on* is a separate, run-time
-# matter (`semantic_review_enabled()` and a configured model).
+# What `/review` needs from the Core runtime (semantic-review-v1, segmentation-v1).
+# `verify_core_compatibility` probes all of them at start-up.
 REVIEW_CORE_SYMBOLS: dict[str, tuple[str, ...]] = {
     "wuwaterm.application": (
         "ContextBefore",
         "SemanticReviewJob",
+        "TranslationContext",
         "semantic_review_async",
         "semantic_review_enabled",
     ),
@@ -110,26 +162,72 @@ def missing_review_symbols() -> tuple[str, ...]:
     return tuple(missing)
 
 
+def probe_local_core_capabilities() -> frozenset[str]:
+    """Probe optional runtime capabilities exposed by an installed local Core."""
+    caps: set[str] = set()
+    try:
+        app = import_module("wuwaterm.application")
+    except ImportError:
+        return frozenset()
+    service_caps = getattr(app, "service_capabilities", None)
+    if callable(service_caps):
+        try:
+            caps.update(str(item) for item in service_caps())
+        except Exception:  # noqa: BLE001 - capability probe must stay safe
+            pass
+    if hasattr(app, "TranslationContext") and hasattr(app, "ContextBefore"):
+        caps.add("translation-context-v1")
+    try:
+        structural = import_module("wuwaterm.structural_checks")
+        if hasattr(structural, "check_segment_structure"):
+            caps.add("structure-check-v1")
+    except ImportError:
+        pass
+    try:
+        protected_sig = signature(app.SentenceTranslator.translate_protected_async)
+        if "context" in protected_sig.parameters:
+            caps.add("protected-text-context-v1")
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return frozenset(caps)
+
+
 def verify_core_compatibility() -> None:
+    """Validate installed Core semver range and runtime capabilities."""
     try:
         version = metadata.version("wuwaterm")
     except metadata.PackageNotFoundError as exc:
         raise CoreCompatibilityError("WuwaTerm Core is not installed") from exc
-    if version != CORE_VERSION:
+    if not is_compatible_core_version(version):
         raise CoreCompatibilityError(
-            f"WuwaTerm Core {CORE_VERSION} is required; found {version}"
+            f"WuwaTerm Core {CORE_VERSION_SPEC} is required; found {version}"
         )
     try:
         app = import_module("wuwaterm.application")
         required = (
-            "DEFAULT_LLM_MAX_CONCURRENCY", "DEFAULT_LLM_TIMEOUT_SECONDS",
-            "LLM_INPUT_CHAR_LIMIT", "LLMTranslationError", "MarkupTranslation",
+            "ContextBefore",
+            "DEFAULT_LLM_MAX_CONCURRENCY",
+            "DEFAULT_LLM_TIMEOUT_SECONDS",
+            "LLM_INPUT_CHAR_LIMIT",
+            "LLMTranslationError",
+            "MarkupTranslation",
             "OperationExecutionBudget",
-            "ProtectedStructure", "ProtectedText", "SentenceTranslator",
-            "SlidingWindowRateLimiter", "TermService", "TranslationJob",
-            "TranslationOutcome", "TRANSLATION_UNAVAILABLE_NOTICE",
-            "build_term_service", "build_translator", "count_cjk", "count_latin",
-            "error_code_for_llm_reason", "llm_configured", "translate_request",
+            "ProtectedStructure",
+            "ProtectedText",
+            "SentenceTranslator",
+            "SlidingWindowRateLimiter",
+            "TermService",
+            "TranslationContext",
+            "TranslationJob",
+            "TranslationOutcome",
+            "TRANSLATION_UNAVAILABLE_NOTICE",
+            "build_term_service",
+            "build_translator",
+            "count_cjk",
+            "count_latin",
+            "error_code_for_llm_reason",
+            "llm_configured",
+            "translate_request",
             "translate_request_async",
         )
         for name in required:
@@ -139,8 +237,11 @@ def verify_core_compatibility() -> None:
             raise AttributeError("protected translation guard")
         if "execution_budget" not in signature(protected_async).parameters:
             raise AttributeError("protected execution budget")
-        if "execution_budget" not in signature(app.SentenceTranslator.translate_async).parameters:
+        translate_async_params = signature(app.SentenceTranslator.translate_async).parameters
+        if "execution_budget" not in translate_async_params:
             raise AttributeError("sentence execution budget")
+        if "context" not in translate_async_params:
+            raise AttributeError("sentence translation context")
         if "before_llm_call" not in signature(app.translate_request_async).parameters:
             raise AttributeError("application translation guard")
         if "execution_budget" not in signature(app.translate_request_async).parameters:
@@ -148,14 +249,14 @@ def verify_core_compatibility() -> None:
         missing = missing_review_symbols()
         if missing:
             raise AttributeError("review symbols: " + ", ".join(missing))
-        if _version_at_least(CORE_VERSION, WRAPPER_STRIP_CORE_VERSION) and not (
-            wrapper_strip_is_native()
-        ):
+        if not wrapper_strip_is_native():
             raise AttributeError(
                 "wuwaterm.normalize.strip_telegram_wrapper_noise"
             )
         if "execution_budget" not in signature(app.semantic_review_async).parameters:
             raise AttributeError("review execution budget")
+        structural = import_module("wuwaterm.structural_checks")
+        getattr(structural, "check_segment_structure")
         llm_transport = import_module("wuwaterm.llm_transport")
         getattr(llm_transport, "current_execution_budget")
     except (ImportError, AttributeError, TypeError, ValueError) as exc:

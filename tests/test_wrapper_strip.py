@@ -1,12 +1,4 @@
-"""Telegram wrapper cleanup survives Core 0.13.0's preparation change.
-
-Core #318 stopped deleting screenshot markers inside generic text preparation
-and exposes `wuwaterm.normalize.strip_telegram_wrapper_noise` instead, so the
-adapter has to own the cleanup. Core 0.12.0 folded it into
-`normalize_user_text` with wider marker patterns. The pin is Core 0.13.0, so
-every assertion here runs against the narrower 0.13.0 patterns and none is
-conditional on the installed Core.
-"""
+"""Telegram wrapper cleanup and Core >=0.16.0,<1.0 compatibility checks."""
 from __future__ import annotations
 
 import importlib
@@ -16,6 +8,8 @@ import pytest
 from wuwaterm_telegram import core_compat
 from wuwaterm_telegram.core_compat import (
     CoreCompatibilityError,
+    is_compatible_core_version,
+    probe_local_core_capabilities,
     strip_telegram_wrapper_noise,
     verify_core_compatibility,
     wrapper_strip_is_native,
@@ -53,26 +47,13 @@ def test_keep_paragraphs_preserves_blank_line_separators():
     assert strip_telegram_wrapper_noise(wrapped) == "第一段\n第二段"
 
 
-def _legacy_core_normalize(value: str) -> str:
-    """Stand-in for Core 0.12.0: markers out, every line collapsed."""
-    for marker in ("(WW 3.4)", "[spoiler]", ">"):
-        value = value.replace(marker, "")
-    lines = (line.strip() for line in value.splitlines())
-    return "\n".join(line for line in lines if line)
-
-
-def test_legacy_core_fallback_also_keeps_paragraphs(monkeypatch):
-    """The pre-0.13.0 path must behave the same on the paragraph boundary."""
+def test_missing_wrapper_strip_symbol_raises_instead_of_legacy_fallback(monkeypatch):
+    """Pre-0.13.0 legacy fallback is gone; missing symbol fails loudly."""
     normalize = importlib.import_module("wuwaterm.normalize")
     monkeypatch.delattr(normalize, "strip_telegram_wrapper_noise", raising=False)
-    monkeypatch.setattr(normalize, "normalize_user_text", _legacy_core_normalize)
     assert not wrapper_strip_is_native()
-    wrapped = "(WW 3.4)\n[spoiler]\n> 第一段\n\n> 第二段"
-    assert (
-        strip_telegram_wrapper_noise(wrapped, keep_paragraphs=True)
-        == "第一段\n\n第二段"
-    )
-    assert strip_telegram_wrapper_noise(wrapped) == "第一段\n第二段"
+    with pytest.raises(CoreCompatibilityError, match="strip_telegram_wrapper_noise"):
+        strip_telegram_wrapper_noise("[spoiler] 今汐登场")
 
 
 def test_prose_that_only_looks_like_a_marker_is_preserved():
@@ -87,19 +68,84 @@ def test_prose_that_only_looks_like_a_marker_is_preserved():
         assert strip_telegram_wrapper_noise(source) == source
 
 
-def test_version_compare_gates_the_symbol_requirement():
-    assert core_compat._version_at_least("0.13.0", "0.13.0")
-    assert core_compat._version_at_least("0.13.1", "0.13.0")
-    assert not core_compat._version_at_least("0.12.0", "0.13.0")
-    assert not core_compat._version_at_least("0.9.0", "0.13.0")
+def test_semver_range_accepts_newer_compatible_core_and_rejects_out_of_range(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import core_lock
+
+    for ok_ver in (
+        "0.16.0",
+        "0.16.0+local",
+        "0.16.0.post1",
+        "0.16.1",
+        "0.17.0",
+        "0.17.0+local",
+        "0.17.0+abc.1",
+        "0.17.0.post1+g123",
+        "0.99.9",
+    ):
+        assert is_compatible_core_version(ok_ver), ok_ver
+        assert core_lock.version_satisfies_spec(ok_ver, core_compat.CORE_VERSION_SPEC), ok_ver
+
+    for bad_ver in (
+        "0.15.9",
+        "0.15.9+local",
+        "0.13.0",
+        "0.16.0rc1",
+        "0.16.0rc1+local",
+        "0.16.0.dev0",
+        "0.16.0a1",
+        "0.16.1a1",
+        "0.17.0+bad!",
+        "1.0.0rc1",
+        "1.0.0",
+        "1.0.0+local",
+        "not-a-version",
+    ):
+        assert not is_compatible_core_version(bad_ver), bad_ver
+        assert not core_lock.version_satisfies_spec(bad_ver, core_compat.CORE_VERSION_SPEC), bad_ver
+
+    # Verify stdlib-only PEP 440 fallback matches packaging.SpecifierSet exactly.
+    monkeypatch.setattr(core_compat, "_SpecifierSet", None)
+    monkeypatch.setattr(core_compat, "_Version", None)
+    monkeypatch.setattr(core_lock, "_SpecifierSet", None)
+    monkeypatch.setattr(core_lock, "_Version", None)
+    for ok_ver in ("0.16.0", "0.16.0+local", "0.17.0+local", "0.17.0.post1+g123"):
+        assert is_compatible_core_version(ok_ver), f"stdlib failed to accept {ok_ver}"
+        assert core_lock.version_satisfies_spec(ok_ver, core_compat.CORE_VERSION_SPEC), ok_ver
+    for bad_ver in ("0.16.0rc1", "0.16.0rc1+local", "0.15.9+local", "1.0.0+local", "0.17.0+bad!"):
+        assert not is_compatible_core_version(bad_ver), f"stdlib failed to reject {bad_ver}"
+        assert not core_lock.version_satisfies_spec(bad_ver, core_compat.CORE_VERSION_SPEC), bad_ver
+
+    # A newer compatible 0.x Core passes runtime compatibility checks.
+    monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "0.17.2")
+    verify_core_compatibility()
+
+    # An older Core, pre-release, or breaking 1.0.0 Core is rejected.
+    monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "0.15.0")
+    with pytest.raises(CoreCompatibilityError, match=">=0.16.0,<1.0"):
+        verify_core_compatibility()
+
+    monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "0.16.0rc1")
+    with pytest.raises(CoreCompatibilityError, match=">=0.16.0,<1.0"):
+        verify_core_compatibility()
+
+    monkeypatch.setattr(core_compat.metadata, "version", lambda _name: "1.0.0")
+    with pytest.raises(CoreCompatibilityError, match=">=0.16.0,<1.0"):
+        verify_core_compatibility()
 
 
-def test_pinned_core_ships_the_native_wrapper_strip_symbol():
-    assert core_compat._version_at_least(
-        core_compat.CORE_VERSION, core_compat.WRAPPER_STRIP_CORE_VERSION
-    )
+def test_installed_core_ships_native_wrapper_strip_and_capabilities():
+    assert core_compat.CORE_VERSION == "0.16.0"
     assert wrapper_strip_is_native()
     verify_core_compatibility()
+    caps = probe_local_core_capabilities()
+    assert "translation-context-v1" in caps
+    assert "structure-check-v1" in caps
 
 
 def test_missing_wrapper_strip_symbol_fails_compatibility(monkeypatch):

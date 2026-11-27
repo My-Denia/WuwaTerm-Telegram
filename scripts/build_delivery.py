@@ -1176,12 +1176,15 @@ def build(args: argparse.Namespace) -> int:
         tar.extractall(source_dir, filter="data")
     # Everything below runs the archive's own bytes, not the working tree.
     ci = ci_evidence(source_dir, commit, args.workflow_file) if args.authority == "official-ci" else None
-    pins = [d.removeprefix("wuwaterm==") for d in tomllib.loads(
-        (source_dir / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
-        if d.startswith("wuwaterm==")]
-    if len(pins) != 1:
-        fail("the archive's project must pin exactly one Core version")
-    core_version = pins[0]
+    core_deps = [
+        d.removeprefix("wuwaterm").strip()
+        for d in tomllib.loads(
+            (source_dir / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]["dependencies"]
+        if re.match(r"^wuwaterm(?:==|>=|<=|>|<)", d)
+    ]
+    if len(core_deps) != 1:
+        fail("the archive's project must specify exactly one Core dependency")
 
     wheels_dir = attempt / "inputs" / "wheels"
     wheels_dir.mkdir()
@@ -1201,6 +1204,7 @@ def build(args: argparse.Namespace) -> int:
         prepare += ["--lock", str(lock), "--core", str(core_path)]
     # The archive's own context builder checks both wheels' hashes, names and versions.
     run(prepare)
+    core_version = wheel_identity(core_path)[1]
     check_wheel_matches_source(telegram_path, source_dir)
 
     wheels = []
