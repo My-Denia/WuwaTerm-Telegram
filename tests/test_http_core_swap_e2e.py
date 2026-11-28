@@ -567,6 +567,7 @@ def test_pure_http_mode_full_pipeline_without_local_db(monkeypatch, tmp_path, ca
         health_result = operations.health()
         assert health_result["status"] == "ready"
         assert health_result["core_mode"] == "http"
+        assert health_result["poll_checked"] is False
         assert health_result["service_version"] == "0.16.0"
         assert health_result["dictionary_revision"] == "rev_1"
         assert CAP_PROTECTED_TRANSLATION in health_result["capabilities"]
@@ -581,8 +582,32 @@ def test_pure_http_mode_full_pipeline_without_local_db(monkeypatch, tmp_path, ca
             check=False,
         )
         assert cli_proc.returncode == 0, cli_proc.stderr
-        assert json.loads(cli_proc.stdout)["dictionary_revision"] == "rev_1"
+        cli_health = json.loads(cli_proc.stdout)
+        assert cli_health["dictionary_revision"] == "rev_1"
+        assert cli_health["poll_checked"] is False
         assert secret_token not in (cli_proc.stdout + cli_proc.stderr)
+
+        # When WUWATERM_POLL_HEALTH=1 is enabled on Linux, HTTP health checks BOTH
+        # Core API and local SDK polling evidence and reports poll_checked=True.
+        if sys.platform == "linux":
+            from wuwaterm_telegram import poll_health
+
+            poll_dir = tmp_path / "poll-health"
+            poll_dir.mkdir(mode=0o700)
+            monkeypatch.setattr(poll_health, "HEALTH_DIR", poll_dir)
+            monkeypatch.setenv("WUWATERM_POLL_HEALTH", "1")
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            try:
+                poll_health.record_success(read_fd)
+                combined_health = operations.health()
+                assert combined_health["status"] == "ready"
+                assert combined_health["core_mode"] == "http"
+                assert combined_health["poll_checked"] is True
+                assert combined_health["pid"] == os.getpid()
+            finally:
+                os.close(read_fd)
+                monkeypatch.delenv("WUWATERM_POLL_HEALTH", raising=False)
 
         # 3. Full Telegram command, lookup, review, rich HTML channel & queue pipeline.
         fake_bot = _FakeTelegramBot()
@@ -1023,23 +1048,42 @@ def test_http_mode_about_and_status_degrade_cleanly_when_core_unreachable(
         asyncio.run(exercise())
 
 
-def test_deploy_files_demonstrate_pure_http_mode_and_local_fallback():
+def test_deploy_compose_preserves_data_mount_and_env_example_avoids_unreachable_loopback_default():
     root = Path(__file__).resolve().parents[1]
-    compose_text = (root / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
-    env_text = (root / "deploy" / "env.example").read_text(encoding="utf-8")
-
-    # Compose must not actively mount data/terms.db by default.
-    active_compose_lines = [
+    compose_lines = [
         line.strip()
-        for line in compose_text.splitlines()
+        for line in (root / "deploy" / "docker-compose.yml").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    assert "- ../state:/app/state" in active_compose_lines
-    assert "- ../data:/app/data:ro" not in active_compose_lines
-    assert "WUWATERM_CORE_MODE=http" in compose_text
+    # Keep ../data mount active for local-mode and Core setup.sh --telegram-dir compatibility.
+    assert "- ../data:/app/data:ro" in compose_lines
+    assert "- ../state:/app/state" in compose_lines
 
-    # env.example documents pure HTTP mode defaults and local compatibility fallback.
-    assert "WUWATERM_CORE_MODE=http" in env_text
-    assert "WUWATERM_CORE_API_URL=" in env_text
-    assert "WUWATERM_CORE_API_TOKEN=" in env_text
-    assert "local" in env_text
+    # env.example must not ship an active container-unreachable 127.0.0.1 Core API URL.
+    active_env_lines = [
+        line.strip()
+        for line in (root / "deploy" / "env.example").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    active_env = dict(line.split("=", 1) for line in active_env_lines if "=" in line)
+    assert "WUWATERM_CORE_MODE" not in active_env
+    assert not active_env.get("WUWATERM_CORE_API_URL", "").startswith(
+        ("http://127.0.0.1", "https://127.0.0.1", "http://localhost", "https://localhost")
+    )
+
+
+def test_operations_identity_and_state_plan_do_not_import_core_backend():
+    """Importing operations for identity/state-plan stays stdlib-only (lazy core_backend import)."""
+    program = (
+        "import sys; "
+        "import wuwaterm_telegram.operations as ops; "
+        "assert 'wuwaterm_telegram.core_backend' not in sys.modules; "
+        "assert 'httpx' not in sys.modules"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", program],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr

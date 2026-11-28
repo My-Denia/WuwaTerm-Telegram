@@ -14,13 +14,6 @@ import re
 import stat
 import sys
 
-from . import poll_health
-from .core_backend import (
-    CoreBackendError,
-    DEFAULT_CORE_HEALTH_TIMEOUT_SECONDS,
-    probe_http_core_health,
-    resolve_core_mode,
-)
 from .state_paths import state_paths
 
 
@@ -334,12 +327,12 @@ def _max_age(value: str) -> int:
 
 
 def health(
-    max_age: int = poll_health.DEFAULT_MAX_AGE,
+    max_age: int = 90,
     *,
     core_mode: str | None = None,
     core_api_url: str | None = None,
     core_api_token: str | None = None,
-    timeout_seconds: float = DEFAULT_CORE_HEALTH_TIMEOUT_SECONDS,
+    timeout_seconds: float = 5.0,
     check_poll: bool | None = None,
     transport=None,
 ) -> dict[str, object]:
@@ -348,11 +341,19 @@ def health(
     - In HTTP Core mode (``WUWATERM_CORE_MODE=http``, or ``auto`` with
       ``WUWATERM_CORE_API_URL`` set): probes Core HTTP ``/v1/meta`` (and
       optional ``/v1/capabilities`` / ``/v1/dictionary``) without requiring a
-      local ``terms.db`` file. Also checks local SDK poll health when
-      ``WUWATERM_POLL_HEALTH=1`` or ``check_poll=True``.
+      local ``terms.db`` file. Reports ``poll_checked: false`` unless
+      ``WUWATERM_POLL_HEALTH=1`` or ``check_poll=True``, in which case local
+      SDK poll health is also verified and ``poll_checked: true`` is reported.
     - In local mode: checks local SDK polling evidence via ``poll_health.health``
       with zero network calls.
     """
+    from . import poll_health
+    from .core_backend import (
+        CoreBackendError,
+        probe_http_core_health,
+        resolve_core_mode,
+    )
+
     raw_mode = (
         core_mode
         if core_mode is not None
@@ -387,12 +388,16 @@ def health(
         should_check_poll = poll_health.enabled() if check_poll is None else check_poll
         if should_check_poll:
             poll_result = poll_health.health(max_age)
-            result = {
+            return {
                 **result,
+                "poll_checked": True,
                 "pid": poll_result["pid"],
                 "age_seconds": poll_result["age_seconds"],
             }
-        return result
+        return {
+            **result,
+            "poll_checked": False,
+        }
 
     return poll_health.health(max_age)
 
