@@ -73,10 +73,15 @@ from .core_backend import (
     CoreBackend,
     CoreBackendError,
     CoreMeta,
+    CoreModeSetting,
     DEFAULT_CORE_HTTP_TIMEOUT_SECONDS,
+    DEFAULT_CORE_MODE,
     HttpCoreBackend,
     HttpReviewBackend,
     LocalCoreBackend,
+    ResolvedCoreMode,
+    redact_core_endpoint,
+    resolve_core_mode,
 )
 from .core_compat import (
     strip_telegram_wrapper_noise,
@@ -428,21 +433,40 @@ class BotConfig:
     channel_queue_max_attempts: int = DEFAULT_QUEUE_MAX_ATTEMPTS
     channel_queue_persist: bool = False
     channel_queue_path: str | None = None
+    core_mode: CoreModeSetting = DEFAULT_CORE_MODE
     core_api_url: str | None = None
     core_api_token: str | None = None
     core_api_timeout_seconds: float = DEFAULT_CORE_HTTP_TIMEOUT_SECONDS
     llm_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
     llm_max_concurrency: int = DEFAULT_LLM_MAX_CONCURRENCY
 
+    def __post_init__(self) -> None:
+        try:
+            normalized_mode, _resolved, normalized_url = resolve_core_mode(
+                self.core_mode, self.core_api_url
+            )
+        except ValueError as exc:
+            raise BotConfigError(str(exc)) from None
+        object.__setattr__(self, "core_mode", normalized_mode)
+        object.__setattr__(self, "core_api_url", normalized_url)
+
+    @property
+    def resolved_core_mode(self) -> ResolvedCoreMode:
+        _setting, resolved, _url = resolve_core_mode(
+            self.core_mode, self.core_api_url
+        )
+        return resolved
+
     @classmethod
     def from_env(cls) -> "BotConfig":
-        core_api_url = os.getenv("WUWATERM_CORE_API_URL", "").strip() or None
-        if core_api_url is not None:
-            parsed_core = urlparse(core_api_url)
-            if parsed_core.scheme not in {"http", "https"} or not parsed_core.netloc:
-                raise BotConfigError(
-                    "WUWATERM_CORE_API_URL must be an absolute HTTP(S) URL"
-                )
+        raw_core_mode = os.getenv("WUWATERM_CORE_MODE", "").strip() or DEFAULT_CORE_MODE
+        raw_core_api_url = os.getenv("WUWATERM_CORE_API_URL", "").strip() or None
+        try:
+            core_mode, _resolved, core_api_url = resolve_core_mode(
+                raw_core_mode, raw_core_api_url
+            )
+        except ValueError as exc:
+            raise BotConfigError(str(exc)) from None
         return cls(
             rate_limit_per_minute=_env_int(
                 "WUWATERM_RATE_LIMIT_PER_MINUTE",
@@ -535,6 +559,7 @@ class BotConfig:
             channel_queue_path=(
                 os.getenv("WUWATERM_CHANNEL_QUEUE_PATH", "").strip() or None
             ),
+            core_mode=core_mode,
             core_api_url=core_api_url,
             core_api_token=(
                 os.getenv("WUWATERM_CORE_API_TOKEN", "").strip() or None
@@ -1121,7 +1146,9 @@ def create_application(
 ) -> Application:
     health_enabled = poll_health.enabled()
     config = config or BotConfig.from_env()
-    _validate_llm_config_env()
+    effective_core_mode = config.resolved_core_mode
+    if effective_core_mode == "local":
+        _validate_llm_config_env()
     if chat_settings is None:
         chat_settings = ChatSettings(_chat_settings_path_from_env(db_path))
     if health_enabled:
@@ -1133,24 +1160,32 @@ def create_application(
         builder = ApplicationBuilder().token(token)
     builder = builder.post_init(_publish_commands)
     app = builder.post_shutdown(_close_translator_on_shutdown).build()
-    service = build_term_service(db_path)
-    app.bot_data[SERVICE_KEY] = service
-    translator = build_translator(
-        db_path,
-        timeout=config.llm_timeout_seconds,
-        max_concurrency=config.llm_max_concurrency,
-    )
-    app.bot_data[TRANSLATOR_KEY] = translator
     app.bot_data[CONFIG_KEY] = config
+    service: TermService | None = None
+    translator: SentenceTranslator | None = None
     core_backend: CoreBackend
-    if config.core_api_url:
+    if effective_core_mode == "http":
+        assert config.core_api_url is not None
         core_backend = HttpCoreBackend(
             config.core_api_url,
             api_token=config.core_api_token,
             timeout_seconds=config.core_api_timeout_seconds,
         )
+        LOGGER.info(
+            "configured core backend core_mode=http endpoint=%s local_db=disabled",
+            redact_core_endpoint(config.core_api_url),
+        )
     else:
+        service = build_term_service(db_path)
+        app.bot_data[SERVICE_KEY] = service
+        translator = build_translator(
+            db_path,
+            timeout=config.llm_timeout_seconds,
+            max_concurrency=config.llm_max_concurrency,
+        )
+        app.bot_data[TRANSLATOR_KEY] = translator
         core_backend = LocalCoreBackend(service, translator)
+        LOGGER.info("configured core backend core_mode=local")
     app.bot_data[CORE_BACKEND_KEY] = core_backend
     app.bot_data[RATE_LIMITER_KEY] = PerChatRateLimiter(config.rate_limit_per_minute)
     app.bot_data[REJECT_LIMITER_KEY] = PerChatRateLimiter(config.rate_limit_per_minute)
@@ -1183,7 +1218,7 @@ def create_application(
         else None
     )
     review_bot.register_review(
-        app, app.bot_data[SERVICE_KEY], translator, backend=review_backend
+        app, service, translator, backend=review_backend
     )
     app.add_handler(CommandHandler(["help", "start"], help_command))
     app.add_handler(CommandHandler("about", about_command))
@@ -1375,20 +1410,22 @@ def _fsync_state_parent(path: Path) -> None:
 
 def run_bot(db_path: str | Path, token: str | None = None) -> None:
     verify_core_compatibility()
-    verify_dictionary(db_path)
     logging.basicConfig(
         level=os.getenv("WUWATERM_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     for noisy_logger in ("httpx", "httpcore", "telegram", "telegram.ext"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+    config = BotConfig.from_env()
+    if config.resolved_core_mode == "local":
+        verify_dictionary(db_path)
     token = token or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit(
             "wuwaterm-telegram: TELEGRAM_BOT_TOKEN is required; "
             "set it in the bot environment or .env"
         )
-    app = create_application(token, db_path)
+    app = create_application(token, db_path, config=config)
     app.run_polling()
 
 
@@ -1856,7 +1893,7 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     message = update.effective_message
     if not message:
         return
-    service: TermService = context.application.bot_data[SERVICE_KEY]
+    service: TermService | None = context.application.bot_data.get(SERVICE_KEY)
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
     remote_meta: CoreMeta | None = None
     core_backend = context.application.bot_data.get(CORE_BACKEND_KEY)
@@ -1876,7 +1913,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     config: BotConfig = context.application.bot_data[CONFIG_KEY]
     if not _is_owner(update, config):
         return
-    service: TermService = context.application.bot_data[SERVICE_KEY]
+    service: TermService | None = context.application.bot_data.get(SERVICE_KEY)
     settings: ChatSettings = context.application.bot_data[CHAT_SETTINGS_KEY]
     reply_index: ChannelReplyIndex = context.application.bot_data[
         CHANNEL_REPLY_INDEX_KEY
@@ -1916,7 +1953,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _about_text(
-    service: TermService,
+    service: TermService | None,
     config: BotConfig,
     *,
     remote_meta: CoreMeta | None = None,
@@ -1927,7 +1964,7 @@ def _about_text(
         term_count = remote_meta.term_count
         llm = "configured" if remote_meta.llm_configured else "not configured"
         source = profile
-    else:
+    elif service is not None:
         meta = service.metadata()
         profile = meta.get("source_profile") or "unknown"
         repo = meta.get("source_repo_url")
@@ -1935,6 +1972,11 @@ def _about_text(
         source = f"{profile} ({repo})" if repo else profile
         term_count = service.term_count()
         llm = "configured" if llm_configured() else "not configured"
+    else:
+        source = "unavailable (Core HTTP unreachable)"
+        commit = "unknown"
+        term_count = 0
+        llm = "unknown"
     return (
         "wuwaterm /about\n"
         f"Data source: {source}\n"
@@ -1946,7 +1988,7 @@ def _about_text(
 
 
 def _status_text(
-    service: TermService,
+    service: TermService | None,
     config: BotConfig,
     settings: ChatSettings,
     reply_index: ChannelReplyIndex,
@@ -1956,17 +1998,28 @@ def _status_text(
     backend_kind: str = "local",
     remote_meta: CoreMeta | None = None,
 ) -> str:
+    remote_lines = ""
     if remote_meta is not None:
         commit = remote_meta.source_commit or "unknown"
         profile = remote_meta.source_profile or "unknown"
         term_count = remote_meta.term_count
         llm = "yes" if remote_meta.llm_configured else "no"
-    else:
+        caps_summary = ",".join(sorted(remote_meta.capabilities)) or "none"
+        remote_lines = f"Core service version: {remote_meta.service_version}\n"
+        if remote_meta.dictionary_revision:
+            remote_lines += f"Core dictionary revision: {remote_meta.dictionary_revision}\n"
+        remote_lines += f"Core capabilities: {caps_summary}\n"
+    elif service is not None:
         meta = service.metadata()
         commit = meta.get("wutheringdata_commit") or "unknown"
         profile = meta.get("source_profile") or "unknown"
         term_count = service.term_count()
         llm = "yes" if llm_configured() else "no"
+    else:
+        commit = "unknown"
+        profile = "unknown"
+        term_count = 0
+        llm = "unknown"
     short_commit = commit[:12] if re.fullmatch(r"[0-9a-f]{40}", commit) else commit
     channel_auto = "on" if config.channel_autotranslate else "off"
     tracked_channel_posts = reply_index.entry_count()
@@ -1999,6 +2052,7 @@ def _status_text(
     return (
         "wuwaterm /status\n"
         f"Core backend: {backend_kind}\n"
+        f"{remote_lines}"
         f"Dictionary terms: {term_count}\n"
         f"Data profile: {profile}\n"
         f"Data commit: {short_commit}\n"

@@ -18,6 +18,7 @@ import logging
 import re
 import time
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
+from urllib.parse import urlparse
 
 import httpx
 
@@ -85,7 +86,72 @@ CAP_HYBRID_RAG = "hybrid-rag-v1"
 DEFAULT_CAPABILITY_CACHE_TTL_SECONDS = 60.0
 DEFAULT_CAPABILITY_RETRY_COOLDOWN_SECONDS = 15.0
 DEFAULT_CORE_HTTP_TIMEOUT_SECONDS = 45.0
+DEFAULT_CORE_HEALTH_TIMEOUT_SECONDS = 5.0
 HTTP_TERM_QUERY_MAX_CHARS = 200
+
+CoreModeSetting = Literal["auto", "http", "local"]
+ResolvedCoreMode = Literal["http", "local"]
+DEFAULT_CORE_MODE: CoreModeSetting = "auto"
+VALID_CORE_MODES: frozenset[str] = frozenset({"auto", "http", "local"})
+
+
+def redact_core_endpoint(url: str) -> str:
+    """Return a sanitized ``scheme://host[:port]`` label (no credentials/path/query)."""
+    parsed = urlparse(url.strip())
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if not parsed.scheme or not host:
+        return "<invalid-endpoint>"
+    return f"{parsed.scheme}://{host}:{port}" if port is not None else f"{parsed.scheme}://{host}"
+
+
+def resolve_core_mode(
+    mode: str | None,
+    api_url: str | None,
+) -> tuple[CoreModeSetting, ResolvedCoreMode, str | None]:
+    """Validate and resolve ``WUWATERM_CORE_MODE`` + ``WUWATERM_CORE_API_URL`` fail-closed."""
+    raw_mode = (mode or "").strip().lower() or DEFAULT_CORE_MODE
+    if raw_mode not in VALID_CORE_MODES:
+        raise ValueError("WUWATERM_CORE_MODE must be one of: auto, http, local")
+    normalized_mode: CoreModeSetting = raw_mode  # type: ignore[assignment]
+
+    normalized_url = (api_url or "").strip() or None
+    if normalized_url is not None:
+        parsed = urlparse(normalized_url)
+        try:
+            _ = parsed.port
+        except ValueError:
+            raise ValueError(
+                "WUWATERM_CORE_API_URL must be an absolute HTTP(S) URL"
+            ) from None
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+            raise ValueError(
+                "WUWATERM_CORE_API_URL must be an absolute HTTP(S) URL"
+            )
+
+    if normalized_mode == "http":
+        if normalized_url is None:
+            raise ValueError(
+                "WUWATERM_CORE_MODE=http requires WUWATERM_CORE_API_URL"
+            )
+        return normalized_mode, "http", normalized_url
+
+    if normalized_mode == "local":
+        if normalized_url is not None:
+            raise ValueError(
+                "WUWATERM_CORE_MODE=local conflicts with WUWATERM_CORE_API_URL; "
+                "unset WUWATERM_CORE_API_URL or set WUWATERM_CORE_MODE=http"
+            )
+        return normalized_mode, "local", None
+
+    if normalized_url is not None:
+        return normalized_mode, "http", normalized_url
+    return normalized_mode, "local", None
 
 
 class CoreBackendError(RuntimeError):
@@ -94,6 +160,93 @@ class CoreBackendError(RuntimeError):
     def __init__(self, code: str, message: str = "") -> None:
         super().__init__(message or code)
         self.code = code
+
+
+def probe_http_core_health(
+    base_url: str,
+    *,
+    api_token: str | None = None,
+    timeout_seconds: float = DEFAULT_CORE_HEALTH_TIMEOUT_SECONDS,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, object]:
+    """Synchronously probe Core HTTP ``/v1/meta`` (+ optional ``/v1/capabilities``)."""
+    _setting, _resolved, normalized_url = resolve_core_mode("http", base_url)
+    assert normalized_url is not None
+    normalized = normalized_url.rstrip("/")
+    token = (api_token or "").strip() or None
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    with httpx.Client(
+        base_url=normalized,
+        headers=headers,
+        timeout=timeout_seconds,
+        transport=transport,
+    ) as client:
+        try:
+            meta_resp = client.get("/v1/meta")
+        except httpx.HTTPError as exc:
+            raise CoreBackendError(
+                "llm_unavailable", "core http health probe failed: request_error"
+            ) from exc
+        if meta_resp.status_code != 200:
+            code = _extract_error_code(meta_resp)
+            raise CoreBackendError(code, f"core http health probe failed: {code}")
+        try:
+            meta_body = meta_resp.json()
+        except ValueError as exc:
+            raise CoreBackendError(
+                "invalid_response", "core http health probe returned invalid metadata"
+            ) from exc
+        if not isinstance(meta_body, Mapping):
+            raise CoreBackendError(
+                "invalid_response", "core http health probe returned invalid metadata"
+            )
+
+        caps: set[str] = set()
+        try:
+            caps_resp = client.get("/v1/capabilities")
+        except httpx.HTTPError:
+            caps_resp = None
+        if caps_resp is not None and caps_resp.status_code == 200:
+            try:
+                caps_body = caps_resp.json()
+            except ValueError:
+                caps_body = None
+            if isinstance(caps_body, Mapping):
+                raw_caps = caps_body.get("capabilities")
+                if isinstance(raw_caps, list):
+                    caps.update(
+                        item
+                        for item in raw_caps
+                        if isinstance(item, str) and CAPABILITY_TOKEN_RE.fullmatch(item)
+                    )
+
+        dictionary_revision: str | None = None
+        if CAP_DICTIONARY_IDENTITY in caps:
+            try:
+                dict_resp = client.get("/v1/dictionary")
+                if dict_resp.status_code == 200:
+                    dict_body = dict_resp.json()
+                    if isinstance(dict_body, Mapping):
+                        rev = dict_body.get("revision")
+                        if isinstance(rev, str):
+                            dictionary_revision = rev
+            except (httpx.HTTPError, ValueError):
+                pass
+
+    return {
+        "status": "ready",
+        "core_mode": "http",
+        "core_endpoint": redact_core_endpoint(normalized),
+        "service_version": str(meta_body.get("service_version", "unknown")),
+        "api_version": str(meta_body.get("api_version", "v1")),
+        "term_count": int(meta_body.get("term_count") or 0),
+        "llm_configured": bool(meta_body.get("llm_configured", False)),
+        "capabilities": sorted(caps),
+        "dictionary_revision": dictionary_revision,
+    }
 
 
 @dataclass(frozen=True)

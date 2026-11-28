@@ -959,7 +959,11 @@ async def _handle_channel_post(
                 context, config, resolved_rejection
             )
             return ChannelPostOutcome("retryable_failure", resolved_rejection)
-        translator: SentenceTranslator = context.application.bot_data[TRANSLATOR_KEY]
+        translator: SentenceTranslator | None = (
+            None
+            if http_backend is not None
+            else context.application.bot_data[TRANSLATOR_KEY]
+        )
         async with admission:
             if _queue_deadline_expired(context) or not _message_is_fresh(
                 message, config.channel_max_age_seconds
@@ -1379,7 +1383,7 @@ def _passes_final_delivery_gate(
 
 
 async def _translate_channel_input(
-    translator: SentenceTranslator,
+    translator: SentenceTranslator | None,
     plain: str,
     html_text: str | None,
     *,
@@ -1465,6 +1469,7 @@ async def _translate_channel_input(
                 exc.failure_stage = stage
                 raise exc
             return outcome.text
+        assert translator is not None
         return await _translate_plain_stage(
             translator,
             text,
@@ -1489,6 +1494,7 @@ async def _translate_channel_input(
                 before_llm_call=before_llm_call,
                 execution_budget=budget,
             )
+        assert translator is not None
         translated_seg = await translate_html_async(
             translator,
             seg_html,

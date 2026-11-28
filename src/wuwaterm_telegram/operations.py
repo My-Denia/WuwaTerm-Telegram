@@ -326,12 +326,91 @@ def _max_age(value: str) -> int:
     return age
 
 
+def health(
+    max_age: int = 90,
+    *,
+    core_mode: str | None = None,
+    core_api_url: str | None = None,
+    core_api_token: str | None = None,
+    timeout_seconds: float = 5.0,
+    check_poll: bool | None = None,
+    transport=None,
+) -> dict[str, object]:
+    """Check runtime readiness.
+
+    - In HTTP Core mode (``WUWATERM_CORE_MODE=http``, or ``auto`` with
+      ``WUWATERM_CORE_API_URL`` set): probes Core HTTP ``/v1/meta`` (and
+      optional ``/v1/capabilities`` / ``/v1/dictionary``) without requiring a
+      local ``terms.db`` file. Reports ``poll_checked: false`` unless
+      ``WUWATERM_POLL_HEALTH=1`` or ``check_poll=True``, in which case local
+      SDK poll health is also verified and ``poll_checked: true`` is reported.
+    - In local mode: checks local SDK polling evidence via ``poll_health.health``
+      with zero network calls.
+    """
+    from . import poll_health
+    from .core_backend import (
+        CoreBackendError,
+        probe_http_core_health,
+        resolve_core_mode,
+    )
+
+    raw_mode = (
+        core_mode
+        if core_mode is not None
+        else (os.getenv("WUWATERM_CORE_MODE", "").strip() or None)
+    )
+    raw_url = (
+        core_api_url
+        if core_api_url is not None
+        else (os.getenv("WUWATERM_CORE_API_URL", "").strip() or None)
+    )
+    raw_token = (
+        core_api_token
+        if core_api_token is not None
+        else (os.getenv("WUWATERM_CORE_API_TOKEN", "").strip() or None)
+    )
+    try:
+        _setting, resolved_mode, normalized_url = resolve_core_mode(raw_mode, raw_url)
+    except ValueError as exc:
+        raise OperationsError(str(exc)) from None
+
+    if resolved_mode == "http":
+        assert normalized_url is not None
+        try:
+            result = probe_http_core_health(
+                normalized_url,
+                api_token=raw_token,
+                timeout_seconds=timeout_seconds,
+                transport=transport,
+            )
+        except CoreBackendError as exc:
+            raise OperationsError(str(exc)) from None
+        should_check_poll = poll_health.enabled() if check_poll is None else check_poll
+        if should_check_poll:
+            poll_result = poll_health.health(max_age)
+            return {
+                **result,
+                "poll_checked": True,
+                "pid": poll_result["pid"],
+                "age_seconds": poll_result["age_seconds"],
+            }
+        return {
+            **result,
+            "poll_checked": False,
+        }
+
+    return poll_health.health(max_age)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     identity_parser = commands.add_parser("identity", help="report offline installed/build identity")
     identity_parser.add_argument("--artifact-root", type=Path, default=Path("/app"))
-    health_parser = commands.add_parser("health", help="check recent successful SDK polling")
+    health_parser = commands.add_parser(
+        "health",
+        help="check Core HTTP readiness (HTTP mode) and/or recent SDK polling",
+    )
     health_parser.add_argument("--max-age", type=_max_age, default=90, metavar="SECONDS")
     plan_parser = commands.add_parser("state-plan", help="plan state paths without writes")
     plan_parser.add_argument("--db", type=Path, required=True)
@@ -344,8 +423,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "identity":
             result = identity(args.artifact_root)
         elif args.command == "health":
-            from .poll_health import health
-
             result = health(args.max_age)
         else:
             result = state_plan(args.db, args.mount)

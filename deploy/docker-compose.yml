@@ -11,6 +11,12 @@ services:
     restart: unless-stopped
     env_file:
       - ../.env
+    # Pure HTTP Core mode (recommended): set WUWATERM_CORE_MODE=http (or auto),
+    # WUWATERM_CORE_API_URL, and optional WUWATERM_CORE_API_TOKEN in ../.env.
+    # HTTP mode ignores /app/data/terms.db; the ../data mount stays here so
+    # existing local deployments and Core's setup.sh --telegram-dir keep working.
+    # If Core runs on host loopback (e.g. http://127.0.0.1:8788), add
+    # `network_mode: host` or address Core over a shared Docker network.
     environment:
       WUWATERM_DB_PATH: /app/data/terms.db
       WUWATERM_STATE_DIR: /app/state
