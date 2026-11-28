@@ -4,7 +4,7 @@
 
 A standalone Telegram adapter for WuwaTerm's Chinese–English game terminology, centered on **linked-channel auto-translation (P0)** while fully preserving **group/private translation, terminology lookup, and `/review` (P1)**.
 
-- **Core compatibility & service decoupling**: Compatible with WuwaTerm Core `>=0.16.0,<1.0` via semantic version range + runtime capability probing. `core-lock.json` pins the reviewed Core `0.16.0` release wheel and SHA-256 for deterministic CI and container builds. Telegram also supports consuming an independently deployed Core HTTP API via `WUWATERM_CORE_API_URL` (`HttpCoreBackend` with `GET /v1/capabilities` negotiation and safe fallback), alongside the embedded `LocalCoreBackend`.
+- **Core compatibility & service decoupling**: Compatible with WuwaTerm Core `>=0.16.0,<1.0` via semantic version range + runtime capability probing. `core-lock.json` pins the reviewed Core `0.16.0` release wheel and SHA-256 for deterministic CI and container builds. Production deployments run in **pure HTTP Core mode** (`WUWATERM_CORE_MODE=http` + `WUWATERM_CORE_API_URL`, optional `WUWATERM_CORE_API_TOKEN`): Telegram consumes an independently deployed Core HTTP API via `HttpCoreBackend` (with `GET /v1/capabilities` negotiation and hot-swap awareness) and completely skips local `terms.db` verification and in-process translator initialization. The embedded `LocalCoreBackend` remains available as a compatibility fallback (`WUWATERM_CORE_MODE=local`, or `auto` without `WUWATERM_CORE_API_URL`).
 
 ## Channel auto-translation (P0)
 
@@ -39,9 +39,9 @@ Without `--to`, `/tr`, `/term` and `/sentence` pick the direction themselves: te
 ## Requirements
 
 - Python 3.11 or later.
-- WuwaTerm Core `>=0.16.0,<1.0` (embedded library) and/or a running WuwaTerm Core HTTP API service (`WUWATERM_CORE_API_URL`).
-- A schema-2 WuwaTerm terms database, built or obtained separately with WuwaTerm Core.
-- A Telegram bot token. A configured OpenAI-compatible model is optional; without it dictionary lookup remains available.
+- A running WuwaTerm Core HTTP API service (`WUWATERM_CORE_MODE=http` + `WUWATERM_CORE_API_URL`), **or** (legacy embedded fallback) a local schema-2 `terms.db` with `WUWATERM_CORE_MODE=local` (or `auto` with `WUWATERM_CORE_API_URL` unset).
+- WuwaTerm Core `>=0.16.0,<1.0` installed (used for shared text/HTML helpers and optional embedded fallback).
+- A Telegram bot token. In pure HTTP mode, LLM credentials live on the Core service; in local fallback mode, an OpenAI-compatible model is optional (without it dictionary lookup remains available).
 
 ## Installation from verified artifacts
 
@@ -61,10 +61,15 @@ Both wheel hashes and metadata are checked before pip starts. Pip installs both 
 Set the environment variables needed by your deployment using [the example](deploy/env.example), then start the bot:
 
 ```sh
-.venv/bin/wuwaterm-telegram --db data/terms.db
+# Pure HTTP Core mode (recommended; no local terms.db required):
+WUWATERM_CORE_MODE=http WUWATERM_CORE_API_URL=http://127.0.0.1:8000 \
+  WUWATERM_STATE_DIR=state .venv/bin/wuwaterm-telegram
+
+# Legacy embedded local-DB fallback:
+WUWATERM_CORE_MODE=local .venv/bin/wuwaterm-telegram --db data/terms.db
 ```
 
-`TELEGRAM_BOT_TOKEN` is required. `OWNER_USER_ID` controls owner-only commands and private translation access; without it, private translation is refused. The bot checks the installed Core semver range, required capabilities and the database before polling. Keep credentials out of the repository and logs.
+`TELEGRAM_BOT_TOKEN` is required. `OWNER_USER_ID` controls owner-only commands and private translation access; without it, private translation is refused. `WUWATERM_CORE_MODE` is fail-closed (`auto` | `http` | `local`, default `auto`): `http` fails at startup if `WUWATERM_CORE_API_URL` is unset or invalid so deployments never silently fall back to an embedded database, and `local` fails if `WUWATERM_CORE_API_URL` is also set. In pure HTTP mode the bot skips local `terms.db` verification and in-process translator initialization; in local mode it checks the database before polling. Keep credentials out of the repository and logs.
 
 ## Reviewing a translation
 
@@ -112,7 +117,7 @@ docker compose -f deploy/docker-compose.yml exec -T wuwaterm-telegram \
   python -B -m wuwaterm_telegram.operations health
 ```
 
-The command succeeds only after the SDK has completed a poll, including an empty response, within the last 90 seconds. `--max-age` accepts 1–3600 seconds. It checks the running process and boot identity without contacting Telegram. A stopped poller or stale, missing or invalid record fails. This indicates recent polling only; it does not verify handlers or translation. Poll health is disabled unless explicitly enabled, and needs Linux `/proc` and the writable tmpfs.
+The command succeeds only after the SDK has completed a poll, including an empty response, within the last 90 seconds. `--max-age` accepts 1–3600 seconds. In pure HTTP Core mode (`WUWATERM_CORE_MODE=http`, or `auto` with `WUWATERM_CORE_API_URL` set), `operations health` probes Core HTTP `/v1/meta` (and optional `/v1/capabilities`) without requiring a local `terms.db`, and also checks local SDK poll health whenever `WUWATERM_POLL_HEALTH=1`. In local mode it checks the running process and boot identity without making any network connection. A stopped poller or stale, missing or invalid record fails. Poll health needs Linux `/proc` and the writable tmpfs when enabled.
 
 ## Container
 
@@ -133,7 +138,7 @@ The final image layer only adds `/usr/local/share/wuwaterm/install-probe.json`, 
 
 An optional `WUWATERM_SOURCE_REVISION` build argument may be supplied as a full lowercase commit SHA after verifying the wheel provenance. The image records it as an unverified claim. Compose keeps API Web credentials out of the bot container even when a shared `.env` contains them.
 
-Place the database at `data/terms.db`; Compose mounts `data/` read-only and `state/` read-write. The prepared Docker context contains only the lock, wheel artifacts and verification code, not the workspace or `.env`. Stop the old bot before starting a replacement against the same state.
+In pure HTTP Core mode (the default in `deploy/docker-compose.yml` and `deploy/env.example`), Compose mounts only `state/` read-write and does not require a `data/terms.db` volume mount. For legacy embedded local-DB fallback, set `WUWATERM_CORE_MODE=local`, leave `WUWATERM_CORE_API_URL` unset, place the database at `data/terms.db`, and uncomment the `../data:/app/data:ro` mount in `deploy/docker-compose.yml`. The prepared Docker context contains only the lock, wheel artifacts and verification code, not the workspace or `.env`. Stop the old bot before starting a replacement against the same state.
 
 ## Dependency audit
 

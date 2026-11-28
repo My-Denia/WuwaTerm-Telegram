@@ -11,15 +11,23 @@ services:
     restart: unless-stopped
     env_file:
       - ../.env
+    # Pure HTTP Core mode (default): configure WUWATERM_CORE_MODE=http,
+    # WUWATERM_CORE_API_URL, and optional WUWATERM_CORE_API_TOKEN in ../.env.
+    # No local data/terms.db volume mount is required in HTTP mode.
+    #
+    # Local embedded compatibility fallback: set WUWATERM_CORE_MODE=local (and
+    # leave WUWATERM_CORE_API_URL unset) in ../.env, uncomment WUWATERM_DB_PATH
+    # below, and uncomment the ../data:/app/data:ro volume mount.
     environment:
-      WUWATERM_DB_PATH: /app/data/terms.db
       WUWATERM_STATE_DIR: /app/state
       WUWATERM_POLL_HEALTH: ${WUWATERM_POLL_HEALTH:-0}
+      # WUWATERM_DB_PATH: /app/data/terms.db
       WUWATERM_API_WEB_ENABLED: ""
       WUWATERM_API_WEB_DEVICE_TOKEN: ""
       WUWATERM_API_WEB_EDGE_SECRET: ""
     volumes:
-      - ../data:/app/data:ro
       - ../state:/app/state
+      # Uncomment only for legacy embedded local-DB mode (WUWATERM_CORE_MODE=local):
+      # - ../data:/app/data:ro
     tmpfs:
       - /run/wuwaterm-telegram:rw,noexec,nosuid,nodev,size=1m,mode=0700
